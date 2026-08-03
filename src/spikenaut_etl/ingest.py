@@ -13,10 +13,16 @@ import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
+
+# Preserves the caller's concrete model type through read_validated. Returning
+# the bare BaseModel would erase it, and every downstream `record.telemetry` /
+# `record.timestamp` access would go unchecked -- which is a poor look for a
+# pipeline whose whole argument is that declared schemas catch field errors.
+M = TypeVar("M", bound=BaseModel)
 
 
 @dataclass
@@ -58,8 +64,8 @@ def read_jsonl(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
 
 
 def read_validated(
-    path: Path, model: type[BaseModel], stats: IngestStats
-) -> Iterator[tuple[int, BaseModel]]:
+    path: Path, model: type[M], stats: IngestStats
+) -> Iterator[tuple[int, M]]:
     """Stream a source through its declared schema.
 
     ``extra="forbid"`` means an unexpected field raises here rather than being

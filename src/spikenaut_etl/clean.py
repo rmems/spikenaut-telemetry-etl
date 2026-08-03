@@ -226,7 +226,7 @@ def clean_qubic_ticks(path: Path) -> CleanResult:
     stats = IngestStats(source="qubic_ticks")
     quarantine = timestamps.QuarantineLog(source="qubic_ticks")
     records: list[tuple[int, RawQubicTick]] = list(
-        read_validated(path, RawQubicTick, stats)  # type: ignore[arg-type]
+        read_validated(path, RawQubicTick, stats)
     )
     if not records:
         return CleanResult(

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import random
 from collections.abc import Callable, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -192,7 +193,7 @@ def write_sample(
 
 def _expected_columns(
     spec: SourceSpec, rows: Sequence[dict[str, Any]]
-) -> set[str] | None:
+) -> AbstractSet[str] | None:
     """Declared columns minus any dropped as dead in this run.
 
     Dead-column removal is data-dependent, so the schema gate checks that what
