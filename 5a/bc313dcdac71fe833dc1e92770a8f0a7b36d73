@@ -1,0 +1,64 @@
+src/spikenaut_etl/validate.py
+  s_fe5a9a0c4a0b0e::t_aec6abfcf54b5e 286-289
+  s_fe5a9a0c4a0b0e::t_c8c8dae25e3138 76-100,102,107-110,114-118,124
+  s_fe5a9a0c4a0b0e::t_ea668766c70364 200
+  s_fe5a9a0c4a0b0e::t_937a5f10a42677 1-19,21-58,63-75,101,103-106,111-113,119-123,125-199,201-285,290-342
+  s_fe5a9a0c4a0b0e::t_55dd1d86bdd40a 20
+  s_fe5a9a0c4a0b0e::t_c91b712e9ad931 59-62
+src/spikenaut_etl/schemas.py
+  s_fe5a9a0c4a0b0e::t_4d49fbc11887b7 212-215
+  s_fe5a9a0c4a0b0e::t_240eab07387b43 1-21,23-49,73,80-91,112-199,201-204,206-209,216-253
+src/spikenaut_etl/ingest.py
+  s_fe5a9a0c4a0b0e::t_fc4c0ca9326d46 1-15,17-18,20-60,62-105
+src/spikenaut_etl/__init__.py
+  s_fe5a9a0c4a0b0e::t_3ad1d5cecbe9b6 1-25
+.github/workflows/validate.yml
+  s_fe5a9a0c4a0b0e::t_09facdd24fbce5 1-66
+src/spikenaut_etl/timestamps.py
+  s_fe5a9a0c4a0b0e::t_9c1d0590e1db33 31-38,44-45,50-59
+  s_fe5a9a0c4a0b0e::t_995ce1cc9ab635 1-30,39-43,46-49,60-73,78-83,85-87,89-108,113-115,118-158,160
+  s_fe5a9a0c4a0b0e::t_2e31b20e7de1a5 109-112,116-117
+  s_fe5a9a0c4a0b0e::t_8d14a47f3c64d4 159,161-162
+tests/test_regression_shipped_defects.py
+  s_fe5a9a0c4a0b0e::t_3d051af77a76cc 11
+  s_fe5a9a0c4a0b0e::t_ebf30dad05ca89 41-44,49-53,62-63,65,69
+  s_fe5a9a0c4a0b0e::t_33229896e6a6ce 230
+  s_fe5a9a0c4a0b0e::t_25819365547c64 1-10,12-40,45-48,70-180,182,195-229,231
+  s_fe5a9a0c4a0b0e::t_ea578352558b7b 181,183-194
+  s_fe5a9a0c4a0b0e::t_077b4fc6b41e0f 54-61,64,66-68
+src/spikenaut_etl/pipeline.py
+  s_fe5a9a0c4a0b0e::t_7ec18c07f178c7 58-63
+  s_fe5a9a0c4a0b0e::t_d79b709cdb2447 1-15,17-57,64-188
+src/spikenaut_etl/cli.py
+  s_fe5a9a0c4a0b0e::t_e59535a7a3a637 1-79
+README.md
+  s_fe5a9a0c4a0b0e::t_ecde138f6a3dcb 1-179
+tools/make_fixtures.py
+  s_fe5a9a0c4a0b0e::t_a644190edc78e5 1-137
+pyproject.toml
+  s_fe5a9a0c4a0b0e::t_924518bcc6c6c6 20-21
+  s_fe5a9a0c4a0b0e::t_39ec663f6d701b 1-19,22-48
+src/spikenaut_etl/report.py
+  s_fe5a9a0c4a0b0e::t_787509ac5c64c8 1-14,16-111
+src/spikenaut_etl/clean.py
+  s_fe5a9a0c4a0b0e::t_c0b617cd9cb011 89,91-98,109-111,113
+  s_fe5a9a0c4a0b0e::t_5bdc2c1cee383c 194
+  s_fe5a9a0c4a0b0e::t_2925998e3f52c4 200
+  s_fe5a9a0c4a0b0e::t_2f6313c9d92335 1-15,17-88,90,99-108,112,114-193,195-199,201-310
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "5abc313dcdac71fe833dc1e92770a8f0a7b36d73",
+  "prompts": {},
+  "sessions": {
+    "s_fe5a9a0c4a0b0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a16e4dcc-bc48-448f-91db-126cfb4546d4",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Raul Montoya Cardenas <montoyaraul34@gmail.com>"
+    }
+  }
+}
