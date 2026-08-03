@@ -3,7 +3,15 @@
 ####################################################################################################################
 
 version: "1.0"
-linter: qodana-python-community
+
+# CI runs the release linter, which requires QODANA_TOKEN (set as a repo secret).
+# Local runs without a token need the Community linter instead:
+#
+#   qodana scan --linter qodana-python-community
+#
+# The exclusions below were verified against Community; both inspections exist
+# in either linter, so they apply the same way.
+linter: qodana-python
 
 profile:
   name: qodana.recommended
@@ -37,8 +45,8 @@ exclude:
 
   # 11 findings, "Class has no __init__ method", on pydantic BaseModel
   # subclasses and @dataclass types. Both generate __init__ at runtime; the
-  # Community linter models neither. Every one of these classes is instantiated
-  # in the test suite.
+  # linter models neither. Every one of these classes is instantiated in the
+  # test suite.
   - name: PyClassHasNoInitInspection
 
 # Deliberately left enabled, despite each currently reporting one verified false
