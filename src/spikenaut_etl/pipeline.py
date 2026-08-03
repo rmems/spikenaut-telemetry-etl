@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import random
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,9 @@ class SourceSpec:
     cleaner: Cleaner
     output: str
     gates: GateConfig
+    # Published sample prefix, e.g. "mining" -> samples/mining_SAMPLE_1k.jsonl.
+    # None means this source publishes no sample.
+    sample_prefix: str | None = None
 
     def input_path(self, root: Path) -> Path:
         return root / self.filename
@@ -49,6 +52,7 @@ SOURCES: tuple[SourceSpec, ...] = (
         # No timestamp column exists in this source, so the fabrication gate
         # has nothing to check.
         gates=GateConfig(require_timestamp_jitter=False),
+        sample_prefix="gpu",
     ),
     SourceSpec(
         key="node_sync_harvest",
@@ -61,6 +65,7 @@ SOURCES: tuple[SourceSpec, ...] = (
             ),
             identity_columns=GateConfig.identity_columns | {"chain_epoch"},
         ),
+        sample_prefix="mining",
     ),
     SourceSpec(
         key="qubic_ticks_snn",
@@ -68,6 +73,7 @@ SOURCES: tuple[SourceSpec, ...] = (
         cleaner=clean.clean_qubic_ticks,
         output="full_data/qubic_ticks_snn.jsonl",
         gates=GateConfig(allow_constant=frozenset({"epoch", "epoch_progress"})),
+        sample_prefix="qubic",
     ),
     SourceSpec(
         key="ghost_market_log",
@@ -75,8 +81,12 @@ SOURCES: tuple[SourceSpec, ...] = (
         cleaner=clean.clean_trading_log,
         output="full_data/ghost_market_log.jsonl",
         gates=GateConfig(),
+        sample_prefix="hft",
     ),
 )
+
+# Published sample sizes, as (row count, filename suffix).
+SAMPLE_SIZES: tuple[tuple[int, str], ...] = ((100, "100"), (1000, "1k"))
 
 
 @dataclass
@@ -86,6 +96,7 @@ class RunOutcome:
     rendered: str
     report_path: Path | None = None
     output_path: Path | None = None
+    sample_paths: list[Path] = field(default_factory=list)
 
 
 def run_source(
@@ -120,11 +131,24 @@ def run_source(
         return RunOutcome(spec.key, False, f"{rendered}\n{exc}", report_path)
 
     output_path = None
+    sample_paths: list[Path] = []
     if write_output:
         output_path = output_root / spec.output
         write_jsonl(result.rows, output_path)
 
-    return RunOutcome(spec.key, True, rendered, report_path, output_path)
+        if spec.sample_prefix:
+            for size, suffix in SAMPLE_SIZES:
+                sample_paths.append(
+                    write_sample(
+                        result.rows,
+                        output_root
+                        / "samples"
+                        / f"{spec.sample_prefix}_SAMPLE_{suffix}.jsonl",
+                        size,
+                    )
+                )
+
+    return RunOutcome(spec.key, True, rendered, report_path, output_path, sample_paths)
 
 
 def run_all(

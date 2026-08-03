@@ -64,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
         print(outcome.rendered)
         if outcome.output_path:
             print(f"      wrote     {outcome.output_path}")
+        for sample in outcome.sample_paths:
+            print(f"      sample    {sample}")
 
     failed = [o for o in outcomes if not o.ok]
     print()

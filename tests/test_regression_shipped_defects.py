@@ -235,6 +235,45 @@ def test_real_fixtures_pass_all_gates(key, filename, tmp_path):
     assert outcome.output_path is not None and outcome.output_path.exists()
 
 
+def test_published_samples_are_draws_not_prefixes(tmp_path):
+    """Samples must not be byte-exact prefixes of their parent file.
+
+    Every published ``*_SAMPLE_*.jsonl`` was: ``head -100`` and ``head -1000`` of
+    the full file. That double-counted rows whenever a sample config was loaded
+    alongside its parent, and made the sample unrepresentative -- ``ch2_mode`` is
+    constant across the first 200 rows of ``ghost_market_log.jsonl`` but varies
+    over the file.
+    """
+    spec = next(s for s in SOURCES if s.key == "ghost_market_log")
+    outcome = run_source(spec, FIXTURES, tmp_path, tmp_path / "reports")
+    assert outcome.ok
+    assert outcome.sample_paths, "a sample must be produced"
+
+    full = (tmp_path / spec.output).read_text().splitlines()
+    checked = 0
+    for sample_path in outcome.sample_paths:
+        sample = sample_path.read_text().splitlines()
+        assert set(sample) <= set(full), "sample rows must come from the parent"
+        if len(sample) >= len(full):
+            # Requested size exceeds the population, so the "sample" is the whole
+            # file. Nothing to assert about ordering.
+            continue
+        assert sample != full[: len(sample)], (
+            f"{sample_path.name} is a prefix of its parent file"
+        )
+        checked += 1
+    assert checked, "fixture too small to exercise sampling"
+
+
+def test_samples_are_reproducible(tmp_path):
+    """The same input must yield byte-identical samples across runs."""
+    spec = next(s for s in SOURCES if s.key == "ghost_market_log")
+    first = run_source(spec, FIXTURES, tmp_path / "a", tmp_path / "ra")
+    second = run_source(spec, FIXTURES, tmp_path / "b", tmp_path / "rb")
+    for left, right in zip(first.sample_paths, second.sample_paths, strict=True):
+        assert left.read_bytes() == right.read_bytes()
+
+
 def test_real_node_sync_preserves_actual_timestamps():
     """Output timestamps must trace to the source, not a generated sequence."""
     result = clean.clean_node_sync(FIXTURES / "node_sync_harvest.jsonl")
