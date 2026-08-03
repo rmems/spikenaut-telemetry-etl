@@ -1,0 +1,29 @@
+src/spikenaut_etl/pipeline.py
+  s_fe5a9a0c4a0b0e::t_45cbc9859abbb0 14
+  s_fe5a9a0c4a0b0e::t_be6e843dfd33cc 34-36
+  s_fe5a9a0c4a0b0e::t_801525f31c9043 68,76,84,88-89
+  s_fe5a9a0c4a0b0e::t_73f1c7d7ade60c 55
+  s_fe5a9a0c4a0b0e::t_5f4965b817dc62 99
+  s_fe5a9a0c4a0b0e::t_b8dc80190ea7ed 134,139-151
+tests/test_regression_shipped_defects.py
+  s_fe5a9a0c4a0b0e::t_9c6fd77d628a62 238-252,254-255,261-263,266-276
+  s_fe5a9a0c4a0b0e::t_86e859b8a08087 253,256-260,264-265
+src/spikenaut_etl/cli.py
+  s_fe5a9a0c4a0b0e::t_a460c09f1e8f37 67-68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "845e36082b1396414255b1a1c38e4a6cafa90f1e",
+  "prompts": {},
+  "sessions": {
+    "s_fe5a9a0c4a0b0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a16e4dcc-bc48-448f-91db-126cfb4546d4",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Raul Montoya Cardenas <montoyaraul34@gmail.com>"
+    }
+  }
+}
