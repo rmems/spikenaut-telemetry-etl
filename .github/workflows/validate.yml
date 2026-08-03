@@ -1,0 +1,66 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src tests tools
+
+      - name: Test
+        run: pytest -q
+
+      # The pipeline must accept the real fixtures...
+      - name: Pipeline accepts valid data
+        run: |
+          spikenaut-etl validate \
+            --input tests/fixtures \
+            --reports "$RUNNER_TEMP/reports"
+
+      # ...and must reject each defect that reached production. An exit code of 0
+      # here means a gate has regressed and corrupt data could ship again.
+      - name: Pipeline rejects known-corrupt data
+        run: |
+          set +e
+          failures=0
+          for fixture in all_empty_telemetry all_zero_telemetry fabricated_timestamps; do
+            case "$fixture" in
+              all_empty_telemetry) key=neuromorphic_data; name=neuromorphic_data.jsonl ;;
+              *)                   key=node_sync_harvest; name=node_sync_harvest.jsonl ;;
+            esac
+
+            dir="$RUNNER_TEMP/corrupt-$fixture"
+            mkdir -p "$dir"
+            cp "tests/fixtures/corrupt/$fixture.jsonl" "$dir/$name"
+
+            spikenaut-etl validate --input "$dir" \
+              --reports "$RUNNER_TEMP/reports-$fixture" --only "$key"
+            status=$?
+
+            if [ $status -eq 0 ]; then
+              echo "::error::$fixture was ACCEPTED; a validation gate has regressed"
+              failures=$((failures + 1))
+            else
+              echo "ok: $fixture correctly rejected (exit $status)"
+            fi
+          done
+          exit $failures

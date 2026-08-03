@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spikenaut-telemetry-etl"
+version = "0.1.0"
+description = "Validated cleaning pipeline for Spikenaut SNN telemetry datasets"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Raul Montoya Cardenas" }]
+keywords = ["telemetry", "etl", "data-quality", "neuromorphic", "snn"]
+
+dependencies = [
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+# Publishing is a git push against the Hugging Face dataset remote; `clean`
+# writes directly into a checkout of it. No SDK dependency needed.
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+spikenaut-etl = "spikenaut_etl.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/rmems/spikenaut-telemetry-etl"
+Dataset = "https://huggingface.co/datasets/rmems/Spikenaut-SNN-Telemetry"
+Producer = "https://github.com/rmems/Theseus-Quarry"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spikenaut_etl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 90
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
