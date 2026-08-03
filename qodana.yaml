@@ -1,0 +1,50 @@
+####################################################################################################################
+# WARNING: Do not store sensitive information in this file, as its contents will be included in the Qodana report. #
+####################################################################################################################
+
+version: "1.0"
+linter: qodana-python-community
+
+profile:
+  name: qodana.recommended
+
+include:
+  - name: CheckDependencyLicenses
+
+# Two inspections are structurally wrong for this codebase and were verified
+# false before being disabled -- not silenced to make the report green.
+#
+# An analyzer that reports 79 findings, every one of them false, is worse than
+# no analyzer: it trains you to skim past the output. That is the same failure
+# mode as the pipeline this repo replaces, which printed "Cleanup complete!"
+# over 813,973 empty records.
+exclude:
+  # 68 findings, all reading "Invalid type annotation" on a PEP 604 `X | None`.
+  #
+  # The inspection resolves no Python SDK for the project (SARIF logicalLocations
+  # report a bare "project" module) and falls back to a pre-3.10 language level.
+  # Neither QODANA_PYTHON_PATH nor a bootstrap conda env changes it; the linter
+  # container itself already ships Python 3.12.4.
+  #
+  # The syntax is correct here: requires-python is >=3.10, ruff targets py310,
+  # every module has `from __future__ import annotations`, and CI passes on 3.10
+  # and 3.12. ruff's UP rules actively rewrite `Optional[X]` into `X | None`, so
+  # leaving this on puts the two linters in permanent conflict.
+  #
+  # Type-hint correctness is covered properly by mypy, which runs in CI against
+  # python_version 3.10 and passes clean.
+  - name: PyTypeHintsInspection
+
+  # 11 findings, "Class has no __init__ method", on pydantic BaseModel
+  # subclasses and @dataclass types. Both generate __init__ at runtime; the
+  # Community linter models neither. Every one of these classes is instantiated
+  # in the test suite.
+  - name: PyClassHasNoInitInspection
+
+# Deliberately left enabled, despite each currently reporting one verified false
+# positive. Disabling them would hide real instances of the same class later:
+#
+#   PyInconsistentReturnsInspection            ingest.py count_lines -- single
+#     return inside a `with`; returns 200 on the fixture.
+#   PyStringConversionWithoutDunderMethod      pipeline.py f"{exc}" where exc is
+#     our ValidationError; inherits BaseException.__str__ and renders correctly.
