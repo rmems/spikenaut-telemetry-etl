@@ -61,6 +61,19 @@ _COIN_TAG = re.compile(
 # Unix epoch seconds as a bare string, e.g. "1773996924".
 _EPOCH_SECONDS = re.compile(r"^\d{9,11}$")
 
+# Sub-second precision finer than microseconds. ghost_market_log.jsonl is written
+# by a Rust producer whose timestamps carry *nanoseconds*
+# ("2026-03-11T18:22:37.433458521+00:00" -- 9 digits). Python's %f accepts at most
+# 6, and datetime cannot represent finer than microseconds at all, so the tail is
+# truncated. Caught by CI on 3.10; newer interpreters are more permissive here,
+# which is precisely why the pinned matrix matters.
+_SUBSECOND = re.compile(r"(?<=\.)(\d{7,})")
+
+
+def _truncate_subseconds(text: str) -> str:
+    """Trim fractional seconds to the 6 digits datetime can represent."""
+    return _SUBSECOND.sub(lambda m: m.group(1)[:6], text)
+
 
 @dataclass(frozen=True)
 class ParsedTimestamp:
@@ -122,15 +135,19 @@ def parse(raw: object) -> ParsedTimestamp:
             raw=raw, moment=datetime.fromtimestamp(int(text), tz=timezone.utc)
         )
 
+    normalized = _truncate_subseconds(text)
+
     for pattern in _DATETIME_PATTERNS:
         try:
-            return ParsedTimestamp(raw=raw, moment=datetime.strptime(text, pattern))
+            return ParsedTimestamp(
+                raw=raw, moment=datetime.strptime(normalized, pattern)
+            )
         except ValueError:
             continue
 
     # Last resort: stdlib ISO parser handles offsets this module hasn't enumerated.
     try:
-        return ParsedTimestamp(raw=raw, moment=datetime.fromisoformat(text))
+        return ParsedTimestamp(raw=raw, moment=datetime.fromisoformat(normalized))
     except ValueError:
         return ParsedTimestamp(raw=raw)
 

@@ -159,6 +159,19 @@ def test_real_timestamp_forms_all_parse(raw):
     assert timestamps.parse(raw).ok, f"{raw!r} must parse"
 
 
+def test_nanosecond_precision_is_truncated_not_rejected():
+    """ghost_market_log timestamps carry 9 fractional digits.
+
+    Python's %f accepts at most 6 and datetime cannot represent finer than
+    microseconds. Truncating is correct; rejecting would quarantine all 31,573
+    rows of the one healthy file in the dataset.
+    """
+    parsed = timestamps.parse("2026-03-11T18:22:37.433458521+00:00")
+    assert parsed.ok, "nanosecond timestamps must parse"
+    assert parsed.moment is not None
+    assert parsed.moment.microsecond == 433458
+
+
 def test_unparseable_timestamp_yields_none_not_a_guess():
     parsed = timestamps.parse("not-a-timestamp")
     assert not parsed.ok
