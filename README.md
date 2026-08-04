@@ -174,6 +174,19 @@ since a uniform sample would be ~95% datetime and would never exercise coin pars
 
 ---
 
+## Issue tracking
+
+**GitHub issues, for this repository only.**
+
+`Spikenaut-Vault/CLAUDE.md` directs all task tracking to `bd` (beads), and vault-
+and model-scoped work still lives there. This repo is the exception: the vault's
+git remote currently 404s, and beads syncs through `refs/dolt/data` on that remote,
+so every issue in it sits in one local Dolt database with no off-machine copy.
+Issues filed here survive a disk failure, link from commits and PRs, and are
+visible to anyone who reaches the repo through the dataset's provenance chain.
+
+Fold this back into beads once the vault remote is fixed, if one tracker is wanted.
+
 ## License
 
 MIT OR Apache-2.0.
