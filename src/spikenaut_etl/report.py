@@ -35,6 +35,7 @@ class FileReport:
     distinct_rows: int
     distinct_ratio: float
     quarantined: int
+    quarantined_by_reason: dict[str, int]
     dead_columns: list[str]
     dead_column_drift: list[str]
     coin_counts: dict[str, int]
@@ -73,6 +74,7 @@ def build(result: CleanResult, validation: ValidationResult) -> FileReport:
         distinct_rows=distinct,
         distinct_ratio=round(distinct / len(rows), 8) if rows else 0.0,
         quarantined=len(result.quarantine),
+        quarantined_by_reason=result.quarantine.counts(),
         dead_columns=sorted(result.dead_columns),
         dead_column_drift=list(result.dead_column_drift),
         coin_counts=dict(result.coin_counts),
@@ -98,7 +100,10 @@ def render(report: FileReport) -> str:
         f"      distinct  {report.distinct_rows} ({report.distinct_ratio:.4%})",
     ]
     if report.quarantined:
-        lines.append(f"      quarantined  {report.quarantined} unparseable timestamps")
+        detail = ", ".join(
+            f"{k}={v}" for k, v in sorted(report.quarantined_by_reason.items())
+        )
+        lines.append(f"      quarantined  {report.quarantined} rows ({detail})")
     if report.dead_columns:
         lines.append(f"      dropped   {', '.join(report.dead_columns)}")
     for message in report.dead_column_drift:

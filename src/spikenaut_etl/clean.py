@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -133,6 +134,74 @@ def drop_columns(
 
 
 # --------------------------------------------------------------------------- #
+# Trailing out-of-order records
+# --------------------------------------------------------------------------- #
+
+# A backward step smaller than this is ordinary capture jitter, not disorder.
+BACKWARD_JUMP_TOLERANCE_S = 60.0
+
+# A trailing disordered run must be small in *both* senses to be quarantined.
+# Stray appended records are a handful of rows (the real file has 12); anything
+# larger is a real chunk of capture, or a much bigger problem, and must not be
+# discarded here. The ratio alone is not enough -- 12 rows is 0.01% of the full
+# 120,334-row file but 5% of a 222-row test fixture -- and the absolute bound
+# alone would let a small file lose a third of itself.
+TRAILING_DISORDER_MAX_ROWS = 64
+TRAILING_DISORDER_MAX_RATIO = 0.10
+
+
+def find_trailing_disorder(
+    stamped: Sequence[tuple[int, float]],
+    *,
+    total_rows: int,
+    tolerance: float = BACKWARD_JUMP_TOLERANCE_S,
+    max_rows: int = TRAILING_DISORDER_MAX_ROWS,
+    max_ratio: float = TRAILING_DISORDER_MAX_RATIO,
+) -> list[int]:
+    """Positions of a short out-of-order run at the end of the file.
+
+    ``stamped`` is ``(row_position, epoch_seconds)`` for rows that carry a real
+    datetime, in file order. Returns the positions to quarantine, or ``[]``.
+
+    ``node_sync_harvest.jsonl`` ends with 12 rows timestamped ~21 hours *before*
+    the record they follow -- the only rows in the file carrying a UTC offset,
+    with two distinct ``(power_w, gpu_temp_c)`` pairs between them. They are
+    placeholders from a different writer, and they were published.
+
+    The trigger is deliberately the *ordering* break, not the constant values.
+    The pipeline this replaced trimmed tails by inspecting values, and fired on
+    its own corrupted all-zero output, deleting 20 good rows. Ordering is a
+    property of how the file was written, not of what the numbers happen to be.
+
+    Three conditions must all hold, so this stays a narrow rule:
+
+    * a backward step larger than ``tolerance``,
+    * the run after the last such step reaches the end of the file,
+    * that run is at most ``max_rows`` long *and* under ``max_ratio`` of the file.
+    """
+    if len(stamped) < 2 or total_rows <= 0:
+        return []
+
+    breaks = [
+        i
+        for i, ((_, a), (_, b)) in enumerate(pairwise(stamped), start=1)
+        if a - b > tolerance
+    ]
+    if not breaks:
+        return []
+
+    run = stamped[breaks[-1] :]
+    positions = [pos for pos, _ in run]
+
+    # Must be the actual tail of the file, contiguous, and small both ways.
+    if positions != list(range(total_rows - len(positions), total_rows)):
+        return []
+    if len(positions) > max_rows or len(positions) / total_rows > max_ratio:
+        return []
+    return positions
+
+
+# --------------------------------------------------------------------------- #
 # Per-source cleaners
 # --------------------------------------------------------------------------- #
 
@@ -177,14 +246,12 @@ def clean_node_sync(path: Path) -> CleanResult:
     """
     stats = IngestStats(source="node_sync_harvest")
     quarantine = timestamps.QuarantineLog(source="node_sync_harvest")
-    raw: list[dict[str, Any]] = []
-    coins: Counter = Counter()
-    epochs: list[float] = []
+    parsed_rows: list[tuple[int, dict[str, Any], timestamps.ParsedTimestamp]] = []
 
     for row, record in read_validated(path, RawNodeSyncRecord, stats):
         parsed = timestamps.parse(record.timestamp)
         if not parsed.ok:
-            quarantine.record(row, record.timestamp)
+            quarantine.record(row, record.timestamp, timestamps.UNPARSEABLE)
             continue
 
         payload = record.telemetry.model_dump()
@@ -192,10 +259,25 @@ def clean_node_sync(path: Path) -> CleanResult:
         payload["blockchain"] = parsed.coin
         payload["block_height"] = parsed.height
         payload["chain_epoch"] = parsed.epoch_number
-        coins[parsed.coin or "__unattributed__"] += 1
-        if parsed.epoch is not None:
-            epochs.append(parsed.epoch)
-        raw.append(payload)
+        parsed_rows.append((row, payload, parsed))
+
+    # Records appended out of time order came from a different run. Quarantine a
+    # short trailing burst of them; anything larger is left in place for the
+    # ordering gate to reject, so this can never quietly delete real capture.
+    stamped = [
+        (pos, p.epoch)
+        for pos, (_, _, p) in enumerate(parsed_rows)
+        if p.epoch is not None
+    ]
+    disordered = set(find_trailing_disorder(stamped, total_rows=len(parsed_rows)))
+    for pos in sorted(disordered):
+        source_row, _, parsed = parsed_rows[pos]
+        quarantine.record(source_row, parsed.raw, timestamps.OUT_OF_ORDER)
+
+    kept = [t for pos, t in enumerate(parsed_rows) if pos not in disordered]
+    raw = [payload for _, payload, _ in kept]
+    coins = Counter(p.coin or "__unattributed__" for _, _, p in kept)
+    epochs = [p.epoch for _, _, p in kept if p.epoch is not None]
 
     identity = {"timestamp", "blockchain", "block_height", "chain_epoch"}
     dead = find_dead_columns(raw) - identity
@@ -294,7 +376,7 @@ def clean_trading_log(path: Path) -> CleanResult:
     for row, record in read_validated(path, RawTradingLog, stats):
         parsed = timestamps.parse(record.timestamp)
         if not parsed.ok:
-            quarantine.record(row, record.timestamp)
+            quarantine.record(row, record.timestamp, timestamps.UNPARSEABLE)
             continue
         rows.append(record.model_dump())
         if parsed.epoch is not None:

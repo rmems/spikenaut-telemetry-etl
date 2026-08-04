@@ -152,28 +152,42 @@ def parse(raw: object) -> ParsedTimestamp:
         return ParsedTimestamp(raw=raw)
 
 
+UNPARSEABLE = "unparseable"
+OUT_OF_ORDER = "out-of-order"
+
+
 @dataclass
 class QuarantineLog:
-    """Collects inputs that could not be parsed, for the run report.
+    """Rows excluded from output, with the reason, for the run report.
 
-    Unparseable rows are excluded from output and counted here. They are never
-    replaced with a synthesized value, and the count is surfaced so a spike is
-    visible rather than absorbed.
+    Quarantined rows are counted and surfaced rather than absorbed, and are never
+    replaced with a synthesized value. Reasons are tracked separately because they
+    mean different things: an unparseable timestamp is a malformed record, while
+    an out-of-order trailing run is a different writer's data appended to the file.
     """
 
     source: str
-    entries: list[tuple[int, str]] = field(default_factory=list)
+    entries: list[tuple[int, str, str]] = field(default_factory=list)
 
-    def record(self, row_index: int, raw: str) -> None:
-        self.entries.append((row_index, raw))
+    def record(self, row_index: int, raw: str, reason: str = UNPARSEABLE) -> None:
+        self.entries.append((row_index, raw, reason))
 
     def __len__(self) -> int:  # pragma: no cover - trivial
         return len(self.entries)
 
+    def counts(self) -> dict[str, int]:
+        tally: dict[str, int] = {}
+        for _, _, reason in self.entries:
+            tally[reason] = tally.get(reason, 0) + 1
+        return tally
+
     def summary(self, limit: int = 10) -> str:
         if not self.entries:
-            return f"{self.source}: 0 unparseable timestamps"
+            return f"{self.source}: 0 quarantined rows"
         n = len(self.entries)
-        head = ", ".join(f"row {i}: {v!r}" for i, v in self.entries[:limit])
+        head = ", ".join(
+            f"row {i} ({reason}): {v!r}" for i, v, reason in self.entries[:limit]
+        )
         more = "" if n <= limit else f" (+{n - limit} more)"
-        return f"{self.source}: {n} unparseable timestamps -- {head}{more}"
+        tally = ", ".join(f"{k}={v}" for k, v in sorted(self.counts().items()))
+        return f"{self.source}: {n} quarantined [{tally}] -- {head}{more}"

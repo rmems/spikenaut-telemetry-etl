@@ -185,10 +185,16 @@ def write_sample(
     loading a sample config alongside the full file counted the same rows twice
     and the "sample" only ever showed the opening minutes of a capture. A seeded
     random draw is reproducible and actually representative.
+
+    The draw is sorted back into source order. These are time series: a sample
+    whose records are shuffled is not a sample of a capture, and it would trip
+    the trailing-disorder rule for a reason having nothing to do with the data.
     """
+    if len(rows) <= n:
+        return write_jsonl(rows, path)
     rng = random.Random(seed)
-    picked = rows if len(rows) <= n else rng.sample(list(rows), n)
-    return write_jsonl(picked, path)
+    picked = sorted(rng.sample(range(len(rows)), n))
+    return write_jsonl([rows[i] for i in picked], path)
 
 
 def _expected_columns(

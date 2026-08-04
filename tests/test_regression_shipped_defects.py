@@ -23,6 +23,7 @@ from spikenaut_etl.validate import (
     gate_distinct_rows,
     gate_no_constant_columns,
     gate_timestamps_not_fabricated,
+    gate_timestamps_ordered,
 )
 
 CORRUPT = Path(__file__).parent / "fixtures" / "corrupt"
@@ -191,12 +192,14 @@ def test_coin_tag_is_decomposed_not_coerced():
 
 
 def test_node_sync_recovers_coin_attribution():
-    """The fixture is stratified 70/70/70 across the three timestamp forms."""
+    """The fixture is stratified 100 per form across the timestamp forms."""
     result = clean.clean_node_sync(FIXTURES / "node_sync_harvest.jsonl")
-    assert result.coin_counts["dynex"] == 70, "coin:height form"
-    assert result.coin_counts["qubic"] == 70, "coin:epoch:tick form"
-    assert result.coin_counts["__unattributed__"] == 70, "datetime form"
-    assert len(result.quarantine) == 0, "every real timestamp form must parse"
+    assert result.coin_counts["dynex"] == 100, "coin:height form"
+    assert result.coin_counts["qubic"] == 100, "coin:epoch:tick form"
+    assert result.coin_counts["__unattributed__"] == 100, "datetime form"
+    assert timestamps.UNPARSEABLE not in result.quarantine.counts(), (
+        "every real timestamp form must parse"
+    )
 
 
 def test_qubic_epoch_tick_form_is_fully_decomposed():
@@ -233,6 +236,79 @@ def test_real_fixtures_pass_all_gates(key, filename, tmp_path):
     outcome = run_source(spec, FIXTURES, tmp_path, tmp_path / "reports")
     assert outcome.ok, f"real data must pass:\n{outcome.rendered}"
     assert outcome.output_path is not None and outcome.output_path.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Defect 7: 12 placeholder rows published in the 2026-08-03 rebuild
+# --------------------------------------------------------------------------- #
+
+
+def test_trailing_placeholder_rows_are_quarantined():
+    """The 12 rows appended ~21h before the record they follow must not ship.
+
+    They are the only rows in the source carrying a UTC offset and hold two
+    distinct (power_w, gpu_temp_c) pairs between them. beads sv-l43 flagged them
+    in July as placeholders that "teach the SNN a false idle pattern"; the
+    2026-08-03 rebuild restored them along with the 20 rows the old broken
+    heuristic had trimmed.
+    """
+    result = clean.clean_node_sync(FIXTURES / "node_sync_harvest.jsonl")
+
+    reasons = result.quarantine.counts()
+    assert reasons.get(timestamps.OUT_OF_ORDER) == 12, reasons
+    assert timestamps.UNPARSEABLE not in reasons, "all real forms must still parse"
+
+    # 312 fixture rows in, 12 quarantined.
+    assert len(result.rows) == 300
+    assert not any(
+        r["timestamp"] and r["timestamp"].endswith(("-05:00", "+00:00"))
+        for r in result.rows
+        if r.get("timestamp")
+    ), "no offset-bearing placeholder row may survive"
+
+
+def test_surviving_rows_are_in_time_order():
+    result = clean.clean_node_sync(FIXTURES / "node_sync_harvest.jsonl")
+    assert gate_timestamps_ordered(result.epochs, 60.0) == []
+
+
+def test_ordering_gate_catches_a_backward_jump():
+    """Belt and braces: whatever quarantine misses, the gate must reject."""
+    ordered = [0.0, 1.0, 2.0, 3.0]
+    assert gate_timestamps_ordered(ordered, 60.0) == []
+
+    reversed_tail = [0.0, 1.0, 2.0, 3.0, -80000.0]
+    failures = gate_timestamps_ordered(reversed_tail, 60.0)
+    assert failures and "backwards" in str(failures[0])
+
+
+def test_ordering_gate_tolerates_duplicate_seconds():
+    """qubic_ticks has 235 records sharing a second with their predecessor.
+
+    Strict monotonicity would reject a healthy 1 Hz capture, so the gate uses a
+    tolerance. This is the case that stops it from becoming the next heuristic
+    that fires on good data.
+    """
+    jittery = [0.0, 1.0, 1.0, 0.9, 2.0, 3.0, 2.5, 4.0]
+    assert gate_timestamps_ordered(jittery, 60.0) == []
+
+
+def test_trailing_disorder_rule_refuses_to_eat_a_large_run():
+    """A big out-of-order run is a real problem, not stray appended records.
+
+    Quarantining it silently would repeat the original sin: clean_datasets.jl
+    trimmed 20 good rows because a value heuristic misfired. Anything large is
+    left in place for the gate to reject loudly.
+    """
+    stamped = [(i, float(i)) for i in range(100)]
+    stamped += [(100 + i, -50000.0 + i) for i in range(50)]  # 33% of the file
+    assert clean.find_trailing_disorder(stamped, total_rows=150) == []
+
+
+def test_trailing_disorder_rule_ignores_a_mid_file_break():
+    """Only a run reaching the end of the file qualifies."""
+    stamped = [(0, 0.0), (1, 1.0), (2, -90000.0), (3, 5.0), (4, 6.0)]
+    assert clean.find_trailing_disorder(stamped, total_rows=5) == []
 
 
 def test_published_samples_are_draws_not_prefixes(tmp_path):

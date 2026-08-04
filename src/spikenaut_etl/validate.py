@@ -50,12 +50,18 @@ class GateConfig:
             unexpected collapsed.
         require_timestamp_jitter: Enforce the fabrication gate. Disable only for
             sources genuinely sampled on a fixed interval.
+        max_backward_jump_seconds: How far time may run backwards between adjacent
+            records before the sequence is treated as disordered. Not zero:
+            ``qubic_ticks`` has 235 records sharing a whole second with their
+            predecessor, which is ordinary for a 1 Hz capture. A 21-hour reversal
+            is not.
     """
 
     min_distinct_ratio: float = 0.01
     max_row_delta_ratio: float = 0.05
     allow_constant: frozenset[str] = frozenset()
     require_timestamp_jitter: bool = True
+    max_backward_jump_seconds: float = 60.0
     identity_columns: frozenset[str] = frozenset(
         {"row_index", "timestamp", "blockchain", "block_height", "tick", "epoch", "step"}
     )
@@ -220,6 +226,53 @@ def gate_timestamps_not_fabricated(
     return []
 
 
+def find_backward_jumps(
+    timestamps: Sequence[float], tolerance: float
+) -> list[tuple[int, float]]:
+    """Indices where time runs backwards by more than ``tolerance`` seconds.
+
+    Returns ``(index, seconds_backwards)`` for each break, where ``index`` is the
+    position of the *first* record of the out-of-order run.
+    """
+    breaks: list[tuple[int, float]] = []
+    for i, (a, b) in enumerate(pairwise(timestamps), start=1):
+        if a - b > tolerance:
+            breaks.append((i, a - b))
+    return breaks
+
+
+def gate_timestamps_ordered(
+    timestamps: Sequence[float], tolerance: float
+) -> list[GateFailure]:
+    """Reject a capture whose records are not in time order.
+
+    Appended records that predate everything before them did not come from the
+    same run. ``node_sync_harvest.jsonl`` ended with 12 such rows -- the only ones
+    in the file carrying a UTC offset, holding two distinct
+    ``(power_w, gpu_temp_c)`` pairs between them -- sitting ~21 hours before the
+    record they follow. They were placeholders, and they shipped, because the
+    existing fabrication gate looks for *uniform spacing* and 12 rows in 120,334
+    move no distribution-based check.
+
+    Cleaning quarantines a small trailing run like that. This gate is what catches
+    anything the quarantine did not, so disorder can never reach a published file
+    silently.
+    """
+    if len(timestamps) < 2:
+        return []
+    breaks = find_backward_jumps(timestamps, tolerance)
+    if not breaks:
+        return []
+    index, seconds = breaks[0]
+    detail = (
+        f"time runs backwards {seconds:,.0f}s at record {index} "
+        f"(tolerance {tolerance}s)"
+    )
+    if len(breaks) > 1:
+        detail += f"; {len(breaks)} such breaks total"
+    return [GateFailure("timestamps_ordered", detail)]
+
+
 def gate_schema_matches(
     rows: Sequence[dict[str, Any]], expected: Iterable[str]
 ) -> list[GateFailure]:
@@ -292,8 +345,10 @@ def check_all(
     failures += gate_row_count_delta(n_in, len(rows), cfg.max_row_delta_ratio)
     if expected_columns is not None:
         failures += gate_schema_matches(rows, expected_columns)
-    if timestamps is not None and cfg.require_timestamp_jitter:
-        failures += gate_timestamps_not_fabricated(timestamps)
+    if timestamps is not None:
+        failures += gate_timestamps_ordered(timestamps, cfg.max_backward_jump_seconds)
+        if cfg.require_timestamp_jitter:
+            failures += gate_timestamps_not_fabricated(timestamps)
     return ValidationResult(name=name, n_in=n_in, n_out=len(rows), failures=failures)
 
 
