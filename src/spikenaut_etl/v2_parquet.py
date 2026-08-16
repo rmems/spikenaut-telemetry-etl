@@ -70,7 +70,7 @@ def _features_equivalent(
     return True
 
 
-def convert_source(dataset_root: Path, config: str, out_root: Path) -> ConversionResult:
+def _load_v2_source(dataset_root: Path, config: str) -> datasets.Dataset:
     if config not in V2_SOURCES:
         raise BuildError(
             f"unknown v2 config {config!r}; expected one of {sorted(V2_SOURCES)}"
@@ -86,7 +86,12 @@ def convert_source(dataset_root: Path, config: str, out_root: Path) -> Conversio
         raise BuildError(f"cannot load {source}: {exc!r}") from exc
     if loaded.num_rows == 0:
         raise BuildError(f"{source} is empty")
+    return loaded
 
+
+def _write_converted(
+    config: str, loaded: datasets.Dataset, out_root: Path
+) -> ConversionResult:
     directory = out_root / OUTPUT_DIR / config
     directory.mkdir(parents=True, exist_ok=True)
     for stale in directory.glob("*.parquet"):
@@ -117,13 +122,20 @@ def convert_source(dataset_root: Path, config: str, out_root: Path) -> Conversio
     return ConversionResult(config=config, rows=reloaded.num_rows, path=path)
 
 
+def convert_source(dataset_root: Path, config: str, out_root: Path) -> ConversionResult:
+    return _write_converted(config, _load_v2_source(dataset_root, config), out_root)
+
+
 def build_v2_parquet(
     dataset_root: Path, output_root: Path | None = None
 ) -> dict[str, int]:
     """Convert every v2 source; returns config -> row count."""
     out_root = output_root or dataset_root
+    # Load every source before replacing any config's shards so a missing,
+    # empty, or corrupt later file cannot leave a mixed old/new parquet tree.
+    loaded = {config: _load_v2_source(dataset_root, config) for config in V2_SOURCES}
     results = {
-        config: convert_source(dataset_root, config, out_root)
-        for config in V2_SOURCES
+        config: _write_converted(config, table, out_root)
+        for config, table in loaded.items()
     }
     return {config: result.rows for config, result in results.items()}

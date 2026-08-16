@@ -155,3 +155,14 @@ def test_rebuild_replaces_stale_shards(v2_repo):
     stale.write_bytes(b"stale shard")
     build_v2_parquet(v2_repo)
     assert not stale.exists()
+
+
+def test_later_source_failure_does_not_replace_earlier_configs(v2_repo):
+    build_v2_parquet(v2_repo)
+    old = (v2_repo / "v2_parquet" / "gpu_telemetry" / "train-00000.parquet").read_bytes()
+    (v2_repo / "full_data" / "ghost_market_log.jsonl").write_text("{not json\n")
+    with pytest.raises(BuildError):
+        build_v2_parquet(v2_repo)
+    assert (
+        v2_repo / "v2_parquet" / "gpu_telemetry" / "train-00000.parquet"
+    ).read_bytes() == old

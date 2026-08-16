@@ -285,8 +285,8 @@ class BuildError(RuntimeError):
     """A precondition, fidelity, or non-degeneracy check failed.
 
     All v3 tables are computed and validated before the first write, but the
-    build has several write stages (v3 configs, then the v2_parquet
-    conversions), so a failure can leave a partial tree. Completion is marked
+    build has several write stages (v2_parquet conversions, then the v3
+    configs), so a failure can leave a partial tree. Completion is marked
     by ``v3/build_report.json``, written last: a tree without it is
     incomplete, and re-running the builder first removes every artifact it
     owns, so no mixed-generation tree can survive a retry.
@@ -713,6 +713,12 @@ def build_v3(
     horizon: int = OUTCOME_HORIZON_STEPS,
 ) -> BuildReport:
     """Build every v3 config and write the tree plus a build report."""
+    # Deferred import: v2_parquet imports this module for BuildError, and it
+    # pulls in the (heavy) datasets dependency only when actually building.
+    # Import and convert before cleaning v3/ so a missing extra or a bad aux
+    # JSONL cannot leave a half-replaced tree.
+    from .v2_parquet import build_v2_parquet
+
     out_root = (output_root or dataset_root) / "v3"
     gpu = _read_gpu_v2(dataset_root)
 
@@ -733,6 +739,8 @@ def build_v3(
     }
     safety_splits = {name: SAFETY_SCHEMA.empty_table() for name in state_splits}
     encoding = build_encoding_params(state_splits["train"])
+
+    v2_counts = build_v2_parquet(dataset_root, output_root or dataset_root)
 
     _clean_owned_outputs(out_root)
 
@@ -757,14 +765,7 @@ def build_v3(
             configs[name][split_name] = table.num_rows
     _write(encoding, out_root / "encoding_params", "train")
     configs["encoding_params"] = {"train": encoding.num_rows}
-
-    # Deferred import: v2_parquet imports this module for BuildError, and it
-    # pulls in the (heavy) datasets dependency only when actually building.
-    from .v2_parquet import build_v2_parquet
-
-    for config, rows in build_v2_parquet(
-        dataset_root, output_root or dataset_root
-    ).items():
+    for config, rows in v2_counts.items():
         configs[config] = {"train": rows}
 
     report = BuildReport(

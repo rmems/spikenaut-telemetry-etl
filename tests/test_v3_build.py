@@ -383,6 +383,22 @@ def test_unreadable_source_is_a_build_error(tmp_path):
         build_v3(tmp_path)
 
 
+def test_aux_source_failure_does_not_replace_v3(tmp_path):
+    """A bad mining/hft/qubic JSONL must fail before v3/ is cleaned or written."""
+    write_v2_gpu(tmp_path, n_rows=205)
+    write_v2_aux(tmp_path)
+    build_v3(tmp_path, episode_len=EP_LEN, horizon=HORIZON)
+    report = (tmp_path / "v3" / "build_report.json").read_text()
+    shard = (tmp_path / "v3" / "gpu_telemetry" / "full-00000.parquet").read_bytes()
+    (tmp_path / "full_data" / "node_sync_harvest.jsonl").write_text("{not json\n")
+    with pytest.raises(BuildError):
+        build_v3(tmp_path, episode_len=EP_LEN, horizon=HORIZON)
+    assert (tmp_path / "v3" / "build_report.json").read_text() == report
+    assert (
+        tmp_path / "v3" / "gpu_telemetry" / "full-00000.parquet"
+    ).read_bytes() == shard
+
+
 def test_rebuild_removes_stale_owned_shards(tmp_path):
     write_v2_gpu(tmp_path, n_rows=205)
     write_v2_aux(tmp_path)
