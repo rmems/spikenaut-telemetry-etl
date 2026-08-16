@@ -139,8 +139,8 @@ def test_build_writes_every_config(built):
     root, report = built
     v3 = root / "v3"
     for config, splits in {
-        "gpu_telemetry": ["train"],
-        "qubic_signals": ["train"],
+        "gpu_telemetry": ["full"],
+        "qubic_signals": ["full"],
         "state_telemetry": ["train", "validation", "test"],
         "action_proposals": ["train", "validation", "test"],
         "safety_filter_log": ["train", "validation", "test"],
@@ -160,7 +160,7 @@ def test_v2_files_are_untouched(built):
 
 def test_gpu_v3_drops_qubic_and_duplicate_clock(built):
     root, _ = built
-    table = pq.read_table(root / "v3" / "gpu_telemetry" / "train-00000.parquet")
+    table = pq.read_table(root / "v3" / "gpu_telemetry" / "full-00000.parquet")
     names = set(table.column_names)
     assert "qubic_tick_trace" not in names
     assert "clock_mhz" not in names
@@ -172,7 +172,7 @@ def test_gpu_v3_drops_qubic_and_duplicate_clock(built):
 
 def test_qubic_signals_carry_only_qubic_columns(built):
     root, _ = built
-    table = pq.read_table(root / "v3" / "qubic_signals" / "train-00000.parquet")
+    table = pq.read_table(root / "v3" / "qubic_signals" / "full-00000.parquet")
     assert set(table.column_names) == {
         "row_index",
         "ts_utc",
@@ -331,10 +331,30 @@ def test_missing_source_is_a_build_error(tmp_path):
         build_v3(tmp_path)
 
 
+def test_unreadable_source_is_a_build_error(tmp_path):
+    full_data = tmp_path / "full_data"
+    full_data.mkdir(parents=True)
+    (full_data / "neuromorphic_data.jsonl").write_text("{not json at all\n")
+    with pytest.raises(BuildError, match="cannot read"):
+        build_v3(tmp_path)
+
+
+def test_rebuild_removes_stale_owned_shards(tmp_path):
+    write_v2_gpu(tmp_path, n_rows=205)
+    build_v3(tmp_path, episode_len=EP_LEN, horizon=HORIZON)
+    stale = tmp_path / "v3" / "state_telemetry" / "train-00001.parquet"
+    stale.write_bytes(b"stale shard from an older build")
+    foreign = tmp_path / "v3" / "notes.txt"
+    foreign.write_text("not builder-owned; must survive")
+    build_v3(tmp_path, episode_len=EP_LEN, horizon=HORIZON)
+    assert not stale.exists()
+    assert foreign.exists()
+
+
 def test_gpu_v3_and_qubic_signals_row_counts_match_source(built):
     root, report = built
-    assert report.configs["gpu_telemetry_v3"]["train"] == 205
-    assert report.configs["qubic_signals"]["train"] == 205
+    assert report.configs["gpu_telemetry_v3"]["full"] == 205
+    assert report.configs["qubic_signals"]["full"] == 205
     total_state = sum(report.configs["state_telemetry"].values())
     # 21 episodes of 10 (last short), minus two 10-row embargo episodes.
     assert total_state == 205 - 20

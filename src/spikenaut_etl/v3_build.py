@@ -160,6 +160,8 @@ PROPOSALS_SCHEMA = pa.schema(
         pa.field("proposal_logits", pa.list_(pa.float32())),
         pa.field("teacher_action", pa.string()),
         pa.field("teacher_action_id", pa.int16()),
+        # Traceability contract: every published label names the exact teacher
+        # clause (TR-xxx) that produced it.
         pa.field("teacher_rule_id", pa.string()),
         pa.field("label_source", pa.string()),
         pa.field("label_confidence", pa.float32()),
@@ -381,16 +383,23 @@ def _read_gpu_v2(dataset_root: Path) -> pa.Table:
     source = dataset_root / GPU_SOURCE
     if not source.exists():
         raise BuildError(f"missing v2 source {source}")
-    table = pa_json.read_json(source)
+    try:
+        table = pa_json.read_json(source)
+    except (pa.ArrowInvalid, OSError) as exc:
+        raise BuildError(f"cannot read {source}: {exc}") from exc
     n = table.num_rows
     if n == 0:
         raise BuildError(f"{source} is empty")
+    # fill_null(False): pc.all skips nulls by default, and a null in either
+    # guard column must fail the gate, not slip past it.
     row_index = table.column("row_index")
     expected = pa.chunked_array([pa.array(range(n), type=pa.int64())])
-    if not pc.all(pc.equal(row_index, expected)).as_py():
+    if not pc.all(pc.fill_null(pc.equal(row_index, expected), False)).as_py():
         raise BuildError("row_index is not contiguous 0..N-1; refusing to episode it")
     if not pc.all(
-        pc.equal(table.column("clock_mhz"), table.column("gpu_clock_mhz"))
+        pc.fill_null(
+            pc.equal(table.column("clock_mhz"), table.column("gpu_clock_mhz")), False
+        )
     ).as_py():
         raise BuildError(
             "clock_mhz != gpu_clock_mhz; the duplicate-column assumption broke"
@@ -646,6 +655,38 @@ def _assert_non_degenerate(splits: dict[str, pa.Table]) -> None:
         raise BuildError("no rows survived the split")
 
 
+# Every artifact the builder owns under v3/. Anything else in v3/ is foreign
+# and is left alone.
+OWNED_CONFIG_DIRS = (
+    "gpu_telemetry",
+    "qubic_signals",
+    "state_telemetry",
+    "action_proposals",
+    "safety_filter_log",
+    "outcomes",
+    "encoding_params",
+)
+
+
+def _clean_owned_outputs(out_root: Path) -> None:
+    """Remove builder-owned artifacts from a previous run.
+
+    A rebuild that only overwrites matching filenames would leave stale shards
+    (say, an old ``train-00001.parquet``) mixed into the new tree. Deleting
+    exactly what this builder owns keeps rebuilds deterministic without
+    touching anything a human may have parked under ``v3/``.
+    """
+    for name in OWNED_CONFIG_DIRS:
+        directory = out_root / name
+        if not directory.is_dir():
+            continue
+        for stale in directory.glob("*.parquet"):
+            stale.unlink()
+    report = out_root / "build_report.json"
+    if report.exists():
+        report.unlink()
+
+
 def _write(table: pa.Table, directory: Path, split: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{split}-00000.parquet"
@@ -681,11 +722,17 @@ def build_v3(
     safety_splits = {name: SAFETY_SCHEMA.empty_table() for name in state_splits}
     encoding = build_encoding_params(state_splits["train"])
 
+    _clean_owned_outputs(out_root)
+
+    # The two flat corpus derivations are complete captures, not training
+    # sets: they cover validation, test, and embargo episodes too. Publishing
+    # them under a "train" split would mislabel those rows, so they ship as a
+    # single "full" split; episode membership is recoverable from row_index.
     configs: dict[str, dict[str, int]] = {}
-    _write(gpu_v3, out_root / "gpu_telemetry", "train")
-    configs["gpu_telemetry_v3"] = {"train": gpu_v3.num_rows}
-    _write(qubic, out_root / "qubic_signals", "train")
-    configs["qubic_signals"] = {"train": qubic.num_rows}
+    _write(gpu_v3, out_root / "gpu_telemetry", "full")
+    configs["gpu_telemetry_v3"] = {"full": gpu_v3.num_rows}
+    _write(qubic, out_root / "qubic_signals", "full")
+    configs["qubic_signals"] = {"full": qubic.num_rows}
     for name, tables in (
         ("state_telemetry", state_splits),
         ("action_proposals", proposal_splits),
