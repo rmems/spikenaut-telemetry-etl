@@ -1,0 +1,22 @@
+tests/test_v3_build.py
+  s_9e210268da7e37::t_40f9a04b64a502 369
+  s_9e210268da7e37::t_c2ec424e5846e9 380-381,402-409
+src/spikenaut_etl/v3_build.py
+  s_9e210268da7e37::t_2a77456e94d7eb 722
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "724b01cf24fdc6277633918d78fdc8c2799963cd",
+  "prompts": {},
+  "sessions": {
+    "s_9e210268da7e37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c7fb48da-9d9d-4fd4-8ef3-0f614d668dd3",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Raul Montoya Cardenas <montoyaraul34@gmail.com>"
+    }
+  }
+}
