@@ -716,7 +716,8 @@ def build_v3(
     # Deferred import: v2_parquet imports this module for BuildError, and it
     # pulls in the (heavy) datasets dependency only when actually building.
     # Import and convert before cleaning v3/ so a missing extra or a bad aux
-    # JSONL cannot leave a half-replaced tree.
+    # JSONL cannot leave a half-replaced tree; build_v2_parquet itself loads
+    # every source fully before replacing any shard.
     from .v2_parquet import build_v2_parquet
 
     out_root = (output_root or dataset_root) / "v3"

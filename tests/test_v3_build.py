@@ -366,6 +366,7 @@ def test_teacher_labels_appear_when_signals_exist(built):
 
 def test_clock_duplicate_assumption_is_guarded(tmp_path):
     write_v2_gpu(tmp_path, n_rows=205, clock_mismatch=True)
+    write_v2_aux(tmp_path)
     with pytest.raises(BuildError, match="clock_mhz"):
         build_v3(tmp_path, episode_len=EP_LEN, horizon=HORIZON)
 
@@ -376,9 +377,8 @@ def test_missing_source_is_a_build_error(tmp_path):
 
 
 def test_unreadable_source_is_a_build_error(tmp_path):
-    full_data = tmp_path / "full_data"
-    full_data.mkdir(parents=True)
-    (full_data / "neuromorphic_data.jsonl").write_text("{not json at all\n")
+    write_v2_aux(tmp_path)
+    (tmp_path / "full_data" / "neuromorphic_data.jsonl").write_text("{not json at all\n")
     with pytest.raises(BuildError, match="cannot read"):
         build_v3(tmp_path)
 
@@ -397,6 +397,16 @@ def test_aux_source_failure_does_not_replace_v3(tmp_path):
     assert (
         tmp_path / "v3" / "gpu_telemetry" / "full-00000.parquet"
     ).read_bytes() == shard
+
+
+def test_missing_aux_source_fails_before_any_write(tmp_path):
+    """A v2 source the late conversion stage would need must fail the build
+    up front, leaving no partial v3 tree behind."""
+    write_v2_gpu(tmp_path, n_rows=205)
+    with pytest.raises(BuildError, match="missing v2 source"):
+        build_v3(tmp_path, episode_len=EP_LEN, horizon=HORIZON)
+    assert not (tmp_path / "v3").exists()
+    assert not (tmp_path / "v2_parquet").exists()
 
 
 def test_rebuild_removes_stale_owned_shards(tmp_path):
