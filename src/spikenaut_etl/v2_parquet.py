@@ -92,10 +92,16 @@ def convert_source(dataset_root: Path, config: str, out_root: Path) -> Conversio
     for stale in directory.glob("*.parquet"):
         stale.unlink()
     path = directory / "train-00000.parquet"
-    loaded.to_parquet(str(path))
-
-    # Verify the fidelity contract by reloading what was just written.
-    reloaded = datasets.load_dataset("parquet", data_files=str(path), split="train")
+    try:
+        loaded.to_parquet(str(path))
+        # Verify the fidelity contract by reloading what was just written.
+        reloaded = datasets.load_dataset(
+            "parquet", data_files=str(path), split="train"
+        )
+    except Exception as exc:  # noqa: BLE001 -- write/reload failures (disk,
+        # Arrow, loader internals) are expected failure modes of this entry
+        # point and must exit through the CLI's BuildError path.
+        raise BuildError(f"{config}: parquet write/reload failed: {exc!r}") from exc
     if reloaded.num_rows != loaded.num_rows:
         raise BuildError(
             f"{config}: parquet round-trip changed row count "

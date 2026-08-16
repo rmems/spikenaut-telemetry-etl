@@ -282,7 +282,15 @@ DELTA_FEATURES = (
 
 
 class BuildError(RuntimeError):
-    """A precondition or non-degeneracy check failed; nothing was written."""
+    """A precondition, fidelity, or non-degeneracy check failed.
+
+    All v3 tables are computed and validated before the first write, but the
+    build has several write stages (v3 configs, then the v2_parquet
+    conversions), so a failure can leave a partial tree. Completion is marked
+    by ``v3/build_report.json``, written last: a tree without it is
+    incomplete, and re-running the builder first removes every artifact it
+    owns, so no mixed-generation tree can survive a retry.
+    """
 
 
 @dataclass(frozen=True)
