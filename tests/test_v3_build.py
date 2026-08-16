@@ -310,6 +310,7 @@ def test_teacher_labels_appear_when_signals_exist(built):
     first = proposals.to_pylist()[0]
     assert first["teacher_action"] == "throttle_clocks"
     assert first["teacher_action_id"] == 1
+    assert first["teacher_rule_id"] == "TR-003-HW-THERMAL"
     assert first["label_source"] == "teacher_rule"
     assert first["label_confidence"] == pytest.approx(1.0)
 

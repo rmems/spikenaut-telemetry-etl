@@ -160,6 +160,7 @@ PROPOSALS_SCHEMA = pa.schema(
         pa.field("proposal_logits", pa.list_(pa.float32())),
         pa.field("teacher_action", pa.string()),
         pa.field("teacher_action_id", pa.int16()),
+        pa.field("teacher_rule_id", pa.string()),
         pa.field("label_source", pa.string()),
         pa.field("label_confidence", pa.float32()),
     ]
@@ -578,6 +579,7 @@ def build_action_proposals(state: pa.Table) -> pa.Table:
                 "proposal_logits": None,
                 "teacher_action": decision.action.action_name,
                 "teacher_action_id": int(decision.action),
+                "teacher_rule_id": decision.rule_id,
                 "label_source": "teacher_rule",
                 "label_confidence": decision.confidence,
             }
