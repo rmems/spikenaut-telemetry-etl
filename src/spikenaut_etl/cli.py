@@ -64,7 +64,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "build-v3":
         # Deferred import: the base install stays pyarrow-free for validate/clean.
-        from .v3_build import BuildError, build_v3
+        try:
+            from .v3_build import BuildError, build_v3
+        except ImportError as exc:
+            print(
+                f"error: build-v3 needs the 'v3' extra: {exc}\n"
+                "install it with: pip install 'spikenaut-telemetry-etl[v3]'",
+                file=sys.stderr,
+            )
+            return 2
 
         try:
             build_report = build_v3(args.input, args.output)
