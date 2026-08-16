@@ -1,0 +1,23 @@
+tests/test_teacher_policy.py
+  s_9e210268da7e37::t_f7f72452689429 1-9,12-251
+  s_9e210268da7e37::t_94869198068011 10-11
+src/spikenaut_etl/teacher_policy.py
+  s_9e210268da7e37::t_cec652613d34bc 153-155,157
+  s_9e210268da7e37::t_7438c6a4688f80 1-152,156,158-228
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "1255cbe6b065ed13a4db9606736288eb9fea9d2b",
+  "prompts": {},
+  "sessions": {
+    "s_9e210268da7e37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c7fb48da-9d9d-4fd4-8ef3-0f614d668dd3",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Raul Montoya Cardenas <montoyaraul34@gmail.com>"
+    }
+  }
+}
