@@ -8,8 +8,9 @@
 Exit status is 1 if any source fails a gate, so CI fails on corrupt data.
 
 ``build-v3`` reads the *published v2 JSONL* in a dataset-repo checkout (not the
-raw backup) and writes the additive ``v3/`` Parquet tree; --output defaults to
-the same checkout. It needs the ``v3`` optional dependency (pyarrow).
+raw backup) and writes the additive ``v3/`` Parquet tree plus the
+``v2_parquet/`` config conversions; --output defaults to the same checkout. It
+needs the ``v3`` optional dependency (pyarrow + datasets).
 """
 
 from __future__ import annotations
@@ -66,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
         # Deferred import: the base install stays pyarrow-free for validate/clean.
         try:
             from .v3_build import BuildError, build_v3
+
+            build_report = build_v3(args.input, args.output)
         except ImportError as exc:
             print(
                 f"error: build-v3 needs the 'v3' extra: {exc}\n"
@@ -73,9 +76,6 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-
-        try:
-            build_report = build_v3(args.input, args.output)
         except BuildError as exc:
             print(f"build-v3 failed: {exc}", file=sys.stderr)
             return 1
