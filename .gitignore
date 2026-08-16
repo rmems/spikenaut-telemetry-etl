@@ -14,3 +14,7 @@ build/
 
 # Generated reports
 reports/
+
+# Local agent-tooling caches (hf CLI skill files etc.) -- never repo content.
+.agents/
+.claude/
