@@ -35,8 +35,6 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           fetch-depth: 1
-          # Don't leave the job's credentials in .git/config for later steps.
-          persist-credentials: false
 
       - name: Run Claude Code Review
         id: claude-review
