@@ -140,9 +140,13 @@ def test_missing_source_refuses(tmp_path):
 
 def test_empty_source_refuses(tmp_path):
     write_jsonl(tmp_path / "full_data" / "node_sync_harvest.jsonl", [])
-    (tmp_path / "full_data" / "node_sync_harvest.jsonl").write_text("")
     with pytest.raises(BuildError):
         convert_source(tmp_path, "mining", tmp_path)
+
+
+def test_unknown_config_refuses(tmp_path):
+    with pytest.raises(BuildError, match="unknown v2 config"):
+        convert_source(tmp_path, "nonsense", tmp_path)
 
 
 def test_rebuild_replaces_stale_shards(v2_repo):

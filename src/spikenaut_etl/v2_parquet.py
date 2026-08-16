@@ -71,6 +71,10 @@ def _features_equivalent(
 
 
 def convert_source(dataset_root: Path, config: str, out_root: Path) -> ConversionResult:
+    if config not in V2_SOURCES:
+        raise BuildError(
+            f"unknown v2 config {config!r}; expected one of {sorted(V2_SOURCES)}"
+        )
     source = dataset_root / V2_SOURCES[config]
     if not source.exists():
         raise BuildError(f"missing v2 source {source}")
