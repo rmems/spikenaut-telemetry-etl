@@ -23,12 +23,16 @@ dependencies = [
 # dependency-light, so it lives in an extra rather than the base install.
 v3 = [
     "pyarrow>=17",
+    # v2_parquet defines its conversion as "exactly what datasets loads from
+    # the JSONL, written to Parquet" -- the library is the fidelity contract.
+    "datasets>=3.0",
 ]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
     "mypy>=1.11",
     "pyarrow>=17",
+    "datasets>=3.0",
 ]
 
 [project.scripts]

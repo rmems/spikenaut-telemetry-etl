@@ -47,10 +47,48 @@ V2_GPU_COLUMNS = [
 ]
 
 
+def write_v2_aux(root) -> None:
+    """Minimal mining/hft/qubic files so build_v3's v2_parquet stage runs."""
+    full_data = root / "full_data"
+    full_data.mkdir(parents=True, exist_ok=True)
+    with (full_data / "node_sync_harvest.jsonl").open("w") as f:
+        for i in range(10):
+            f.write(
+                json.dumps(
+                    {
+                        "hashrate_mh": 1.0 + i,
+                        "timestamp": f"2026-03-19T12:00:{i:02d}" if i % 2 else None,
+                        "blockchain": None if i % 2 else "dynex",
+                    }
+                )
+                + "\n"
+            )
+    with (full_data / "ghost_market_log.jsonl").open("w") as f:
+        for i in range(10):
+            f.write(
+                json.dumps(
+                    {
+                        "timestamp": f"2026-03-11T18:22:{i:02d}",
+                        "step": i,
+                        "action": "observe",
+                    }
+                )
+                + "\n"
+            )
+    with (full_data / "qubic_ticks_snn.jsonl").open("w") as f:
+        for i in range(10):
+            f.write(
+                json.dumps(
+                    {"timestamp": f"2026-03-20T08:55:{i:02d}+00:00", "tick": i}
+                )
+                + "\n"
+            )
+
+
 def write_v2_gpu(root, n_rows: int, clock_mismatch: bool = False) -> None:
     """A tiny but non-degenerate stand-in for neuromorphic_data.jsonl."""
     full_data = root / "full_data"
-    full_data.mkdir(parents=True)
+    full_data.mkdir(parents=True, exist_ok=True)
     with (full_data / "neuromorphic_data.jsonl").open("w") as f:
         for i in range(n_rows):
             clock = 2000.0 + (i % 7) * 100.0
@@ -128,11 +166,14 @@ def test_full_size_geometry_matches_the_real_capture():
 # --------------------------------------------------------------------------- #
 
 
-@pytest.fixture()
-def built(tmp_path):
-    write_v2_gpu(tmp_path, n_rows=205)  # 21 episodes, last one short
-    report = build_v3(tmp_path, episode_len=EP_LEN, horizon=HORIZON)
-    return tmp_path, report
+@pytest.fixture(scope="module")
+def built(tmp_path_factory):
+    """One full build shared by the read-only assertions below."""
+    root = tmp_path_factory.mktemp("dataset_repo")
+    write_v2_gpu(root, n_rows=205)  # 21 episodes, last one short
+    write_v2_aux(root)
+    report = build_v3(root, episode_len=EP_LEN, horizon=HORIZON)
+    return root, report
 
 
 def test_build_writes_every_config(built):
@@ -149,6 +190,9 @@ def test_build_writes_every_config(built):
     }.items():
         for split in splits:
             assert (v3 / config / f"{split}-00000.parquet").exists()
+    for v2_config in ("gpu_telemetry", "mining", "hft", "qubic_ticks"):
+        assert (root / "v2_parquet" / v2_config / "train-00000.parquet").exists()
+        assert report.configs[v2_config]["train"] > 0
     assert report.schema_version == SCHEMA_VERSION
     assert (v3 / "build_report.json").exists()
 
@@ -341,6 +385,7 @@ def test_unreadable_source_is_a_build_error(tmp_path):
 
 def test_rebuild_removes_stale_owned_shards(tmp_path):
     write_v2_gpu(tmp_path, n_rows=205)
+    write_v2_aux(tmp_path)
     build_v3(tmp_path, episode_len=EP_LEN, horizon=HORIZON)
     stale = tmp_path / "v3" / "state_telemetry" / "train-00001.parquet"
     stale.write_bytes(b"stale shard from an older build")

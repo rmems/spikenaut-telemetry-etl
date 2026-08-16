@@ -8,8 +8,9 @@
 Exit status is 1 if any source fails a gate, so CI fails on corrupt data.
 
 ``build-v3`` reads the *published v2 JSONL* in a dataset-repo checkout (not the
-raw backup) and writes the additive ``v3/`` Parquet tree; --output defaults to
-the same checkout. It needs the ``v3`` optional dependency (pyarrow).
+raw backup) and writes the additive ``v3/`` Parquet tree plus the
+``v2_parquet/`` config conversions; --output defaults to the same checkout. It
+needs the ``v3`` optional dependency (pyarrow + datasets).
 """
 
 from __future__ import annotations

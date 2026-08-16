@@ -19,6 +19,10 @@ Outputs (one directory per Hugging Face config):
     v3/outcomes/            within-episode horizon deltas + RLDS step flags
     v3/encoding_params/     per-feature encoder sidecar (axon-encoder params)
 
+plus ``v2_parquet/<config>/`` next to ``v3/`` — Parquet conversions that serve
+the four v2 configs (see ``v2_parquet.py`` for why mixed JSONL/Parquet configs
+cannot work on the Hub). The v2 JSONL files themselves are never touched.
+
 Honesty rules inherited from the rest of this repo:
 
 - **Never synthesize a timestamp.** The v2 GPU source carries none and no
@@ -745,6 +749,15 @@ def build_v3(
             configs[name][split_name] = table.num_rows
     _write(encoding, out_root / "encoding_params", "train")
     configs["encoding_params"] = {"train": encoding.num_rows}
+
+    # Deferred import: v2_parquet imports this module for BuildError, and it
+    # pulls in the (heavy) datasets dependency only when actually building.
+    from .v2_parquet import build_v2_parquet
+
+    for config, rows in build_v2_parquet(
+        dataset_root, output_root or dataset_root
+    ).items():
+        configs[config] = {"train": rows}
 
     report = BuildReport(
         schema_version=SCHEMA_VERSION,
