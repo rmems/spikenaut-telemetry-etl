@@ -67,8 +67,6 @@ def main(argv: list[str] | None = None) -> int:
         # Deferred import: the base install stays pyarrow-free for validate/clean.
         try:
             from .v3_build import BuildError, build_v3
-
-            build_report = build_v3(args.input, args.output)
         except ImportError as exc:
             print(
                 f"error: build-v3 needs the 'v3' extra: {exc}\n"
@@ -76,6 +74,9 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
+
+        try:
+            build_report = build_v3(args.input, args.output)
         except BuildError as exc:
             print(f"build-v3 failed: {exc}", file=sys.stderr)
             return 1

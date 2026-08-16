@@ -419,6 +419,15 @@ def _read_gpu_v2(dataset_root: Path) -> pa.Table:
     return table
 
 
+def _telemetry_base_cols(gpu: pa.Table, n: int) -> dict[str, pa.Array | pa.ChunkedArray]:
+    return {
+        "row_index": gpu.column("row_index"),
+        "ts_utc": _nulls(n, pa.int64()),
+        "ts_synthetic_offset_ms": _nulls(n, pa.int64()),
+        "schema_version": _const_str(n, SCHEMA_VERSION),
+    }
+
+
 def build_gpu_telemetry_v3(gpu: pa.Table) -> pa.Table:
     """v2 GPU sensors, minus qubic_* and the duplicate clock_mhz column."""
     n = gpu.num_rows
@@ -427,12 +436,7 @@ def build_gpu_telemetry_v3(gpu: pa.Table) -> pa.Table:
         for name in gpu.column_names
         if name not in (*QUBIC_COLUMNS, "clock_mhz", "row_index")
     ]
-    cols: dict[str, pa.Array | pa.ChunkedArray] = {
-        "row_index": gpu.column("row_index"),
-        "ts_utc": _nulls(n, pa.int64()),
-        "ts_synthetic_offset_ms": _nulls(n, pa.int64()),
-        "schema_version": _const_str(n, SCHEMA_VERSION),
-    }
+    cols = _telemetry_base_cols(gpu, n)
     for name in keep:
         cols[name] = gpu.column(name)
     return pa.table(cols)
@@ -440,12 +444,7 @@ def build_gpu_telemetry_v3(gpu: pa.Table) -> pa.Table:
 
 def build_qubic_signals(gpu: pa.Table) -> pa.Table:
     n = gpu.num_rows
-    cols: dict[str, pa.Array | pa.ChunkedArray] = {
-        "row_index": gpu.column("row_index"),
-        "ts_utc": _nulls(n, pa.int64()),
-        "ts_synthetic_offset_ms": _nulls(n, pa.int64()),
-        "schema_version": _const_str(n, SCHEMA_VERSION),
-    }
+    cols = _telemetry_base_cols(gpu, n)
     for name in QUBIC_COLUMNS:
         cols[name] = gpu.column(name)
     return pa.table(cols)
@@ -487,7 +486,6 @@ def build_state_telemetry(
 
 def build_outcomes(
     state: pa.Table,
-    episode_len: int = EPISODE_LEN,
     horizon: int = OUTCOME_HORIZON_STEPS,
 ) -> pa.Table:
     """RLDS step structure plus the one horizon delta v2 can support.
@@ -732,7 +730,7 @@ def build_v3(
     state_splits = _split_table(state, layout)
     _assert_non_degenerate(state_splits)
 
-    outcomes = build_outcomes(state, episode_len=episode_len, horizon=horizon)
+    outcomes = build_outcomes(state, horizon=horizon)
     outcome_splits = _split_table(outcomes, layout)
     proposal_splits = {
         name: build_action_proposals(split_state)
