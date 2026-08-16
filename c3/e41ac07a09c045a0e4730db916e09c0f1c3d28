@@ -1,0 +1,36 @@
+tests/test_v3_build.py
+  s_9e210268da7e37::t_9c3738e3b44807 50-69,75-87,91
+  s_9e210268da7e37::t_8963ab97d786d5 70-74
+  s_9e210268da7e37::t_ff2bedfb6d001d 193-195
+  s_9e210268da7e37::t_be06497d640959 388
+  s_9e210268da7e37::t_2c34f6fb9a6a6c 169-176
+src/spikenaut_etl/cli.py
+  s_9e210268da7e37::t_3e74fb253bd785 11-13
+src/spikenaut_etl/v3_build.py
+  s_9e210268da7e37::t_69aea25d46885b 22-25
+  s_9e210268da7e37::t_c8e3393f67cbb3 753-761
+pyproject.toml
+  s_9e210268da7e37::t_ec81b308fb426e 26-28,35
+src/spikenaut_etl/v2_parquet.py
+  s_9e210268da7e37::t_41674fb2e77e6e 1-76,83-119
+  s_9e210268da7e37::t_bac0018b725a07 77-82
+tests/test_v2_parquet.py
+  s_9e210268da7e37::t_9907057c9fe288 1-143,145-153
+  s_9e210268da7e37::t_b7bc3f55aafcca 144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "c3e41ac07a09c045a0e4730db916e09c0f1c3d28",
+  "prompts": {},
+  "sessions": {
+    "s_9e210268da7e37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c7fb48da-9d9d-4fd4-8ef3-0f614d668dd3",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Raul Montoya Cardenas <montoyaraul34@gmail.com>"
+    }
+  }
+}
