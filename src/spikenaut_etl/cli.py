@@ -3,8 +3,13 @@
     spikenaut-etl validate --input <dir>     gates only, writes nothing
     spikenaut-etl clean    --input <dir> --output <dir>
     spikenaut-etl report   --input <dir>
+    spikenaut-etl build-v3 --input <dataset-repo> [--output <dataset-repo>]
 
 Exit status is 1 if any source fails a gate, so CI fails on corrupt data.
+
+``build-v3`` reads the *published v2 JSONL* in a dataset-repo checkout (not the
+raw backup) and writes the additive ``v3/`` Parquet tree; --output defaults to
+the same checkout. It needs the ``v3`` optional dependency (pyarrow).
 """
 
 from __future__ import annotations
@@ -24,10 +29,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="Clean and validate Spikenaut telemetry before publication.",
     )
     parser.add_argument(
-        "command", choices=("validate", "clean", "report"), help="action to perform"
+        "command",
+        choices=("validate", "clean", "report", "build-v3"),
+        help="action to perform",
     )
     parser.add_argument(
-        "--input", type=Path, required=True, help="directory holding the source JSONL"
+        "--input",
+        type=Path,
+        required=True,
+        help="directory holding the source JSONL (for build-v3: the dataset "
+        "repo checkout holding full_data/)",
     )
     parser.add_argument(
         "--output", type=Path, help="dataset repo root (required for 'clean')"
@@ -50,6 +61,29 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "clean" and args.output is None:
         print("error: --output is required for 'clean'", file=sys.stderr)
         return 2
+
+    if args.command == "build-v3":
+        # Deferred import: the base install stays pyarrow-free for validate/clean.
+        try:
+            from .v3_build import BuildError, build_v3
+        except ImportError as exc:
+            print(
+                f"error: build-v3 needs the 'v3' extra: {exc}\n"
+                "install it with: pip install 'spikenaut-telemetry-etl[v3]'",
+                file=sys.stderr,
+            )
+            return 2
+
+        try:
+            build_report = build_v3(args.input, args.output)
+        except BuildError as exc:
+            print(f"build-v3 failed: {exc}", file=sys.stderr)
+            return 1
+        for config, split_rows in sorted(build_report.configs.items()):
+            counts = ", ".join(f"{s}={n}" for s, n in split_rows.items())
+            print(f"  {config:<20} {counts}")
+        print("build-v3 complete; report written to v3/build_report.json")
+        return 0
 
     write_output = args.command == "clean"
     outcomes = run_all(

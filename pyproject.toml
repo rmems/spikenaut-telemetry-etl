@@ -19,10 +19,16 @@ dependencies = [
 [project.optional-dependencies]
 # Publishing is a git push against the Hugging Face dataset remote; `clean`
 # writes directly into a checkout of it. No SDK dependency needed.
+# The v3 Parquet builder is the one consumer of pyarrow; validate/clean stay
+# dependency-light, so it lives in an extra rather than the base install.
+v3 = [
+    "pyarrow>=17",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
     "mypy>=1.11",
+    "pyarrow>=17",
 ]
 
 [project.scripts]
