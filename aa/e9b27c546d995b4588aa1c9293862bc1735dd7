@@ -1,0 +1,19 @@
+src/spikenaut_etl/cli.py
+  s_9e210268da7e37::t_99128b39d23e3b 67-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "aae9b27c546d995b4588aa1c9293862bc1735dd7",
+  "prompts": {},
+  "sessions": {
+    "s_9e210268da7e37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c7fb48da-9d9d-4fd4-8ef3-0f614d668dd3",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Raul Montoya Cardenas <montoyaraul34@gmail.com>"
+    }
+  }
+}
