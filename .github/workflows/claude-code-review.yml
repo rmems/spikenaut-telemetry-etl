@@ -45,6 +45,10 @@ jobs:
           plugins: 'code-review@claude-code-plugins'
           prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
           claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
+          # CodeRabbit's autofix bot pushes commits directly to PR branches, which
+          # fires this workflow's `synchronize` trigger with the bot as the actor.
+          # Without this, the action refuses to run for any non-human actor.
+          allowed_bots: 'coderabbitai'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 
