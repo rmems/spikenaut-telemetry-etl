@@ -77,6 +77,13 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             build_report = build_v3(args.input, args.output)
+        except ImportError as exc:
+            print(
+                f"error: build-v3 needs the 'v3' extra: {exc}\n"
+                "install it with: pip install 'spikenaut-telemetry-etl[v3]'",
+                file=sys.stderr,
+            )
+            return 2
         except BuildError as exc:
             print(f"build-v3 failed: {exc}", file=sys.stderr)
             return 1
