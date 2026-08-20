@@ -311,7 +311,7 @@ def test_outcomes_delta_and_rlds_flags(tmp_path):
     write_v2_gpu(tmp_path, n_rows=205)
     gpu = v3_build._read_gpu_v2(tmp_path)
     state = build_state_telemetry(gpu, episode_len=EP_LEN)
-    outcomes = build_outcomes(state, episode_len=EP_LEN, horizon=HORIZON)
+    outcomes = build_outcomes(state, horizon=HORIZON)
     assert outcomes.schema.equals(OUTCOMES_SCHEMA)
 
     rows = outcomes.to_pylist()
