@@ -116,9 +116,16 @@ def find_dead_columns(rows: Sequence[dict[str, Any]]) -> set[str]:
 
 
 def report_dead_column_drift(
-    observed: Iterable[str], expected: Iterable[str]
+    observed: Iterable[str],
+    expected: Iterable[str],
+    *,
+    present: Iterable[str] | None = None,
 ) -> list[str]:
     observed_set, expected_set = set(observed), set(expected)
+    if present is not None:
+        present_set = set(present)
+        observed_set &= present_set
+        expected_set &= present_set
     messages = []
     for col in sorted(expected_set - observed_set):
         messages.append(f"{col!r} was expected dead but now carries signal")
@@ -226,7 +233,8 @@ def clean_gpu_telemetry(path: Path) -> CleanResult:
         raw.append(payload)
 
     dead = find_dead_columns(raw) - {"row_index"}
-    drift = report_dead_column_drift(dead, EXPECTED_DEAD_GPU)
+    present = {key for row in raw for key in row}
+    drift = report_dead_column_drift(dead, EXPECTED_DEAD_GPU, present=present)
     rows = drop_columns(raw, dead)
 
     return CleanResult(
@@ -291,12 +299,16 @@ def clean_node_sync(path: Path) -> CleanResult:
 
     kept = [t for pos, t in enumerate(parsed_rows) if pos not in disordered]
     raw = [payload for _, payload, _ in kept]
-    coins = Counter(p.coin or "__unattributed__" for _, _, p in kept)
+    coins = Counter(
+        (payload.get("blockchain") or p.coin or "__unattributed__")
+        for _, payload, p in kept
+    )
     epochs = [p.epoch for _, _, p in kept if p.epoch is not None]
 
     identity = {"timestamp", "blockchain", "block_height", "chain_epoch"}
     dead = find_dead_columns(raw) - identity
-    drift = report_dead_column_drift(dead, EXPECTED_DEAD_NODE_SYNC)
+    present = {key for row in raw for key in row}
+    drift = report_dead_column_drift(dead, EXPECTED_DEAD_NODE_SYNC, present=present)
     rows = drop_columns(raw, dead)
 
     return CleanResult(

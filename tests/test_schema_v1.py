@@ -129,6 +129,7 @@ def test_miner_perf_maps_to_stable_node_sync_columns():
     assert result.ingest.n_parsed == 8
     assert len(result.rows) == 8
     assert {row["blockchain"] for row in result.rows} == {"kaspa"}
+    assert result.coin_counts["kaspa"] == 8
     assert result.rows[0]["hashrate_mh"] == pytest.approx(1250.0)
     published = CLEAN_COLUMNS["node_sync_harvest"]
     for row in result.rows:

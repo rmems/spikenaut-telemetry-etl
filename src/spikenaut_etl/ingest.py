@@ -115,13 +115,11 @@ def read_validated(
                 )
             try:
                 record = parse_record(payload, model, row=row, source=path.name)
-            except PydanticValidationError as exc:
-                stats.n_schema_errors += 1
-                stats.note_error(row, f"schema violation: {_terse(exc)}")
-                raise IngestError(
-                    f"{path.name}:{row}: schema violation: {_terse(exc)}; "
-                    "refusing to ingest"
-                ) from exc
+            except IngestError as exc:
+                if "schema violation" in str(exc):
+                    stats.n_schema_errors += 1
+                    stats.note_error(row, str(exc))
+                raise
             stats.n_parsed += 1
             yield row, record
 
@@ -142,7 +140,13 @@ def parse_record(
                 f"this reader implements Theseus-Quarry schema v"
                 f"{COLLECTOR_SCHEMA_VERSION} only and will not guess"
             )
-        envelope = TelemetryEnvelope.model_validate(payload)
+        try:
+            envelope = TelemetryEnvelope.model_validate(payload)
+        except PydanticValidationError as exc:
+            raise IngestError(
+                f"{source}:{row}: schema violation: {_terse(exc)}; "
+                "refusing to ingest"
+            ) from exc
         _reject_empty_v1(envelope, row=row, source=source)
         return envelope
 
@@ -152,7 +156,12 @@ def parse_record(
             "refusing to guess"
         )
 
-    record = model.model_validate(payload)
+    try:
+        record = model.model_validate(payload)
+    except PydanticValidationError as exc:
+        raise IngestError(
+            f"{source}:{row}: schema violation: {_terse(exc)}; refusing to ingest"
+        ) from exc
     _reject_empty_legacy(record, row=row, source=source)
     return record
 
