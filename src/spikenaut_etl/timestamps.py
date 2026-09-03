@@ -135,6 +135,11 @@ def parse(raw: object) -> ParsedTimestamp:
             raw=raw, moment=datetime.fromtimestamp(int(text), tz=timezone.utc)
         )
 
+    # Theseus-Quarry chrono DateTime<Utc> serializes with a trailing Z.
+    # Python 3.10's fromisoformat rejects Z; the %z patterns want ±HH:MM.
+    if text.endswith("Z") and "T" in text:
+        text = text[:-1] + "+00:00"
+
     normalized = _truncate_subseconds(text)
 
     for pattern in _DATETIME_PATTERNS:

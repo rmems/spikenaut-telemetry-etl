@@ -6,8 +6,9 @@ which is how the ``kaspa_*`` / ``monero_*`` fields in ``neuromorphic_data.jsonl`
 were dropped without anyone noticing.
 
 Field names track ``TelemetryEnvelope`` in ``rmems/Theseus-Quarry``
-(``crates/mining-telemetry-core/src/schema.rs``) so schema-v1 collections can flow
-through this pipeline unchanged once the legacy backlog is cleared.
+(``crates/mining-telemetry-core/src/schema.rs``). Ingest dispatches on
+``schema_version`` and maps v1 ``kind`` / tagged ``payload`` onto the ``Clean*``
+contracts below so published columns stay stable.
 
 Two rules apply throughout:
 
@@ -19,13 +20,26 @@ Two rules apply throughout:
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Schema version of the *cleaned output*, independent of Theseus-Quarry's
 # collection schema version. Bump on any breaking change to published columns.
 OUTPUT_SCHEMA_VERSION = 2
+
+# Theseus-Quarry ``SCHEMA_VERSION`` in mining-telemetry-core. Break-free: this
+# reader implements v1 only and refuses to guess at any other version.
+COLLECTOR_SCHEMA_VERSION = 1
+
+RecordKind = Literal[
+    "miner_perf",
+    "node_health",
+    "host_hw",
+    "status",
+    "gpu_sched",
+    "rotation",
+]
 
 
 class StrictRecord(BaseModel):
@@ -163,6 +177,101 @@ class RawTradingLog(StrictRecord):
     portfolio_value: float
     ch2_mode: str
     reason: str
+
+
+# --------------------------------------------------------------------------- #
+# Theseus-Quarry schema v1 (TelemetryEnvelope + tagged TelemetryPayload)
+# --------------------------------------------------------------------------- #
+# Shape is taken from crates/mining-telemetry-core/src/schema.rs. extra=forbid
+# so an unknown field or payload tag is a loud ValidationError, not a drop.
+
+
+class PayloadMinerPerf(StrictRecord):
+    type: Literal["miner_perf"]
+    coin: str
+    hashrate: float
+    hashrate_unit: str
+    shares_accepted: int | None = None
+    shares_rejected: int | None = None
+    is_active: bool
+    uptime_seconds: int | None = None
+
+
+class PayloadNodeHealth(StrictRecord):
+    type: Literal["node_health"]
+    coin: str
+    height: int | None = None
+    target_height: int | None = None
+    tick: int | None = None
+    epoch: int | None = None
+    active: bool | None = None
+    speed_hs: int | None = None
+    threads: int | None = None
+    hashrate_mh: float | None = None
+
+
+class PayloadHostHw(StrictRecord):
+    type: Literal["host_hw"]
+    cpu_tctl_c: float | None = None
+    cpu_ccd1_c: float | None = None
+    cpu_ccd2_c: float | None = None
+    cpu_package_power_w: float | None = None
+
+
+class PayloadStatus(StrictRecord):
+    type: Literal["status"]
+    message: str
+
+
+class PayloadGpuSched(StrictRecord):
+    type: Literal["gpu_sched"]
+    decision: str
+    vram_used_mb: int
+    vram_total_mb: int
+    gpu_temp_c: float
+    power_w: float
+    transition_count: int
+
+
+class PayloadRotation(StrictRecord):
+    type: Literal["rotation"]
+    kind: str
+    from_algo: str | None = None
+    to_algo: str | None = None
+    market_age_secs: float
+
+
+TelemetryPayload = Annotated[
+    PayloadMinerPerf
+    | PayloadNodeHealth
+    | PayloadHostHw
+    | PayloadStatus
+    | PayloadGpuSched
+    | PayloadRotation,
+    Field(discriminator="type"),
+]
+
+
+class TelemetryEnvelope(StrictRecord):
+    """Theseus-Quarry durable JSONL line (``SCHEMA_VERSION = 1``)."""
+
+    schema_version: int
+    timestamp: str
+    source: str
+    kind: RecordKind
+    host: str | None = None
+    run_id: str | None = None
+    stem: str
+    payload: TelemetryPayload
+
+    @model_validator(mode="after")
+    def _kind_matches_payload(self) -> TelemetryEnvelope:
+        payload_type = self.payload.type
+        if self.kind != payload_type:
+            raise ValueError(
+                f"kind {self.kind!r} does not match payload.type {payload_type!r}"
+            )
+        return self
 
 
 # --------------------------------------------------------------------------- #

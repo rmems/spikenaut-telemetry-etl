@@ -16,13 +16,14 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
-from . import timestamps
-from .ingest import IngestStats, read_validated
+from . import timestamps, v1
+from .ingest import IngestError, IngestStats, read_validated
 from .schemas import (
     RawGpuRecord,
     RawNodeSyncRecord,
     RawQubicTick,
     RawTradingLog,
+    TelemetryEnvelope,
 )
 
 # Columns expected to be dead, from profiling the recovered originals on
@@ -217,8 +218,11 @@ def clean_gpu_telemetry(path: Path) -> CleanResult:
     quarantine = timestamps.QuarantineLog(source="neuromorphic_data")
     raw: list[dict[str, Any]] = []
     for row, record in read_validated(path, RawGpuRecord, stats):
-        payload = record.telemetry.model_dump()
-        payload["row_index"] = row
+        if isinstance(record, TelemetryEnvelope):
+            payload = v1.map_envelope_to_gpu(record, row)
+        else:
+            payload = record.telemetry.model_dump()
+            payload["row_index"] = row
         raw.append(payload)
 
     dead = find_dead_columns(raw) - {"row_index"}
@@ -249,6 +253,17 @@ def clean_node_sync(path: Path) -> CleanResult:
     parsed_rows: list[tuple[int, dict[str, Any], timestamps.ParsedTimestamp]] = []
 
     for row, record in read_validated(path, RawNodeSyncRecord, stats):
+        if isinstance(record, TelemetryEnvelope):
+            payload = v1.map_envelope_to_node_sync(record)
+            raw_ts = payload.get("timestamp")
+            parsed = timestamps.parse(raw_ts)
+            if not parsed.ok:
+                quarantine.record(row, str(raw_ts), timestamps.UNPARSEABLE)
+                continue
+            payload["timestamp"] = parsed.iso
+            parsed_rows.append((row, payload, parsed))
+            continue
+
         parsed = timestamps.parse(record.timestamp)
         if not parsed.ok:
             quarantine.record(row, record.timestamp, timestamps.UNPARSEABLE)
@@ -307,9 +322,14 @@ def clean_qubic_ticks(path: Path) -> CleanResult:
     """
     stats = IngestStats(source="qubic_ticks")
     quarantine = timestamps.QuarantineLog(source="qubic_ticks")
-    records: list[tuple[int, RawQubicTick]] = list(
-        read_validated(path, RawQubicTick, stats)
-    )
+    records: list[tuple[int, RawQubicTick]] = []
+    for row, record in read_validated(path, RawQubicTick, stats):
+        if isinstance(record, TelemetryEnvelope):
+            raise IngestError(
+                f"{path.name}:{row}: Theseus-Quarry schema v1 envelope cannot "
+                "be read as qubic_ticks; refusing to invent a mapping"
+            )
+        records.append((row, record))
     if not records:
         return CleanResult(
             name="qubic_ticks_snn",
@@ -374,6 +394,11 @@ def clean_trading_log(path: Path) -> CleanResult:
     epochs: list[float] = []
 
     for row, record in read_validated(path, RawTradingLog, stats):
+        if isinstance(record, TelemetryEnvelope):
+            raise IngestError(
+                f"{path.name}:{row}: Theseus-Quarry schema v1 envelope cannot "
+                "be read as ghost_market_log; refusing to invent a mapping"
+            )
         parsed = timestamps.parse(record.timestamp)
         if not parsed.ok:
             quarantine.record(row, record.timestamp, timestamps.UNPARSEABLE)

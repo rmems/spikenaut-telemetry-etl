@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from spikenaut_etl import clean, timestamps
+from spikenaut_etl.ingest import IngestError
 from spikenaut_etl.pipeline import SOURCES, run_source
 from spikenaut_etl.validate import (
     GateConfig,
@@ -36,12 +37,21 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def test_all_empty_telemetry_is_rejected(tmp_path):
-    """The shipped neuromorphic_data.jsonl must not survive validation."""
-    result = clean.clean_gpu_telemetry(CORRUPT / "all_empty_telemetry.jsonl")
+    """The shipped neuromorphic_data.jsonl must not survive ingest or validation.
+
+    ``{"telemetry":{}}`` used to parse because every RawGpuTelemetry field is
+    optional, then satisfy distinctness via ``row_index``. Ingest now refuses
+    the empty payload immediately; the validate gates remain as a backstop.
+    """
+    with pytest.raises(IngestError, match="empty telemetry payload"):
+        clean.clean_gpu_telemetry(CORRUPT / "all_empty_telemetry.jsonl")
+
+    # Belt: if an empty-after-clean frame ever reached the gates, still refuse.
+    empty_after_clean = [{"row_index": i} for i in range(50)]
     validation = check_all(
         "all_empty",
-        result.rows,
-        n_in=result.n_in,
+        empty_after_clean,
+        n_in=50,
         config=GateConfig(require_timestamp_jitter=False),
     )
     assert not validation.ok
