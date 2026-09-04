@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Schema version of the *cleaned output*, independent of Theseus-Quarry's
 # collection schema version. Bump on any breaking change to published columns.
@@ -45,7 +45,9 @@ RecordKind = Literal[
 class StrictRecord(BaseModel):
     """Base: reject unknown fields, forbid coercion surprises."""
 
-    model_config = ConfigDict(extra="forbid", strict=False, frozen=True)
+    model_config = ConfigDict(
+        extra="forbid", strict=False, frozen=True, allow_inf_nan=False
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -255,7 +257,7 @@ TelemetryPayload = Annotated[
 class TelemetryEnvelope(StrictRecord):
     """Theseus-Quarry durable JSONL line (``SCHEMA_VERSION = 1``)."""
 
-    schema_version: int
+    schema_version: int = Field(strict=True)
     timestamp: str
     source: str
     kind: RecordKind
@@ -263,6 +265,16 @@ class TelemetryEnvelope(StrictRecord):
     run_id: str | None = None
     stem: str
     payload: TelemetryPayload
+
+    @field_validator("schema_version")
+    @classmethod
+    def _only_v1(cls, value: int) -> int:
+        if value != COLLECTOR_SCHEMA_VERSION:
+            raise ValueError(
+                f"unknown schema_version {value!r}; this reader implements "
+                f"Theseus-Quarry schema v{COLLECTOR_SCHEMA_VERSION} only"
+            )
+        return value
 
     @model_validator(mode="after")
     def _kind_matches_payload(self) -> TelemetryEnvelope:

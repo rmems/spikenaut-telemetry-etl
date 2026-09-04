@@ -134,7 +134,8 @@ def parse_record(
     """Dispatch one decoded object to schema v1 or the legacy model."""
     if "schema_version" in payload:
         version = payload["schema_version"]
-        if version != COLLECTOR_SCHEMA_VERSION:
+        # bool is an int subclass; 1.0 == 1. Refuse both rather than coerce.
+        if type(version) is not int or version != COLLECTOR_SCHEMA_VERSION:
             raise IngestError(
                 f"{source}:{row}: unknown schema_version {version!r}; "
                 f"this reader implements Theseus-Quarry schema v"

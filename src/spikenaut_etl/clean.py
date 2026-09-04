@@ -214,6 +214,19 @@ def find_trailing_disorder(
 # --------------------------------------------------------------------------- #
 
 
+def _require_v1_datetime(
+    raw_ts: object, *, row: int, source: str
+) -> timestamps.ParsedTimestamp:
+    """Schema-v1 timestamps are chrono DateTime values, not coin tags."""
+    parsed = timestamps.parse(raw_ts)
+    if parsed.moment is None:
+        raise IngestError(
+            f"{source}:{row}: schema-v1 timestamp {raw_ts!r} is not an "
+            "RFC3339 datetime; coin-tag and unparseable values are refused"
+        )
+    return parsed
+
+
 def clean_gpu_telemetry(path: Path) -> CleanResult:
     """``neuromorphic_data.jsonl`` -> flat GPU telemetry.
 
@@ -224,9 +237,15 @@ def clean_gpu_telemetry(path: Path) -> CleanResult:
     stats = IngestStats(source="neuromorphic_data")
     quarantine = timestamps.QuarantineLog(source="neuromorphic_data")
     raw: list[dict[str, Any]] = []
+    epochs: list[float] = []
     for row, record in read_validated(path, RawGpuRecord, stats):
         if isinstance(record, TelemetryEnvelope):
+            parsed = _require_v1_datetime(
+                record.timestamp, row=row, source=path.name
+            )
             payload = v1.map_envelope_to_gpu(record, row)
+            if parsed.epoch is not None:
+                epochs.append(parsed.epoch)
         else:
             payload = record.telemetry.model_dump()
             payload["row_index"] = row
@@ -245,6 +264,7 @@ def clean_gpu_telemetry(path: Path) -> CleanResult:
         quarantine=quarantine,
         dead_columns=dead,
         dead_column_drift=drift,
+        epochs=epochs,
     )
 
 
@@ -263,11 +283,9 @@ def clean_node_sync(path: Path) -> CleanResult:
     for row, record in read_validated(path, RawNodeSyncRecord, stats):
         if isinstance(record, TelemetryEnvelope):
             payload = v1.map_envelope_to_node_sync(record)
-            raw_ts = payload.get("timestamp")
-            parsed = timestamps.parse(raw_ts)
-            if not parsed.ok:
-                quarantine.record(row, str(raw_ts), timestamps.UNPARSEABLE)
-                continue
+            parsed = _require_v1_datetime(
+                payload.get("timestamp"), row=row, source=path.name
+            )
             payload["timestamp"] = parsed.iso
             parsed_rows.append((row, payload, parsed))
             continue

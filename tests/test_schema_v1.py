@@ -25,7 +25,7 @@ from spikenaut_etl.schemas import (
     RawNodeSyncRecord,
     TelemetryEnvelope,
 )
-from spikenaut_etl.v1 import hashrate_to_mh
+from spikenaut_etl.v1 import hashrate_to_mh, map_envelope_to_node_sync
 
 SCHEMA_V1 = Path(__file__).parent / "fixtures" / "schema_v1"
 CORRUPT = Path(__file__).parent / "fixtures" / "corrupt"
@@ -62,6 +62,7 @@ def test_empty_telemetry_writes_nothing(tmp_path):
     assert outcome.output_path is None
     assert not list((tmp_path / "out").rglob("*.jsonl"))
     assert "empty telemetry payload" in outcome.rendered
+    assert outcome.report_path is not None and outcome.report_path.exists()
 
 
 def test_missing_payload_columns_on_v1_status_fail_loud(tmp_path):
@@ -142,25 +143,86 @@ def test_node_health_maps_to_stable_node_sync_columns():
     assert len(result.rows) == 8
     heights = {row.get("block_height") for row in result.rows}
     assert 919876 in heights
+    assert 46075040 in heights, "qubic tick must map onto block_height"
     epochs = {row.get("chain_epoch") for row in result.rows if "chain_epoch" in row}
     assert epochs == {205}
     published = CLEAN_COLUMNS["node_sync_harvest"]
     for row in result.rows:
         assert set(row) <= published
+    assert result.epochs and len(result.epochs) == 8
 
 
-def test_gpu_sched_maps_to_stable_gpu_columns():
-    result = clean.clean_gpu_telemetry(SCHEMA_V1 / "gpu_sched.jsonl")
-    assert len(result.rows) == 8
-    assert result.rows[0]["gpu_temp_c"] == pytest.approx(64.5)
-    assert result.rows[0]["power_w"] == pytest.approx(180.0)
-    published = CLEAN_COLUMNS["neuromorphic_data"]
-    for row in result.rows:
-        assert set(row) <= published
-        assert "vram_used_mb" not in row, "unmapped collector fields must not be invented"
+def test_node_health_tick_maps_to_block_height():
+    env = TelemetryEnvelope.model_validate(
+        {
+            "schema_version": 1,
+            "timestamp": "2026-09-03T08:01:18.400000Z",
+            "source": "collector",
+            "kind": "node_health",
+            "stem": "qubic_telemetry",
+            "payload": {
+                "type": "node_health",
+                "coin": "qubic",
+                "epoch": 205,
+                "tick": 46075040,
+                "hashrate_mh": 1.02,
+            },
+        }
+    )
+    row = map_envelope_to_node_sync(env)
+    assert row["block_height"] == 46075040
+    assert row["chain_epoch"] == 205
+    assert "tick" not in row
 
 
-def test_pipeline_accepts_v1_miner_perf_and_gpu_sched(tmp_path):
+def test_node_health_speed_hs_maps_to_hashrate_mh():
+    env = TelemetryEnvelope.model_validate(
+        {
+            "schema_version": 1,
+            "timestamp": "2026-09-03T08:03:00Z",
+            "source": "collector",
+            "kind": "node_health",
+            "stem": "dynex_telemetry",
+            "payload": {
+                "type": "node_health",
+                "coin": "dynex",
+                "height": 919900,
+                "speed_hs": 1_250_000,
+            },
+        }
+    )
+    row = map_envelope_to_node_sync(env)
+    assert row["hashrate_mh"] == pytest.approx(1.25)
+    assert row["block_height"] == 919900
+
+
+def test_node_health_height_and_tick_together_fail_loud():
+    env = TelemetryEnvelope.model_validate(
+        {
+            "schema_version": 1,
+            "timestamp": "2026-09-03T08:03:00Z",
+            "source": "collector",
+            "kind": "node_health",
+            "stem": "mixed_telemetry",
+            "payload": {
+                "type": "node_health",
+                "coin": "dynex",
+                "height": 919900,
+                "tick": 46075040,
+            },
+        }
+    )
+    with pytest.raises(IngestError, match="both height and tick"):
+        map_envelope_to_node_sync(env)
+
+
+def test_gpu_sched_is_rejected_as_sparse_for_build_v3():
+    """gpu_sched cannot fill CleanGpuTelemetry without inventing clocks/qubic."""
+    with pytest.raises(IngestError, match="cannot fill CleanGpuTelemetry"):
+        clean.clean_gpu_telemetry(SCHEMA_V1 / "gpu_sched.jsonl")
+
+
+def test_pipeline_accepts_v1_miner_perf_and_rejects_gpu_sched(tmp_path):
     node_spec = next(s for s in SOURCES if s.key == "node_sync_harvest")
     gpu_spec = next(s for s in SOURCES if s.key == "neuromorphic_data")
 
@@ -177,8 +239,11 @@ def test_pipeline_accepts_v1_miner_perf_and_gpu_sched(tmp_path):
     gpu_in.mkdir()
     (gpu_in / gpu_spec.filename).write_bytes((SCHEMA_V1 / "gpu_sched.jsonl").read_bytes())
     gpu_out = run_source(gpu_spec, gpu_in, tmp_path / "gout", tmp_path / "grep")
-    assert gpu_out.ok, gpu_out.rendered
-    assert gpu_out.output_path is not None and gpu_out.output_path.exists()
+    assert not gpu_out.ok
+    assert gpu_out.output_path is None
+    assert not list((tmp_path / "gout").rglob("*.jsonl"))
+    assert "gpu_sched" in gpu_out.rendered
+    assert gpu_out.report_path is not None and gpu_out.report_path.exists()
 
 
 def test_mixed_miner_perf_and_node_health_parse(tmp_path):
@@ -262,3 +327,54 @@ def test_read_validated_raises_on_first_bad_v1_line(tmp_path):
         list(read_validated(path, RawNodeSyncRecord, stats))
     assert stats.n_parsed == 1
     assert stats.n_schema_errors == 0, "version errors raise before a schema count"
+
+
+def test_coin_tag_timestamp_rejected_on_v1(tmp_path):
+    line = _first_line(SCHEMA_V1 / "miner_perf.jsonl")
+    line["timestamp"] = "dynex:919876"
+    path = _write_jsonl(tmp_path / "node_sync_harvest.jsonl", [line])
+    with pytest.raises(IngestError, match="not an RFC3339 datetime"):
+        clean.clean_node_sync(path)
+
+
+def test_gpu_v1_coin_tag_timestamp_rejected(tmp_path):
+    line = _first_line(SCHEMA_V1 / "gpu_sched.jsonl")
+    line["timestamp"] = "dynex:919876"
+    path = _write_jsonl(tmp_path / "neuromorphic_data.jsonl", [line])
+    with pytest.raises(IngestError, match="not an RFC3339 datetime"):
+        clean.clean_gpu_telemetry(path)
+
+
+def test_v1_timestamps_feed_ordering_gate(tmp_path):
+    first = _first_line(SCHEMA_V1 / "miner_perf.jsonl")
+    later = dict(first)
+    later["timestamp"] = "2026-09-03T10:00:00.000000Z"
+    earlier = dict(first)
+    earlier["timestamp"] = "2026-09-02T08:00:00.000000Z"
+    # Vary hashrate so the file is not degenerate if ordering were skipped.
+    later["payload"] = dict(first["payload"], hashrate=1.4e9)
+    earlier["payload"] = dict(first["payload"], hashrate=1.1e9)
+    path = _write_jsonl(tmp_path / "node_sync_harvest.jsonl", [first, later, earlier])
+    spec = next(s for s in SOURCES if s.key == "node_sync_harvest")
+    source_dir = tmp_path / "in"
+    source_dir.mkdir()
+    (source_dir / spec.filename).write_bytes(path.read_bytes())
+    outcome = run_source(spec, source_dir, tmp_path / "out", tmp_path / "reports")
+    assert not outcome.ok
+    assert "timestamps_ordered" in outcome.rendered or "backwards" in outcome.rendered
+    assert not list((tmp_path / "out").rglob("*.jsonl"))
+
+
+@pytest.mark.parametrize("token", [True, 1.0, "1"])
+def test_non_integer_schema_version_fails_loud(token):
+    line = _first_line(SCHEMA_V1 / "miner_perf.jsonl")
+    line["schema_version"] = token
+    with pytest.raises(IngestError, match="unknown schema_version"):
+        parse_record(line, RawNodeSyncRecord, row=0, source="test.jsonl")
+
+
+def test_nan_payload_value_fails_loud():
+    line = _first_line(SCHEMA_V1 / "miner_perf.jsonl")
+    line["payload"] = dict(line["payload"], hashrate=float("nan"))
+    with pytest.raises(IngestError, match="schema violation"):
+        parse_record(line, RawNodeSyncRecord, row=0, source="test.jsonl")

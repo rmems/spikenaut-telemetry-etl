@@ -117,10 +117,13 @@ def run_source(
     try:
         result = spec.cleaner(path)
     except IngestError as exc:
+        file_report = report.ingest_failure(spec.key, str(exc))
+        report_path = report.write(file_report, report_dir)
         return RunOutcome(
             spec.key,
             False,
-            f"FAIL  {spec.key}\n      ingest    {exc}",
+            f"{report.render(file_report)}\n{exc}",
+            report_path,
         )
     validation = check_all(
         spec.key,
