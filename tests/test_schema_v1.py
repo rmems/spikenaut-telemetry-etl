@@ -93,6 +93,15 @@ def test_rfc3339_z_timestamp_from_collector_parses():
     assert parsed.moment.year == 2026 and parsed.moment.tzinfo is not None
 
 
+def test_rfc3339_lowercase_z_timestamp_parses():
+    from spikenaut_etl import timestamps
+
+    parsed = timestamps.parse("2026-09-03T08:00:00.123456z")
+    assert parsed.ok and parsed.moment is not None
+    assert parsed.moment.tzinfo is not None
+    assert parsed.epoch == timestamps.parse("2026-09-03T08:00:00.123456Z").epoch
+
+
 def test_collector_schema_version_is_one():
     assert COLLECTOR_SCHEMA_VERSION == 1
 
@@ -373,8 +382,96 @@ def test_non_integer_schema_version_fails_loud(token):
         parse_record(line, RawNodeSyncRecord, row=0, source="test.jsonl")
 
 
-def test_nan_payload_value_fails_loud():
+@pytest.mark.parametrize("token", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_payload_value_fails_loud(token):
     line = _first_line(SCHEMA_V1 / "miner_perf.jsonl")
-    line["payload"] = dict(line["payload"], hashrate=float("nan"))
+    line["payload"] = dict(line["payload"], hashrate=token)
     with pytest.raises(IngestError, match="schema violation"):
         parse_record(line, RawNodeSyncRecord, row=0, source="test.jsonl")
+
+
+def test_truncated_json_line_is_skipped_not_aborted(tmp_path):
+    """A truncated append-only line is counted; later valid rows still parse."""
+    good = _first_line(SCHEMA_V1 / "miner_perf.jsonl")
+    later = dict(good)
+    later["payload"] = dict(good["payload"], hashrate=1.4e9)
+    path = tmp_path / "mixed.jsonl"
+    path.write_text(
+        json.dumps(good)
+        + "\n"
+        + '{"schema_version":1,"kind":\n'
+        + json.dumps(later)
+        + "\n",
+        encoding="utf-8",
+    )
+    stats = IngestStats(source="mixed")
+    rows = list(read_validated(path, RawNodeSyncRecord, stats))
+    assert len(rows) == 2
+    assert stats.n_parsed == 2
+    assert stats.n_json_errors == 1
+    assert stats.n_schema_errors == 0
+    assert any("malformed JSON" in example for example in stats.examples)
+
+
+def test_truncated_json_does_not_abort_clean(tmp_path):
+    good = _first_line(SCHEMA_V1 / "miner_perf.jsonl")
+    later = dict(good)
+    later["payload"] = dict(good["payload"], hashrate=1.4e9)
+    path = tmp_path / "node_sync_harvest.jsonl"
+    path.write_text(
+        json.dumps(good)
+        + "\n"
+        + '{"schema_version":1,"kind":\n'
+        + json.dumps(later)
+        + "\n",
+        encoding="utf-8",
+    )
+    result = clean.clean_node_sync(path)
+    assert result.ingest.n_json_errors == 1
+    assert len(result.rows) == 2
+
+
+def test_non_dict_line_notes_error_before_raise(tmp_path):
+    path = tmp_path / "arr.jsonl"
+    path.write_text("[1, 2, 3]\n", encoding="utf-8")
+    stats = IngestStats(source="arr")
+    with pytest.raises(IngestError, match="must be an object"):
+        list(read_validated(path, RawNodeSyncRecord, stats))
+    assert stats.n_schema_errors == 1
+    assert stats.examples and "must be an object" in stats.examples[0]
+
+
+def test_empty_coin_is_rejected():
+    line = _first_line(SCHEMA_V1 / "miner_perf.jsonl")
+    line["payload"] = dict(line["payload"], coin="   ")
+    env = TelemetryEnvelope.model_validate(line)
+    with pytest.raises(IngestError, match="empty coin"):
+        map_envelope_to_node_sync(env, source="test.jsonl", row=3)
+    with pytest.raises(IngestError, match="test.jsonl:3"):
+        map_envelope_to_node_sync(env, source="test.jsonl", row=3)
+
+
+def test_coin_is_lowercased():
+    line = _first_line(SCHEMA_V1 / "miner_perf.jsonl")
+    line["payload"] = dict(line["payload"], coin="KASPA")
+    env = TelemetryEnvelope.model_validate(line)
+    row = map_envelope_to_node_sync(env)
+    assert row["blockchain"] == "kaspa"
+
+
+def test_gpu_sched_error_includes_source_row():
+    with pytest.raises(IngestError, match=r"gpu_sched\.jsonl:0:"):
+        clean.clean_gpu_telemetry(SCHEMA_V1 / "gpu_sched.jsonl")
+
+
+def test_pipeline_undecodable_file_fails_without_writing(tmp_path):
+    spec = next(s for s in SOURCES if s.key == "node_sync_harvest")
+    source_dir = tmp_path / "input"
+    source_dir.mkdir()
+    (source_dir / spec.filename).write_bytes(b"\xff\xfe not utf-8\n")
+    outcome = run_source(spec, source_dir, tmp_path / "out", tmp_path / "reports")
+    assert not outcome.ok
+    assert outcome.output_path is None
+    assert not list((tmp_path / "out").rglob("*.jsonl"))
+    assert "UnicodeDecodeError" in outcome.rendered
+    assert outcome.report_path is not None and outcome.report_path.exists()

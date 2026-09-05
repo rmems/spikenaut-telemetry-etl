@@ -243,7 +243,7 @@ def clean_gpu_telemetry(path: Path) -> CleanResult:
             parsed = _require_v1_datetime(
                 record.timestamp, row=row, source=path.name
             )
-            payload = v1.map_envelope_to_gpu(record, row)
+            payload = v1.map_envelope_to_gpu(record, row, source=path.name)
             if parsed.epoch is not None:
                 epochs.append(parsed.epoch)
         else:
@@ -282,7 +282,9 @@ def clean_node_sync(path: Path) -> CleanResult:
 
     for row, record in read_validated(path, RawNodeSyncRecord, stats):
         if isinstance(record, TelemetryEnvelope):
-            payload = v1.map_envelope_to_node_sync(record)
+            payload = v1.map_envelope_to_node_sync(
+                record, source=path.name, row=row
+            )
             parsed = _require_v1_datetime(
                 payload.get("timestamp"), row=row, source=path.name
             )

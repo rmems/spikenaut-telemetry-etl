@@ -125,6 +125,16 @@ def run_source(
             f"{report.render(file_report)}\n{exc}",
             report_path,
         )
+    except (UnicodeDecodeError, OSError) as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        file_report = report.ingest_failure(spec.key, detail)
+        report_path = report.write(file_report, report_dir)
+        return RunOutcome(
+            spec.key,
+            False,
+            f"{report.render(file_report)}\n{detail}",
+            report_path,
+        )
     validation = check_all(
         spec.key,
         result.rows,

@@ -47,14 +47,20 @@ def test_all_empty_telemetry_is_rejected(tmp_path):
         clean.clean_gpu_telemetry(CORRUPT / "all_empty_telemetry.jsonl")
 
     # Belt: if an empty-after-clean frame ever reached the gates, still refuse.
-    empty_after_clean = [{"row_index": i} for i in range(50)]
+    # ≥101 rows of identity-only payloads trip both payload_columns_remain
+    # (no data columns) and distinct_rows (1 payload / 101 < 0.01). Fifty
+    # rows only trip the column gate (ratio 0.02 ≥ min_distinct_ratio).
+    empty_after_clean = [{"row_index": i} for i in range(101)]
     validation = check_all(
         "all_empty",
         empty_after_clean,
-        n_in=50,
+        n_in=101,
         config=GateConfig(require_timestamp_jitter=False),
     )
     assert not validation.ok
+    gates = {f.gate for f in validation.failures}
+    assert "payload_columns_remain" in gates
+    assert "distinct_rows" in gates
     with pytest.raises(ValidationError):
         assert_publishable(validation)
 

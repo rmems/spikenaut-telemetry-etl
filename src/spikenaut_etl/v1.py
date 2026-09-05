@@ -29,19 +29,53 @@ _HASHRATE_TO_MH: dict[str, float] = {
 }
 
 
-def hashrate_to_mh(hashrate: float, unit: str) -> float:
+def _loc(*, source: str | None = None, row: int | None = None) -> str:
+    """Prefix mapper errors with ``source:row:`` when the cleaner supplied both."""
+    if source is not None and row is not None:
+        return f"{source}:{row}: "
+    return ""
+
+
+def _normalize_coin(
+    coin: str, *, source: str | None = None, row: int | None = None
+) -> str:
+    """Lowercase a collector coin label. Empty string is refused, never ``""``."""
+    normalized = coin.strip().lower()
+    if not normalized:
+        raise IngestError(
+            f"{_loc(source=source, row=row)}"
+            "empty coin; CleanNodeSync.blockchain is None never empty string",
+            kind="schema",
+        )
+    return normalized
+
+
+def hashrate_to_mh(
+    hashrate: float,
+    unit: str,
+    *,
+    source: str | None = None,
+    row: int | None = None,
+) -> float:
     """Convert a miner_perf hashrate into the published ``hashrate_mh`` column."""
     key = unit.strip().upper()
     scale = _HASHRATE_TO_MH.get(key)
     if scale is None:
         raise IngestError(
+            f"{_loc(source=source, row=row)}"
             f"unknown hashrate_unit {unit!r}; refusing to guess a conversion "
-            f"onto hashrate_mh"
+            f"onto hashrate_mh",
+            kind="schema",
         )
     return hashrate * scale
 
 
-def map_envelope_to_gpu(envelope: TelemetryEnvelope, row_index: int) -> dict[str, Any]:
+def map_envelope_to_gpu(
+    envelope: TelemetryEnvelope,
+    row_index: int,
+    *,
+    source: str | None = None,
+) -> dict[str, Any]:
     """Map a v1 envelope onto the full ``CleanGpuTelemetry`` contract.
 
     ``gpu_sched`` carries temp/power only. ``v3_build.py`` then requires
@@ -51,21 +85,28 @@ def map_envelope_to_gpu(envelope: TelemetryEnvelope, row_index: int) -> dict[str
     satisfy the contract with real measurements. ``row_index`` is accepted
     only so the signature stays aligned with the cleaner.
     """
-    del row_index
+    loc = _loc(source=source, row=row_index)
     payload = envelope.payload
     if isinstance(payload, PayloadGpuSched):
         raise IngestError(
-            "kind 'gpu_sched' cannot fill CleanGpuTelemetry "
+            f"{loc}kind 'gpu_sched' cannot fill CleanGpuTelemetry "
             "(clock_mhz, gpu_clock_mhz, QUBIC_COLUMNS) without inventing "
-            "measurements; refusing sparse GPU rows that would break build-v3"
+            "measurements; refusing sparse GPU rows that would break build-v3",
+            kind="schema",
         )
     raise IngestError(
-        f"kind {envelope.kind!r} cannot map onto CleanGpuTelemetry; "
-        "refusing to invent columns"
+        f"{loc}kind {envelope.kind!r} cannot map onto CleanGpuTelemetry; "
+        "refusing to invent columns",
+        kind="schema",
     )
 
 
-def map_envelope_to_node_sync(envelope: TelemetryEnvelope) -> dict[str, Any]:
+def map_envelope_to_node_sync(
+    envelope: TelemetryEnvelope,
+    *,
+    source: str | None = None,
+    row: int | None = None,
+) -> dict[str, Any]:
     """Map a v1 envelope onto ``CleanNodeSync`` columns that the payload carries.
 
     Null identity fields are omitted so an all-null ``block_height`` does not
@@ -75,46 +116,55 @@ def map_envelope_to_node_sync(envelope: TelemetryEnvelope) -> dict[str, Any]:
     (legacy ``coin:epoch:tick``). ``speed_hs`` maps onto ``hashrate_mh``
     (÷ 1e6) when ``hashrate_mh`` is absent. Both-present collisions raise
     rather than silently dropping one of the producer fields.
+
+    ``payload.coin`` is lowercased. An empty or whitespace-only coin is
+    refused -- ``CleanNodeSync.blockchain`` is ``None``, never ``""``.
     """
+    loc = _loc(source=source, row=row)
     payload = envelope.payload
     if isinstance(payload, PayloadMinerPerf):
         return {
             "timestamp": envelope.timestamp,
-            "blockchain": payload.coin,
-            "hashrate_mh": hashrate_to_mh(payload.hashrate, payload.hashrate_unit),
+            "blockchain": _normalize_coin(payload.coin, source=source, row=row),
+            "hashrate_mh": hashrate_to_mh(
+                payload.hashrate, payload.hashrate_unit, source=source, row=row
+            ),
         }
     if isinstance(payload, PayloadNodeHealth):
         if payload.height is not None and payload.tick is not None:
             raise IngestError(
-                "node_health carries both height and tick; "
+                f"{loc}node_health carries both height and tick; "
                 "CleanNodeSync.block_height cannot represent both; "
-                "refusing to drop tick"
+                "refusing to drop tick",
+                kind="schema",
             )
-        row: dict[str, Any] = {
+        mapped: dict[str, Any] = {
             "timestamp": envelope.timestamp,
-            "blockchain": payload.coin,
+            "blockchain": _normalize_coin(payload.coin, source=source, row=row),
         }
         if payload.height is not None:
-            row["block_height"] = payload.height
+            mapped["block_height"] = payload.height
         elif payload.tick is not None:
-            row["block_height"] = payload.tick
+            mapped["block_height"] = payload.tick
         if payload.epoch is not None:
-            row["chain_epoch"] = payload.epoch
+            mapped["chain_epoch"] = payload.epoch
         if payload.hashrate_mh is not None and payload.speed_hs is not None:
             converted = payload.speed_hs / 1e6
             if converted != payload.hashrate_mh:
                 raise IngestError(
-                    "node_health carries both hashrate_mh and speed_hs; "
+                    f"{loc}node_health carries both hashrate_mh and speed_hs; "
                     "they disagree after H/s → MH/s conversion; refusing to "
-                    "drop a perf signal"
+                    "drop a perf signal",
+                    kind="schema",
                 )
-            row["hashrate_mh"] = payload.hashrate_mh
+            mapped["hashrate_mh"] = payload.hashrate_mh
         elif payload.hashrate_mh is not None:
-            row["hashrate_mh"] = payload.hashrate_mh
+            mapped["hashrate_mh"] = payload.hashrate_mh
         elif payload.speed_hs is not None:
-            row["hashrate_mh"] = payload.speed_hs / 1e6
-        return row
+            mapped["hashrate_mh"] = payload.speed_hs / 1e6
+        return mapped
     raise IngestError(
-        f"kind {envelope.kind!r} cannot map onto CleanNodeSync; "
-        "refusing to invent columns"
+        f"{loc}kind {envelope.kind!r} cannot map onto CleanNodeSync; "
+        "refusing to invent columns",
+        kind="schema",
     )

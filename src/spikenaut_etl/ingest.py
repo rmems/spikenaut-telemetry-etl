@@ -15,6 +15,10 @@ Empty telemetry / empty payloads, unknown versions, unknown payload tags, and
 extra fields all raise :class:`IngestError`. There is no warn-and-continue path
 for those failures: a skipped v1 line is how a next collection run would
 silently become empty published rows.
+
+Malformed JSON is the exception: a truncated trailing line is ordinary for an
+append-only writer. Those lines are counted and skipped so the rest of the
+file can still be ingested.
 """
 
 from __future__ import annotations
@@ -43,6 +47,10 @@ _V1_SHAPE_KEYS = frozenset({"kind", "payload", "stem", "source"})
 
 class IngestError(Exception):
     """Raised when a source line must not be ingested. Output must not be written."""
+
+    def __init__(self, message: str, *, kind: str = "ingest") -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 @dataclass
@@ -92,6 +100,8 @@ def read_validated(
     dropped downstream. Unknown ``schema_version``, a v1-shaped line missing
     ``schema_version``, a wrong payload tag, extra fields, and an empty
     telemetry / payload object all raise :class:`IngestError` immediately.
+    A ``JSONDecodeError`` is counted and skipped so one truncated append does
+    not discard the rest of the file.
     """
     with path.open("r", encoding="utf-8") as handle:
         for row, line in enumerate(handle):
@@ -105,18 +115,19 @@ def read_validated(
             except json.JSONDecodeError as exc:
                 stats.n_json_errors += 1
                 stats.note_error(row, f"malformed JSON: {exc}")
-                raise IngestError(
-                    f"{path.name}:{row}: malformed JSON: {exc}; refusing to ingest"
-                ) from exc
+                continue
             if not isinstance(payload, dict):
                 stats.n_schema_errors += 1
+                stats.note_error(row, "JSONL line must be an object")
                 raise IngestError(
-                    f"{path.name}:{row}: JSONL line must be an object; refusing to ingest"
+                    f"{path.name}:{row}: JSONL line must be an object; "
+                    "refusing to ingest",
+                    kind="schema",
                 )
             try:
                 record = parse_record(payload, model, row=row, source=path.name)
             except IngestError as exc:
-                if "schema violation" in str(exc):
+                if exc.kind == "schema":
                     stats.n_schema_errors += 1
                     stats.note_error(row, str(exc))
                 raise
@@ -139,14 +150,16 @@ def parse_record(
             raise IngestError(
                 f"{source}:{row}: unknown schema_version {version!r}; "
                 f"this reader implements Theseus-Quarry schema v"
-                f"{COLLECTOR_SCHEMA_VERSION} only and will not guess"
+                f"{COLLECTOR_SCHEMA_VERSION} only and will not guess",
+                kind="version",
             )
         try:
             envelope = TelemetryEnvelope.model_validate(payload)
         except PydanticValidationError as exc:
             raise IngestError(
                 f"{source}:{row}: schema violation: {_terse(exc)}; "
-                "refusing to ingest"
+                "refusing to ingest",
+                kind="schema",
             ) from exc
         _reject_empty_v1(envelope, row=row, source=source)
         return envelope
@@ -154,14 +167,16 @@ def parse_record(
     if _v1_shaped(payload):
         raise IngestError(
             f"{source}:{row}: v1-shaped envelope is missing schema_version; "
-            "refusing to guess"
+            "refusing to guess",
+            kind="version",
         )
 
     try:
         record = model.model_validate(payload)
     except PydanticValidationError as exc:
         raise IngestError(
-            f"{source}:{row}: schema violation: {_terse(exc)}; refusing to ingest"
+            f"{source}:{row}: schema violation: {_terse(exc)}; refusing to ingest",
+            kind="schema",
         ) from exc
     _reject_empty_legacy(record, row=row, source=source)
     return record
@@ -183,7 +198,8 @@ def _reject_empty_legacy(record: BaseModel, *, row: int, source: str) -> None:
     values = telemetry.model_dump()
     if not values or all(v is None for v in values.values()):
         raise IngestError(
-            f"{source}:{row}: empty telemetry payload; refusing to ingest"
+            f"{source}:{row}: empty telemetry payload; refusing to ingest",
+            kind="empty",
         )
 
 
@@ -192,7 +208,8 @@ def _reject_empty_v1(record: TelemetryEnvelope, *, row: int, source: str) -> Non
     data = {k: v for k, v in values.items() if k != "type"}
     if not data or all(v is None for v in data.values()):
         raise IngestError(
-            f"{source}:{row}: empty schema-v1 payload; refusing to ingest"
+            f"{source}:{row}: empty schema-v1 payload; refusing to ingest",
+            kind="empty",
         )
 
 
