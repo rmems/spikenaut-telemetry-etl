@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from . import clean, report
+from .ingest import IngestError
 from .schemas import CLEAN_COLUMNS
 from .validate import GateConfig, ValidationError, assert_publishable, check_all
 
@@ -113,7 +114,27 @@ def run_source(
     if not path.exists():
         return RunOutcome(spec.key, False, f"SKIP  {spec.key}: {path} not found")
 
-    result = spec.cleaner(path)
+    try:
+        result = spec.cleaner(path)
+    except IngestError as exc:
+        file_report = report.ingest_failure(spec.key, str(exc))
+        report_path = report.write(file_report, report_dir)
+        return RunOutcome(
+            spec.key,
+            False,
+            f"{report.render(file_report)}\n{exc}",
+            report_path,
+        )
+    except (UnicodeDecodeError, OSError) as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        file_report = report.ingest_failure(spec.key, detail)
+        report_path = report.write(file_report, report_dir)
+        return RunOutcome(
+            spec.key,
+            False,
+            f"{report.render(file_report)}\n{detail}",
+            report_path,
+        )
     validation = check_all(
         spec.key,
         result.rows,

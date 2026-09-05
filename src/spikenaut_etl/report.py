@@ -85,6 +85,26 @@ def build(result: CleanResult, validation: ValidationResult) -> FileReport:
     )
 
 
+def ingest_failure(source: str, detail: str, *, n_in: int = 0) -> FileReport:
+    """Diagnostic for an ingest abort: nothing cleaned, nothing written."""
+    return FileReport(
+        source=source,
+        rows_in=n_in,
+        rows_out=0,
+        distinct_rows=0,
+        distinct_ratio=0.0,
+        quarantined=0,
+        quarantined_by_reason={},
+        dead_columns=[],
+        dead_column_drift=[],
+        coin_counts={},
+        columns=[],
+        gates_passed=False,
+        gate_failures=[f"ingest: {detail}"],
+        generated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
 def write(report: FileReport, directory: Path) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{report.source}.json"

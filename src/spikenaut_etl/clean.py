@@ -16,13 +16,14 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
-from . import timestamps
-from .ingest import IngestStats, read_validated
+from . import timestamps, v1
+from .ingest import IngestError, IngestStats, read_validated
 from .schemas import (
     RawGpuRecord,
     RawNodeSyncRecord,
     RawQubicTick,
     RawTradingLog,
+    TelemetryEnvelope,
 )
 
 # Columns expected to be dead, from profiling the recovered originals on
@@ -115,9 +116,16 @@ def find_dead_columns(rows: Sequence[dict[str, Any]]) -> set[str]:
 
 
 def report_dead_column_drift(
-    observed: Iterable[str], expected: Iterable[str]
+    observed: Iterable[str],
+    expected: Iterable[str],
+    *,
+    present: Iterable[str] | None = None,
 ) -> list[str]:
     observed_set, expected_set = set(observed), set(expected)
+    if present is not None:
+        present_set = set(present)
+        observed_set &= present_set
+        expected_set &= present_set
     messages = []
     for col in sorted(expected_set - observed_set):
         messages.append(f"{col!r} was expected dead but now carries signal")
@@ -206,6 +214,19 @@ def find_trailing_disorder(
 # --------------------------------------------------------------------------- #
 
 
+def _require_v1_datetime(
+    raw_ts: object, *, row: int, source: str
+) -> timestamps.ParsedTimestamp:
+    """Schema-v1 timestamps are chrono DateTime values, not coin tags."""
+    parsed = timestamps.parse(raw_ts)
+    if parsed.moment is None:
+        raise IngestError(
+            f"{source}:{row}: schema-v1 timestamp {raw_ts!r} is not an "
+            "RFC3339 datetime; coin-tag and unparseable values are refused"
+        )
+    return parsed
+
+
 def clean_gpu_telemetry(path: Path) -> CleanResult:
     """``neuromorphic_data.jsonl`` -> flat GPU telemetry.
 
@@ -216,13 +237,23 @@ def clean_gpu_telemetry(path: Path) -> CleanResult:
     stats = IngestStats(source="neuromorphic_data")
     quarantine = timestamps.QuarantineLog(source="neuromorphic_data")
     raw: list[dict[str, Any]] = []
+    epochs: list[float] = []
     for row, record in read_validated(path, RawGpuRecord, stats):
-        payload = record.telemetry.model_dump()
-        payload["row_index"] = row
+        if isinstance(record, TelemetryEnvelope):
+            parsed = _require_v1_datetime(
+                record.timestamp, row=row, source=path.name
+            )
+            payload = v1.map_envelope_to_gpu(record, row, source=path.name)
+            if parsed.epoch is not None:
+                epochs.append(parsed.epoch)
+        else:
+            payload = record.telemetry.model_dump()
+            payload["row_index"] = row
         raw.append(payload)
 
     dead = find_dead_columns(raw) - {"row_index"}
-    drift = report_dead_column_drift(dead, EXPECTED_DEAD_GPU)
+    present = {key for row in raw for key in row}
+    drift = report_dead_column_drift(dead, EXPECTED_DEAD_GPU, present=present)
     rows = drop_columns(raw, dead)
 
     return CleanResult(
@@ -233,6 +264,7 @@ def clean_gpu_telemetry(path: Path) -> CleanResult:
         quarantine=quarantine,
         dead_columns=dead,
         dead_column_drift=drift,
+        epochs=epochs,
     )
 
 
@@ -249,6 +281,17 @@ def clean_node_sync(path: Path) -> CleanResult:
     parsed_rows: list[tuple[int, dict[str, Any], timestamps.ParsedTimestamp]] = []
 
     for row, record in read_validated(path, RawNodeSyncRecord, stats):
+        if isinstance(record, TelemetryEnvelope):
+            payload = v1.map_envelope_to_node_sync(
+                record, source=path.name, row=row
+            )
+            parsed = _require_v1_datetime(
+                payload.get("timestamp"), row=row, source=path.name
+            )
+            payload["timestamp"] = parsed.iso
+            parsed_rows.append((row, payload, parsed))
+            continue
+
         parsed = timestamps.parse(record.timestamp)
         if not parsed.ok:
             quarantine.record(row, record.timestamp, timestamps.UNPARSEABLE)
@@ -276,12 +319,16 @@ def clean_node_sync(path: Path) -> CleanResult:
 
     kept = [t for pos, t in enumerate(parsed_rows) if pos not in disordered]
     raw = [payload for _, payload, _ in kept]
-    coins = Counter(p.coin or "__unattributed__" for _, _, p in kept)
+    coins = Counter(
+        (payload.get("blockchain") or p.coin or "__unattributed__")
+        for _, payload, p in kept
+    )
     epochs = [p.epoch for _, _, p in kept if p.epoch is not None]
 
     identity = {"timestamp", "blockchain", "block_height", "chain_epoch"}
     dead = find_dead_columns(raw) - identity
-    drift = report_dead_column_drift(dead, EXPECTED_DEAD_NODE_SYNC)
+    present = {key for row in raw for key in row}
+    drift = report_dead_column_drift(dead, EXPECTED_DEAD_NODE_SYNC, present=present)
     rows = drop_columns(raw, dead)
 
     return CleanResult(
@@ -307,9 +354,14 @@ def clean_qubic_ticks(path: Path) -> CleanResult:
     """
     stats = IngestStats(source="qubic_ticks")
     quarantine = timestamps.QuarantineLog(source="qubic_ticks")
-    records: list[tuple[int, RawQubicTick]] = list(
-        read_validated(path, RawQubicTick, stats)
-    )
+    records: list[tuple[int, RawQubicTick]] = []
+    for row, record in read_validated(path, RawQubicTick, stats):
+        if isinstance(record, TelemetryEnvelope):
+            raise IngestError(
+                f"{path.name}:{row}: Theseus-Quarry schema v1 envelope cannot "
+                "be read as qubic_ticks; refusing to invent a mapping"
+            )
+        records.append((row, record))
     if not records:
         return CleanResult(
             name="qubic_ticks_snn",
@@ -374,6 +426,11 @@ def clean_trading_log(path: Path) -> CleanResult:
     epochs: list[float] = []
 
     for row, record in read_validated(path, RawTradingLog, stats):
+        if isinstance(record, TelemetryEnvelope):
+            raise IngestError(
+                f"{path.name}:{row}: Theseus-Quarry schema v1 envelope cannot "
+                "be read as ghost_market_log; refusing to invent a mapping"
+            )
         parsed = timestamps.parse(record.timestamp)
         if not parsed.ok:
             quarantine.record(row, record.timestamp, timestamps.UNPARSEABLE)
