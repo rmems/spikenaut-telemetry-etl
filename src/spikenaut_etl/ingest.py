@@ -81,16 +81,6 @@ class IngestStats:
         return out
 
 
-def read_jsonl(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
-    """Yield ``(row_index, object)`` for each non-blank line. 0-indexed."""
-    with path.open("r", encoding="utf-8") as handle:
-        for row, line in enumerate(handle):
-            line = line.strip()
-            if not line:
-                continue
-            yield row, json.loads(line)
-
-
 def read_validated(
     path: Path, model: type[M], stats: IngestStats
 ) -> Iterator[tuple[int, M | TelemetryEnvelope]]:
@@ -180,11 +170,6 @@ def parse_record(
         ) from exc
     _reject_empty_legacy(record, row=row, source=source)
     return record
-
-
-def count_lines(path: Path) -> int:
-    with path.open("rb") as handle:
-        return sum(1 for line in handle if line.strip())
 
 
 def _v1_shaped(payload: dict[str, Any]) -> bool:
