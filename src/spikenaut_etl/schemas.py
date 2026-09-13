@@ -22,7 +22,14 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 # Schema version of the *cleaned output*, independent of Theseus-Quarry's
 # collection schema version. Bump on any breaking change to published columns.
@@ -212,6 +219,38 @@ class RawSystemTelemetry(StrictRecord):
     cpu_ccd2_c: float | None = None
     cpu_package_power_w: float | None = None
     session_label: str
+
+    @field_validator(
+        "timestamp_ms",
+        "power_usage_mw",
+        "temperature_c",
+        "graphics_clock_mhz",
+        "memory_clock_mhz",
+        "pcie_rx_kbps",
+        "pcie_tx_kbps",
+        "pstate",
+        "throttle_reasons_bitmask",
+        "fan_speed_perc",
+        "memory_used_mb",
+        "memory_total_mb",
+        "encoder_util_perc",
+        "decoder_util_perc",
+        "cpu_tctl_c",
+        "cpu_ccd1_c",
+        "cpu_ccd2_c",
+        "cpu_package_power_w",
+        mode="before",
+    )
+    @classmethod
+    def _reject_bool_sensor_fields(cls, value: object, info: ValidationInfo) -> object:
+        # strict=False otherwise coerces True->1 / False->0 (and True->1.0)
+        # before after-validators.
+        if type(value) is bool:
+            raise ValueError(
+                f"{info.field_name} must be a number, not bool; "
+                "refusing to coerce True/False onto a sensor field"
+            )
+        return value
 
     @field_validator("timestamp_ms")
     @classmethod

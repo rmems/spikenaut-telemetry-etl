@@ -8,21 +8,25 @@ mining Hub v3/state_telemetry episodes.
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 
 from spikenaut_etl import clean, timestamps, v3_build
+from spikenaut_etl.cli import main
 from spikenaut_etl.ingest import IngestError
-from spikenaut_etl.pipeline import SOURCES, run_source
+from spikenaut_etl.pipeline import SOURCES, run_all, run_source
 from spikenaut_etl.schemas import (
     SYSTEM_TELEMETRY_FEATURE_AXONS,
     SYSTEM_TELEMETRY_HARDWARE_INVARIANTS,
     SYSTEM_TELEMETRY_HYGIENE_COLUMNS,
     CleanSystemTelemetry,
+    RawSystemTelemetry,
 )
 from spikenaut_etl.system_telemetry import SOURCE_KEY, discover_input
 from spikenaut_etl.v2_parquet import V2_SOURCES
@@ -52,6 +56,39 @@ def _spec():
 # --------------------------------------------------------------------------- #
 
 
+_INT_SENSOR_FIELDS = (
+    "power_usage_mw",
+    "temperature_c",
+    "graphics_clock_mhz",
+    "memory_clock_mhz",
+    "pcie_rx_kbps",
+    "pcie_tx_kbps",
+    "pstate",
+    "throttle_reasons_bitmask",
+    "fan_speed_perc",
+    "memory_used_mb",
+    "memory_total_mb",
+    "encoder_util_perc",
+    "decoder_util_perc",
+)
+
+_FLOAT_SENSOR_FIELDS = (
+    "cpu_tctl_c",
+    "cpu_ccd1_c",
+    "cpu_ccd2_c",
+    "cpu_package_power_w",
+)
+
+_BOOL_REJECT_FIELDS = ("timestamp_ms", *_INT_SENSOR_FIELDS, *_FLOAT_SENSOR_FIELDS)
+
+_LEGACY_JSONL = (
+    "neuromorphic_data.jsonl",
+    "node_sync_harvest.jsonl",
+    "qubic_ticks.jsonl",
+    "ghost_market_log.jsonl",
+)
+
+
 def test_source_is_registered_and_named_system_telemetry_v1():
     keys = [s.key for s in SOURCES]
     assert SOURCE_KEY in keys
@@ -62,6 +99,7 @@ def test_source_is_registered_and_named_system_telemetry_v1():
         "ghost_market_log",
         "system_telemetry_v1",
     ]
+    assert {s.key for s in SOURCES if s.optional} == {SOURCE_KEY}
 
 
 def test_jsonl_load_derives_ts_utc_from_timestamp_ms():
@@ -107,6 +145,91 @@ def test_pipeline_accepts_jsonl_fixture(tmp_path):
     assert outcome.output_path is not None
     assert outcome.output_path.name == "system_telemetry_v1.jsonl"
     assert not list((tmp_path / "out").glob("samples/**/*"))
+
+
+def test_missing_optional_system_telemetry_is_successful_skip(tmp_path):
+    outcome = run_source(_spec(), tmp_path, tmp_path / "out", tmp_path / "reports")
+    assert outcome.ok
+    assert outcome.output_path is None
+    assert outcome.rendered.startswith("SKIP  system_telemetry_v1:")
+
+
+def test_missing_required_source_is_failed_skip(tmp_path):
+    spec = next(s for s in SOURCES if s.key == "neuromorphic_data")
+    outcome = run_source(spec, tmp_path, tmp_path / "out", tmp_path / "reports")
+    assert not spec.optional
+    assert not outcome.ok
+    assert outcome.rendered.startswith("SKIP  neuromorphic_data:")
+
+
+@pytest.mark.parametrize("command", ["validate", "report", "clean"])
+def test_four_source_tree_without_gaming_telemetry_exits_zero(command, tmp_path):
+    for name in _LEGACY_JSONL:
+        shutil.copy(FIXTURES / name, tmp_path / name)
+    argv = [command, "--input", str(tmp_path), "--reports", str(tmp_path / "reports")]
+    if command == "clean":
+        argv.extend(["--output", str(tmp_path / "out")])
+    assert main(argv) == 0
+    outcomes = run_all(
+        tmp_path, tmp_path / "out", tmp_path / "reports", write_output=False
+    )
+    by_key = {o.key: o for o in outcomes}
+    assert by_key[SOURCE_KEY].ok
+    assert by_key[SOURCE_KEY].rendered.startswith("SKIP")
+    assert all(outcome.ok for outcome in outcomes)
+
+
+@pytest.mark.parametrize("command", ["validate", "report", "clean"])
+def test_explicit_only_missing_system_telemetry_exits_nonzero(command, tmp_path):
+    argv = [
+        command,
+        "--input",
+        str(tmp_path),
+        "--reports",
+        str(tmp_path / "reports"),
+        "--only",
+        SOURCE_KEY,
+    ]
+    if command == "clean":
+        argv.extend(["--output", str(tmp_path / "out")])
+    assert main(argv) == 1
+    outcomes = run_all(
+        tmp_path,
+        tmp_path / "out",
+        tmp_path / "reports",
+        only=[SOURCE_KEY],
+        write_output=False,
+    )
+    assert len(outcomes) == 1
+    assert not outcomes[0].ok
+    assert outcomes[0].rendered.startswith("SKIP  system_telemetry_v1:")
+
+
+def test_only_including_optional_source_fails_when_absent(tmp_path):
+    for name in _LEGACY_JSONL:
+        shutil.copy(FIXTURES / name, tmp_path / name)
+    argv = [
+        "validate",
+        "--input",
+        str(tmp_path),
+        "--reports",
+        str(tmp_path / "reports"),
+        "--only",
+        "ghost_market_log",
+        SOURCE_KEY,
+    ]
+    assert main(argv) == 1
+    outcomes = run_all(
+        tmp_path,
+        tmp_path / "out",
+        tmp_path / "reports",
+        only=["ghost_market_log", SOURCE_KEY],
+        write_output=False,
+    )
+    by_key = {o.key: o for o in outcomes}
+    assert by_key["ghost_market_log"].ok
+    assert not by_key[SOURCE_KEY].ok
+    assert by_key[SOURCE_KEY].rendered.startswith("SKIP  system_telemetry_v1:")
 
 
 def test_multiple_sessions_in_one_input_fail_loud(tmp_path):
@@ -221,6 +344,24 @@ def test_allow_constant_spec_passes_timestamp_gates():
 # --------------------------------------------------------------------------- #
 # Fail-loud: zeros-as-real / missing not coerced to 0
 # --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("field", _BOOL_REJECT_FIELDS)
+@pytest.mark.parametrize("flag", (True, False))
+def test_bool_is_rejected_on_sensor_fields(field, flag):
+    row = _first_source_row()
+    row[field] = flag
+    with pytest.raises(PydanticValidationError, match="not bool"):
+        RawSystemTelemetry.model_validate(row)
+
+
+@pytest.mark.parametrize("field", _BOOL_REJECT_FIELDS)
+def test_bool_on_sensors_is_ingest_error(field, tmp_path):
+    row = _first_source_row()
+    row[field] = True
+    path = _write_jsonl(tmp_path / "bool.jsonl", [row])
+    with pytest.raises(IngestError, match="not bool"):
+        clean.clean_system_telemetry(path)
 
 
 def test_unavailable_zero_power_is_refused():

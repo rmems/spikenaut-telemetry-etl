@@ -43,6 +43,10 @@ class SourceSpec:
 
     # Optional locator used when ``filename`` is absent (Hub checkout layout).
     discover: Callable[[Path], Path | None] | None = None
+    # When True, a missing input is a successful SKIP on an unfiltered run.
+    # An explicit ``--only`` selection that includes this key still fails.
+    # Use only for sources from a separate producer (system_telemetry_v1).
+    optional: bool = False
 
     def input_path(self, root: Path) -> Path:
         return root / self.filename
@@ -117,6 +121,7 @@ SOURCES: tuple[SourceSpec, ...] = (
         ),
         sample_prefix=None,
         discover=system_telemetry.discover_input,
+        optional=True,
     ),
 )
 
@@ -141,11 +146,18 @@ def run_source(
     report_dir: Path,
     *,
     write_output: bool = True,
+    require_present: bool = False,
 ) -> RunOutcome:
-    """Clean and validate one source. Writes output only if every gate passes."""
+    """Clean and validate one source. Writes output only if every gate passes.
+
+    When ``require_present`` is True (CLI ``--only`` selected this source), a
+    missing input fails even if ``spec.optional``. Unfiltered runs still treat
+    an optional missing file as a successful SKIP.
+    """
     path = spec.resolve_input(input_root)
     if not path.exists():
-        return RunOutcome(spec.key, False, f"SKIP  {spec.key}: {path} not found")
+        ok = spec.optional and not require_present
+        return RunOutcome(spec.key, ok, f"SKIP  {spec.key}: {path} not found")
 
     try:
         result = spec.cleaner(path)
@@ -215,8 +227,16 @@ def run_all(
     write_output: bool = True,
 ) -> list[RunOutcome]:
     selected = [s for s in SOURCES if not only or s.key in only]
+    require_present = bool(only)
     return [
-        run_source(s, input_root, output_root, report_dir, write_output=write_output)
+        run_source(
+            s,
+            input_root,
+            output_root,
+            report_dir,
+            write_output=write_output,
+            require_present=require_present,
+        )
         for s in selected
     ]
 
