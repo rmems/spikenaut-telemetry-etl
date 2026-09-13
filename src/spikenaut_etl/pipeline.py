@@ -43,6 +43,9 @@ class SourceSpec:
 
     # Optional locator used when ``filename`` is absent (Hub checkout layout).
     discover: Callable[[Path], Path | None] | None = None
+    # When True, a missing input is a successful SKIP rather than a failed run.
+    # Use only for sources from a separate producer (system_telemetry_v1).
+    optional: bool = False
 
     def input_path(self, root: Path) -> Path:
         return root / self.filename
@@ -117,6 +120,7 @@ SOURCES: tuple[SourceSpec, ...] = (
         ),
         sample_prefix=None,
         discover=system_telemetry.discover_input,
+        optional=True,
     ),
 )
 
@@ -145,7 +149,7 @@ def run_source(
     """Clean and validate one source. Writes output only if every gate passes."""
     path = spec.resolve_input(input_root)
     if not path.exists():
-        return RunOutcome(spec.key, False, f"SKIP  {spec.key}: {path} not found")
+        return RunOutcome(spec.key, spec.optional, f"SKIP  {spec.key}: {path} not found")
 
     try:
         result = spec.cleaner(path)
