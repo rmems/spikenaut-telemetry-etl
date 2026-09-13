@@ -247,7 +247,7 @@ class RawSystemTelemetry(StrictRecord):
         # before after-validators.
         if type(value) is bool:
             raise ValueError(
-                f"{info.field_name} must not be bool; "
+                f"{info.field_name} must be a number, not bool; "
                 "refusing to coerce True/False onto a sensor field"
             )
         return value
