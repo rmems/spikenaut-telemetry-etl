@@ -2,22 +2,18 @@
 # WARNING: Do not store sensitive information in this file, as its contents will be included in the Qodana report. #
 ####################################################################################################################
 
-version: "1.0"
-
-# CI runs the release linter, which requires QODANA_TOKEN (set as a repo secret).
-# Local runs without a token need the Community linter instead:
-#
-#   qodana scan --linter qodana-python-community
+# Free Community linter. No Qodana Cloud token or endpoint is required.
+# License audit (CheckDependencyLicenses) is Ultimate Plus only, so it is
+# omitted. qodana.recommended is still valid for Community and is the CI-oriented
+# profile JetBrains documents for pipelines.
 #
 # The exclusions below were verified against Community; both inspections exist
-# in either linter, so they apply the same way.
-linter: qodana-python
+# in the Community linter.
+version: "1.0"
+linter: qodana-python-community
 
 profile:
   name: qodana.recommended
-
-include:
-  - name: CheckDependencyLicenses
 
 # Two inspections are structurally wrong for this codebase and were verified
 # false before being disabled -- not silenced to make the report green.
