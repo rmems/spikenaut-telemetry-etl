@@ -235,14 +235,19 @@ class RawSystemTelemetry(StrictRecord):
         "memory_total_mb",
         "encoder_util_perc",
         "decoder_util_perc",
+        "cpu_tctl_c",
+        "cpu_ccd1_c",
+        "cpu_ccd2_c",
+        "cpu_package_power_w",
         mode="before",
     )
     @classmethod
-    def _reject_bool_int_fields(cls, value: object, info: ValidationInfo) -> object:
-        # strict=False otherwise coerces True->1 / False->0 before after-validators.
+    def _reject_bool_sensor_fields(cls, value: object, info: ValidationInfo) -> object:
+        # strict=False otherwise coerces True->1 / False->0 (and True->1.0)
+        # before after-validators.
         if type(value) is bool:
             raise ValueError(
-                f"{info.field_name} must be an int, not bool; "
+                f"{info.field_name} must not be bool; "
                 "refusing to coerce True/False onto a sensor field"
             )
         return value

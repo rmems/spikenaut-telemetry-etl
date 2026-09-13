@@ -72,6 +72,15 @@ _INT_SENSOR_FIELDS = (
     "decoder_util_perc",
 )
 
+_FLOAT_SENSOR_FIELDS = (
+    "cpu_tctl_c",
+    "cpu_ccd1_c",
+    "cpu_ccd2_c",
+    "cpu_package_power_w",
+)
+
+_BOOL_REJECT_FIELDS = ("timestamp_ms", *_INT_SENSOR_FIELDS, *_FLOAT_SENSOR_FIELDS)
+
 _LEGACY_JSONL = (
     "neuromorphic_data.jsonl",
     "node_sync_harvest.jsonl",
@@ -168,6 +177,59 @@ def test_four_source_tree_without_gaming_telemetry_exits_zero(command, tmp_path)
     assert by_key[SOURCE_KEY].ok
     assert by_key[SOURCE_KEY].rendered.startswith("SKIP")
     assert all(outcome.ok for outcome in outcomes)
+
+
+@pytest.mark.parametrize("command", ["validate", "report", "clean"])
+def test_explicit_only_missing_system_telemetry_exits_nonzero(command, tmp_path):
+    argv = [
+        command,
+        "--input",
+        str(tmp_path),
+        "--reports",
+        str(tmp_path / "reports"),
+        "--only",
+        SOURCE_KEY,
+    ]
+    if command == "clean":
+        argv.extend(["--output", str(tmp_path / "out")])
+    assert main(argv) == 1
+    outcomes = run_all(
+        tmp_path,
+        tmp_path / "out",
+        tmp_path / "reports",
+        only=[SOURCE_KEY],
+        write_output=False,
+    )
+    assert len(outcomes) == 1
+    assert not outcomes[0].ok
+    assert outcomes[0].rendered.startswith("SKIP  system_telemetry_v1:")
+
+
+def test_only_including_optional_source_fails_when_absent(tmp_path):
+    for name in _LEGACY_JSONL:
+        shutil.copy(FIXTURES / name, tmp_path / name)
+    argv = [
+        "validate",
+        "--input",
+        str(tmp_path),
+        "--reports",
+        str(tmp_path / "reports"),
+        "--only",
+        "ghost_market_log",
+        SOURCE_KEY,
+    ]
+    assert main(argv) == 1
+    outcomes = run_all(
+        tmp_path,
+        tmp_path / "out",
+        tmp_path / "reports",
+        only=["ghost_market_log", SOURCE_KEY],
+        write_output=False,
+    )
+    by_key = {o.key: o for o in outcomes}
+    assert by_key["ghost_market_log"].ok
+    assert not by_key[SOURCE_KEY].ok
+    assert by_key[SOURCE_KEY].rendered.startswith("SKIP  system_telemetry_v1:")
 
 
 def test_multiple_sessions_in_one_input_fail_loud(tmp_path):
@@ -284,17 +346,17 @@ def test_allow_constant_spec_passes_timestamp_gates():
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("field", ("timestamp_ms", *_INT_SENSOR_FIELDS))
+@pytest.mark.parametrize("field", _BOOL_REJECT_FIELDS)
 @pytest.mark.parametrize("flag", (True, False))
-def test_bool_is_rejected_on_integer_sensor_fields(field, flag):
+def test_bool_is_rejected_on_sensor_fields(field, flag):
     row = _first_source_row()
     row[field] = flag
     with pytest.raises(PydanticValidationError, match="not bool"):
         RawSystemTelemetry.model_validate(row)
 
 
-@pytest.mark.parametrize("field", ("timestamp_ms", *_INT_SENSOR_FIELDS))
-def test_bool_on_integer_sensors_is_ingest_error(field, tmp_path):
+@pytest.mark.parametrize("field", _BOOL_REJECT_FIELDS)
+def test_bool_on_sensors_is_ingest_error(field, tmp_path):
     row = _first_source_row()
     row[field] = True
     path = _write_jsonl(tmp_path / "bool.jsonl", [row])
