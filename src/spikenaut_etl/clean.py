@@ -467,12 +467,26 @@ def clean_system_telemetry(path: Path) -> CleanResult:
 
     for row, record in system_telemetry.read_records(path, stats):
         system_telemetry.reject_empty_sensors(record, row=row, source=path.name)
-        moment = timestamps.from_epoch_ms(record.timestamp_ms)
+        try:
+            moment = timestamps.from_epoch_ms(record.timestamp_ms)
+        except ValueError as exc:
+            raise IngestError(
+                f"{path.name}:{row}: {exc}; refusing to ingest",
+                kind="schema",
+            ) from exc
         payload = record.model_dump()
         payload["ts_utc"] = moment.isoformat()
         CleanSystemTelemetry.model_validate(payload)
         rows.append(payload)
         epochs.append(moment.timestamp())
+
+    labels = {row["session_label"] for row in rows}
+    if len(labels) > 1:
+        raise IngestError(
+            f"{path.name}: mixed session_label values {sorted(labels)}; "
+            "one config = one play session",
+            kind="schema",
+        )
 
     keep = SYSTEM_TELEMETRY_HARDWARE_INVARIANTS | {"timestamp_ms", "ts_utc"}
     dead = find_dead_columns(rows) - keep

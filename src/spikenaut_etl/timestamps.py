@@ -119,7 +119,12 @@ def from_epoch_ms(timestamp_ms: object) -> datetime:
             f"timestamp_ms must be a positive epoch millisecond count, "
             f"got {timestamp_ms!r}"
         )
-    return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+    try:
+        return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError(
+            f"timestamp_ms {timestamp_ms!r} is not a convertible UTC clock"
+        ) from exc
 
 
 def parse(raw: object) -> ParsedTimestamp:

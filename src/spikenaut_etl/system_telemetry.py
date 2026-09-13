@@ -74,6 +74,11 @@ def iter_source_files(path: Path) -> list[Path]:
         for p in (path / SOURCE_JSONL, path / SOURCE_PARQUET)
         if p.exists() and p.is_file()
     ]
+    if len(explicit) > 1:
+        raise IngestError(
+            f"{path}: both {SOURCE_JSONL} and {SOURCE_PARQUET} present; "
+            "refusing to concatenate duplicate captures"
+        )
     if explicit:
         return explicit
 
@@ -216,7 +221,7 @@ def _read_parquet(
         )
     try:
         table = pq.read_table(path)
-    except (OSError, ValueError) as exc:
+    except Exception as exc:
         raise IngestError(f"{path.name}: cannot read parquet: {exc}") from exc
     for local_row, raw in enumerate(table.to_pylist()):
         stats.n_lines += 1

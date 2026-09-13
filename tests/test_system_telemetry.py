@@ -119,6 +119,45 @@ def test_multiple_sessions_in_one_input_fail_loud(tmp_path):
         clean.clean_system_telemetry(tmp_path)
 
 
+def test_jsonl_and_parquet_together_are_refused(tmp_path):
+    rows = [json.loads(line) for line in SOURCE_FIXTURE.read_text().splitlines() if line]
+    _write_jsonl(tmp_path / "system_telemetry_v1.jsonl", rows)
+    pq.write_table(
+        pa.Table.from_pylist(rows), tmp_path / "system_telemetry_v1.parquet"
+    )
+    with pytest.raises(IngestError, match="duplicate captures"):
+        clean.clean_system_telemetry(tmp_path)
+
+
+def test_mixed_session_labels_fail_loud(tmp_path):
+    a = _first_source_row()
+    b = _varied(a, 1)
+    b["session_label"] = "other"
+    path = _write_jsonl(tmp_path / "mixed.jsonl", [a, b])
+    with pytest.raises(IngestError, match="mixed session_label"):
+        clean.clean_system_telemetry(path)
+
+
+def test_overflow_timestamp_ms_is_ingest_error_not_crash(tmp_path):
+    row = _first_source_row()
+    row["timestamp_ms"] = 10**18
+    path = _write_jsonl(tmp_path / "system_telemetry_v1.jsonl", [row])
+    with pytest.raises(IngestError, match="not a convertible UTC clock"):
+        clean.clean_system_telemetry(path)
+    outcome = run_source(
+        _spec(), tmp_path, tmp_path / "out", tmp_path / "reports"
+    )
+    assert not outcome.ok
+    assert outcome.output_path is None
+
+
+def test_corrupt_parquet_is_ingest_error_not_crash(tmp_path):
+    path = tmp_path / "system_telemetry_v1.parquet"
+    path.write_bytes(b"not a parquet file")
+    with pytest.raises(IngestError, match="cannot read parquet"):
+        clean.clean_system_telemetry(path)
+
+
 # --------------------------------------------------------------------------- #
 # Game-blind / session_label hygiene
 # --------------------------------------------------------------------------- #
