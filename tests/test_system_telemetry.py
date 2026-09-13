@@ -82,8 +82,10 @@ def test_timestamp_ms_must_not_go_through_parse_as_seconds():
     utc = timestamps.from_epoch_ms(ms)
     assert utc.year == 2026
     # parse() treats a bare int as epoch *seconds*. That path cannot represent
-    # this millisecond clock (year 58248 is out of datetime range).
-    with pytest.raises(ValueError, match="out of range"):
+    # this millisecond clock (year 58248). Wording differs across CPython
+    # (3.12 "year 58248 is out of range" vs 3.14 "year must be in 1..9999,
+    # not 58248"); the proof is the impossible year, not the exact phrase.
+    with pytest.raises(ValueError, match=r"year|out of range|58248"):
         timestamps.parse(ms)
 
 
