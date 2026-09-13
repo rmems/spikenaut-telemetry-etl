@@ -16,9 +16,11 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
-from . import timestamps, v1
+from . import system_telemetry, timestamps, v1
 from .ingest import IngestError, IngestStats, read_validated
 from .schemas import (
+    SYSTEM_TELEMETRY_HARDWARE_INVARIANTS,
+    CleanSystemTelemetry,
     RawGpuRecord,
     RawNodeSyncRecord,
     RawQubicTick,
@@ -445,5 +447,43 @@ def clean_trading_log(path: Path) -> CleanResult:
         n_in=stats.n_lines,
         ingest=stats,
         quarantine=quarantine,
+        epochs=epochs,
+    )
+
+
+def clean_system_telemetry(path: Path) -> CleanResult:
+    """``system_telemetry_v1`` parquet/JSONL -> flat hardware sensors.
+
+    ``ts_utc`` is derived from ``timestamp_ms`` by dividing milliseconds. That is
+    a unit conversion of a real clock, not fabrication. Hardware invariants
+    (``session_label``, ``memory_total_mb``, encoder/decoder util when
+    observed-zero) are kept for ``GateConfig.allow_constant`` rather than dropped
+    as dead. ``session_label`` is session hygiene, not a Spikenaut axon.
+    """
+    stats = IngestStats(source=system_telemetry.SOURCE_KEY)
+    quarantine = timestamps.QuarantineLog(source=system_telemetry.SOURCE_KEY)
+    rows: list[dict[str, Any]] = []
+    epochs: list[float] = []
+
+    for row, record in system_telemetry.read_records(path, stats):
+        system_telemetry.reject_empty_sensors(record, row=row, source=path.name)
+        moment = timestamps.from_epoch_ms(record.timestamp_ms)
+        payload = record.model_dump()
+        payload["ts_utc"] = moment.isoformat()
+        CleanSystemTelemetry.model_validate(payload)
+        rows.append(payload)
+        epochs.append(moment.timestamp())
+
+    keep = SYSTEM_TELEMETRY_HARDWARE_INVARIANTS | {"timestamp_ms", "ts_utc"}
+    dead = find_dead_columns(rows) - keep
+    rows = drop_columns(rows, dead)
+
+    return CleanResult(
+        name=system_telemetry.SOURCE_KEY,
+        rows=rows,
+        n_in=stats.n_lines,
+        ingest=stats,
+        quarantine=quarantine,
+        dead_columns=dead,
         epochs=epochs,
     )

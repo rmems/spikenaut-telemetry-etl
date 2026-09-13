@@ -245,6 +245,7 @@ def test_unattributed_rows_are_null_never_empty_string():
         ("node_sync_harvest", "node_sync_harvest.jsonl"),
         ("qubic_ticks_snn", "qubic_ticks.jsonl"),
         ("ghost_market_log", "ghost_market_log.jsonl"),
+        ("system_telemetry_v1", "system_telemetry_v1.jsonl"),
     ],
 )
 def test_real_fixtures_pass_all_gates(key, filename, tmp_path):

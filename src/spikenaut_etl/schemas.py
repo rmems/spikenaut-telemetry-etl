@@ -149,6 +149,140 @@ class RawQubicTick(StrictRecord):
 
 
 # --------------------------------------------------------------------------- #
+# Source: rmems/gaming-telemetry  (system_telemetry_v1, game-agnostic sensors)
+# --------------------------------------------------------------------------- #
+# Producer contract: missing NVML/hwmon/RAPL reads are null, never 0. A literal
+# 0 on the fields in UNAVAILABLE_ZERO_FIELDS is a failed read written as a
+# measurement -- refuse it rather than teach sensor failure as hardware.
+# encoder/decoder util may legitimately be 0 for a whole session.
+# session_label is ETL session hygiene (GateConfig.allow_constant / splits).
+# It is not a Spikenaut axon and must not be published as a training feature.
+
+
+UNAVAILABLE_ZERO_FIELDS = frozenset(
+    {
+        "power_usage_mw",
+        "temperature_c",
+        "graphics_clock_mhz",
+        "memory_clock_mhz",
+        "memory_total_mb",
+        "cpu_tctl_c",
+        "cpu_ccd1_c",
+        "cpu_ccd2_c",
+        "cpu_package_power_w",
+    }
+)
+
+SYSTEM_TELEMETRY_HARDWARE_INVARIANTS = frozenset(
+    {
+        "session_label",
+        "memory_total_mb",
+        "encoder_util_perc",
+        "decoder_util_perc",
+    }
+)
+
+SYSTEM_TELEMETRY_HYGIENE_COLUMNS = frozenset({"session_label"})
+
+
+class RawSystemTelemetry(StrictRecord):
+    """One ``system_telemetry_v1`` sensor row (parquet or JSONL).
+
+    Field names match ``rmems/gaming-telemetry``. Extra fields are forbidden so
+    a collector schema bump is loud. ``session_label`` identifies the capture
+    session for gating; it is not game identity for training.
+    """
+
+    timestamp_ms: int
+    power_usage_mw: int | None = None
+    temperature_c: int | None = None
+    graphics_clock_mhz: int | None = None
+    memory_clock_mhz: int | None = None
+    pcie_rx_kbps: int | None = None
+    pcie_tx_kbps: int | None = None
+    pstate: int | None = None
+    throttle_reasons_bitmask: int | None = None
+    fan_speed_perc: int | None = None
+    memory_used_mb: int | None = None
+    memory_total_mb: int | None = None
+    encoder_util_perc: int | None = None
+    decoder_util_perc: int | None = None
+    cpu_tctl_c: float | None = None
+    cpu_ccd1_c: float | None = None
+    cpu_ccd2_c: float | None = None
+    cpu_package_power_w: float | None = None
+    session_label: str
+
+    @field_validator("timestamp_ms")
+    @classmethod
+    def _positive_epoch_ms(cls, value: int) -> int:
+        if type(value) is bool or value <= 0:
+            raise ValueError(
+                "timestamp_ms must be a positive epoch millisecond count; "
+                "refusing to treat a missing clock as time"
+            )
+        return value
+
+    @field_validator("session_label")
+    @classmethod
+    def _nonempty_session_label(cls, value: str) -> str:
+        label = value.strip()
+        if not label:
+            raise ValueError(
+                "session_label is ETL session hygiene and must be non-empty"
+            )
+        return label
+
+    @model_validator(mode="after")
+    def _reject_unavailable_zeros(self) -> RawSystemTelemetry:
+        for name in sorted(UNAVAILABLE_ZERO_FIELDS):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if value == 0:
+                raise ValueError(
+                    f"{name} is 0; unavailable NVML/hwmon/RAPL reads must be "
+                    "null, not a zero measurement"
+                )
+        return self
+
+
+class CleanSystemTelemetry(StrictRecord):
+    """Flat system telemetry with ``ts_utc`` derived from ``timestamp_ms``.
+
+    ``ts_utc`` is a unit conversion of the source clock, not a synthesized
+    timestamp. ``session_label`` is kept for session splits and
+    ``GateConfig.allow_constant``; it is not a Spikenaut feature axon.
+    """
+
+    timestamp_ms: int
+    ts_utc: str
+    power_usage_mw: int | None = None
+    temperature_c: int | None = None
+    graphics_clock_mhz: int | None = None
+    memory_clock_mhz: int | None = None
+    pcie_rx_kbps: int | None = None
+    pcie_tx_kbps: int | None = None
+    pstate: int | None = None
+    throttle_reasons_bitmask: int | None = None
+    fan_speed_perc: int | None = None
+    memory_used_mb: int | None = None
+    memory_total_mb: int | None = None
+    encoder_util_perc: int | None = None
+    decoder_util_perc: int | None = None
+    cpu_tctl_c: float | None = None
+    cpu_ccd1_c: float | None = None
+    cpu_ccd2_c: float | None = None
+    cpu_package_power_w: float | None = None
+    session_label: str
+
+
+SYSTEM_TELEMETRY_FEATURE_AXONS = frozenset(CleanSystemTelemetry.model_fields) - (
+    SYSTEM_TELEMETRY_HYGIENE_COLUMNS
+)
+
+
+# --------------------------------------------------------------------------- #
 # Source: ghost_market_log.jsonl  (already flat and healthy)
 # --------------------------------------------------------------------------- #
 
@@ -371,4 +505,5 @@ CLEAN_COLUMNS: dict[str, frozenset[str]] = {
     "node_sync_harvest": frozenset(CleanNodeSync.model_fields),
     "qubic_ticks_snn": frozenset(CleanQubicTick.model_fields),
     "ghost_market_log": frozenset(RawTradingLog.model_fields),
+    "system_telemetry_v1": frozenset(CleanSystemTelemetry.model_fields),
 }

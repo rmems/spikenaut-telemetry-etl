@@ -16,9 +16,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import clean, report
+from . import clean, report, system_telemetry
 from .ingest import IngestError
-from .schemas import CLEAN_COLUMNS
+from .schemas import (
+    CLEAN_COLUMNS,
+    SYSTEM_TELEMETRY_HARDWARE_INVARIANTS,
+    SYSTEM_TELEMETRY_HYGIENE_COLUMNS,
+)
 from .validate import GateConfig, ValidationError, assert_publishable, check_all
 
 Cleaner = Callable[[Path], clean.CleanResult]
@@ -37,8 +41,20 @@ class SourceSpec:
     # None means this source publishes no sample.
     sample_prefix: str | None = None
 
+    # Optional locator used when ``filename`` is absent (Hub checkout layout).
+    discover: Callable[[Path], Path | None] | None = None
+
     def input_path(self, root: Path) -> Path:
         return root / self.filename
+
+    def resolve_input(self, root: Path) -> Path:
+        primary = self.input_path(root)
+        if primary.exists():
+            return primary
+        if self.discover is None:
+            return primary
+        found = self.discover(root)
+        return found if found is not None else primary
 
 
 # ``timestamp`` on node_sync is legitimately null for coin-tagged rows, and
@@ -85,6 +101,23 @@ SOURCES: tuple[SourceSpec, ...] = (
         gates=GateConfig(),
         sample_prefix="hft",
     ),
+    SourceSpec(
+        key=system_telemetry.SOURCE_KEY,
+        filename=system_telemetry.SOURCE_JSONL,
+        cleaner=clean.clean_system_telemetry,
+        output="full_data/system_telemetry_v1.jsonl",
+        # Hardware invariants of one capture session, not collapse. session_label
+        # is ETL hygiene only — never a Spikenaut axon. Do not fold this source
+        # into mining v3/state_telemetry gpu-000000..198 episodes.
+        gates=GateConfig(
+            allow_constant=SYSTEM_TELEMETRY_HARDWARE_INVARIANTS,
+            identity_columns=GateConfig.identity_columns
+            | SYSTEM_TELEMETRY_HYGIENE_COLUMNS
+            | {"timestamp_ms", "ts_utc"},
+        ),
+        sample_prefix=None,
+        discover=system_telemetry.discover_input,
+    ),
 )
 
 # Published sample sizes, as (row count, filename suffix).
@@ -110,7 +143,7 @@ def run_source(
     write_output: bool = True,
 ) -> RunOutcome:
     """Clean and validate one source. Writes output only if every gate passes."""
-    path = spec.input_path(input_root)
+    path = spec.resolve_input(input_root)
     if not path.exists():
         return RunOutcome(spec.key, False, f"SKIP  {spec.key}: {path} not found")
 

@@ -114,7 +114,7 @@ spikenaut-etl clean \
 spikenaut-etl report --input ~/spikenaut-data-backup/2026-08-03
 ```
 
-Restrict to one source with `--only node_sync_harvest`.
+Restrict to one source with `--only node_sync_harvest` (or `--only system_telemetry_v1`).
 
 ---
 
@@ -126,6 +126,7 @@ Restrict to one source with `--only node_sync_harvest`.
 | `node_sync_harvest` | `node_sync_harvest.jsonl` | `full_data/node_sync_harvest.jsonl` | Mining telemetry. Three timestamp forms; real ones preserved, coin tags decomposed. |
 | `qubic_ticks_snn` | `qubic_ticks.jsonl` | `full_data/qubic_ticks_snn.jsonl` | Derived columns suffixed `_derived`. |
 | `ghost_market_log` | `ghost_market_log.jsonl` | `full_data/ghost_market_log.jsonl` | Already healthy; validated passthrough. |
+| `system_telemetry_v1` | `system_telemetry_v1.jsonl` / `.parquet`, or a `rmems/gaming-telemetry` checkout (`{session}/train-*.parquet`) | `full_data/system_telemetry_v1.jsonl` | Game-agnostic hardware sensors. `ts_utc` is converted from `timestamp_ms` (not fabricated). `session_label` is session hygiene for `allow_constant` / splits — **not** a Spikenaut axon. Do not fold into mining `v3/state_telemetry` `gpu-000000..198`. |
 
 ### Timestamp forms in `node_sync_harvest.jsonl`
 
@@ -146,6 +147,23 @@ than an invented datetime.
 distinct values across 27,430 rows, with `power_w / hashrate_mh` pinned at 210.9.
 They are preserved for continuity but every one now carries a `_derived` suffix.
 The independent signals are `tick_rate` and `qubic_tick_trace`.
+
+### `system_telemetry_v1` (gaming-telemetry)
+
+`rmems/gaming-telemetry` is multi-game **hardware** capture. Spikenaut stays
+game-blind: title identity never becomes an axon or published training column.
+`session_label` is one capture id for GateConfig and session splits.
+
+Default `GateConfig` fails `no_constant_columns` on this source for hardware
+invariants of a single session (`session_label`, `memory_total_mb`, and
+encoder/decoder util when they are observed-zero). Those four belong in
+`allow_constant`. Missing NVML/hwmon/RAPL reads are `null`; a literal `0` on
+power/temp/clocks/VRAM-capacity/CPU sensors is refused rather than taught as
+hardware behavior.
+
+This mill does **not** append a play session as `gpu-000199` or otherwise mix
+into Hub `v3/state_telemetry` mining episodes. Use `--only system_telemetry_v1`
+when the input is a gaming-telemetry checkout; the mining JSONL keys will SKIP.
 
 ---
 
