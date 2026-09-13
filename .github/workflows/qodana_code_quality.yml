@@ -9,7 +9,12 @@ on:
       - 'releases/*'
 
 jobs:
+  # Community Python only. qodana-python-community does not need Qodana Cloud,
+  # so this job runs on Dependabot and fork pull requests as well as ordinary
+  # ones. The paid Python linter is gone: it required Ultimate, and that
+  # membership has expired.
   qodana:
+    name: Qodana (python)
     runs-on: ubuntu-latest
     # pr-mode is false and qodana.yaml sets no baseline-commit, so the action
     # neither writes to the repo nor posts PR comments -- it only publishes a
@@ -33,6 +38,8 @@ jobs:
         uses: JetBrains/qodana-action@10be11607eb323a180e2b76b26c9c5cdceac3e77  # v2026.2.1
         with:
           pr-mode: false
-        env:
-          QODANA_TOKEN: ${{ secrets.QODANA_TOKEN_574611171 }}
-          QODANA_ENDPOINT: 'https://qodana.cloud'
+          # Space-separated, not comma-separated: the action warns that
+          # "Comma-separated args format is deprecated and will be removed in a
+          # future version."
+          args: --config qodana.yaml
+        # No QODANA_TOKEN / QODANA_ENDPOINT: Community does not talk to Cloud.
