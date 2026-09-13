@@ -102,6 +102,31 @@ class ParsedTimestamp:
         return self.moment.timestamp() if self.moment else None
 
 
+def from_epoch_ms(timestamp_ms: object) -> datetime:
+    """Convert Unix epoch milliseconds to UTC.
+
+    This is a unit conversion of an observed clock, not fabrication.
+    :func:`parse` treats a bare integer as *seconds* (``qubic_ticks.ts``);
+    passing ``timestamp_ms`` through that path would mis-scale the clock.
+    """
+    if type(timestamp_ms) is bool or not isinstance(timestamp_ms, int):
+        raise ValueError(
+            f"timestamp_ms must be a positive int of epoch milliseconds, "
+            f"got {timestamp_ms!r}"
+        )
+    if timestamp_ms <= 0:
+        raise ValueError(
+            f"timestamp_ms must be a positive epoch millisecond count, "
+            f"got {timestamp_ms!r}"
+        )
+    try:
+        return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError(
+            f"timestamp_ms {timestamp_ms!r} is not a convertible UTC clock"
+        ) from exc
+
+
 def parse(raw: object) -> ParsedTimestamp:
     """Interpret a legacy timestamp field. Never invents a value."""
     if not isinstance(raw, str):
