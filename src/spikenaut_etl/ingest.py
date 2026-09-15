@@ -1,15 +1,21 @@
-"""Readers for legacy free-form JSONL and Theseus-Quarry schema-v1 envelopes.
+"""Readers for legacy free-form JSONL, published Vault Clean* JSONL, and
+Theseus-Quarry schema-v1 envelopes.
 
 Legacy files predate the versioned ``TelemetryEnvelope`` in
 ``rmems/Theseus-Quarry``. They stream, because ``neuromorphic_data.jsonl`` is
 395 MB and holding it as a list of dicts costs several GB.
 
-Dispatch is per line on ``schema_version``:
+Dispatch is per line on ``schema_version``, then on shape:
 
 * ``schema_version == 1`` → ``TelemetryEnvelope`` (tagged ``payload``).
 * any other ``schema_version`` → raise; this reader does not guess.
 * a v1-shaped line with no ``schema_version`` → raise.
-* otherwise → the caller's legacy model.
+* nested ``telemetry`` → the caller's legacy ``Raw*`` model.
+* published Clean GPU / CleanNodeSync / CleanQubicTick → re-validated as-is
+  (typed-null timestamps on coin-tagged harvest rows are kept, never filled).
+* LIVE_COLUMNS (``sm_clock_mhz`` without ``gpu_clock_mhz``) → named contract
+  unless ``--profile live-columns``. Never invent ``sm_clock_mhz`` from
+  ``gpu_clock_mhz``.
 
 Empty telemetry / empty payloads, unknown versions, unknown payload tags, and
 extra fields all raise :class:`IngestError`. There is no warn-and-continue path
@@ -32,7 +38,29 @@ from typing import Any, TypeVar
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
-from .schemas import COLLECTOR_SCHEMA_VERSION, TelemetryEnvelope
+from .contracts import (
+    CONTRACT_LIVE_COLUMNS_REQUIRED,
+    CONTRACT_MIXED_SHAPES,
+    LiveColumnsRecord,
+    ShapeProfile,
+    live_columns_required_message,
+    looks_like_clean_gpu,
+    looks_like_clean_node_sync,
+    looks_like_clean_qubic,
+    looks_like_live_columns,
+    looks_like_nested_raw,
+    mixed_shapes_message,
+)
+from .schemas import (
+    COLLECTOR_SCHEMA_VERSION,
+    CleanGpuTelemetry,
+    CleanNodeSync,
+    CleanQubicTick,
+    RawGpuRecord,
+    RawNodeSyncRecord,
+    RawQubicTick,
+    TelemetryEnvelope,
+)
 
 # Preserves the caller's concrete model type through read_validated. Returning
 # the bare BaseModel would erase it, and every downstream `record.telemetry` /
@@ -51,6 +79,14 @@ class IngestError(Exception):
     def __init__(self, message: str, *, kind: str = "ingest") -> None:
         super().__init__(message)
         self.kind = kind
+
+
+class ContractError(IngestError):
+    """Named producer/consumer contract mismatch. Output must not be written."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(f"[{code}] {message}", kind="contract")
+        self.code = code
 
 
 @dataclass
@@ -83,7 +119,7 @@ class IngestStats:
 
 def read_validated(
     path: Path, model: type[M], stats: IngestStats
-) -> Iterator[tuple[int, M | TelemetryEnvelope]]:
+) -> Iterator[tuple[int, BaseModel]]:
     """Stream a source through its declared schema, or schema v1.
 
     ``extra="forbid"`` means an unexpected field raises here rather than being
@@ -131,7 +167,7 @@ def parse_record(
     *,
     row: int,
     source: str,
-) -> M | TelemetryEnvelope:
+) -> BaseModel:
     """Dispatch one decoded object to schema v1 or the legacy model."""
     if "schema_version" in payload:
         version = payload["schema_version"]
@@ -161,15 +197,100 @@ def parse_record(
             kind="version",
         )
 
+    record = _parse_legacy(payload, model, row=row, source=source)
+    _reject_empty_legacy(record, row=row, source=source)
+    return record
+
+
+def _parse_legacy(
+    payload: dict[str, Any],
+    model: type[M],
+    *,
+    row: int,
+    source: str,
+) -> BaseModel:
+    """Legacy collector JSONL, or the published Clean* / LIVE_COLUMNS shapes."""
+    if model is RawGpuRecord:
+        return _parse_gpu_payload(payload, row=row, source=source)
+    if model is RawNodeSyncRecord:
+        return _parse_node_sync_payload(payload, row=row, source=source)
+    if model is RawQubicTick:
+        return _parse_qubic_payload(payload, row=row, source=source)
+    return _validate_model(payload, model, row=row, source=source)
+
+
+def _parse_gpu_payload(payload: dict[str, Any], *, row: int, source: str) -> BaseModel:
+    if looks_like_nested_raw(payload):
+        return _validate_model(payload, RawGpuRecord, row=row, source=source)
+    if looks_like_live_columns(payload):
+        try:
+            return LiveColumnsRecord.model_validate(payload)
+        except PydanticValidationError as exc:
+            raise ContractError(
+                live_columns_required_message(source=source, row=row)
+                + f" schema: {_terse(exc)}",
+                code=CONTRACT_LIVE_COLUMNS_REQUIRED,
+            ) from exc
+    if looks_like_clean_gpu(payload):
+        return _validate_model(payload, CleanGpuTelemetry, row=row, source=source)
+    return _validate_model(payload, RawGpuRecord, row=row, source=source)
+
+
+def _parse_node_sync_payload(
+    payload: dict[str, Any], *, row: int, source: str
+) -> BaseModel:
+    if looks_like_nested_raw(payload):
+        return _validate_model(payload, RawNodeSyncRecord, row=row, source=source)
+    if looks_like_clean_node_sync(payload):
+        return _validate_model(payload, CleanNodeSync, row=row, source=source)
+    return _validate_model(payload, RawNodeSyncRecord, row=row, source=source)
+
+
+def _parse_qubic_payload(payload: dict[str, Any], *, row: int, source: str) -> BaseModel:
+    if looks_like_clean_qubic(payload):
+        return _validate_model(payload, CleanQubicTick, row=row, source=source)
+    return _validate_model(payload, RawQubicTick, row=row, source=source)
+
+
+def _validate_model(
+    payload: dict[str, Any],
+    model: type[M],
+    *,
+    row: int,
+    source: str,
+) -> M:
     try:
-        record = model.model_validate(payload)
+        return model.model_validate(payload)
     except PydanticValidationError as exc:
         raise IngestError(
             f"{source}:{row}: schema violation: {_terse(exc)}; refusing to ingest",
             kind="schema",
         ) from exc
-    _reject_empty_legacy(record, row=row, source=source)
-    return record
+
+
+def shape_of(record: BaseModel) -> ShapeProfile:
+    """Classify one parsed record as raw, published, or live-columns."""
+    if isinstance(record, LiveColumnsRecord):
+        return "live-columns"
+    if isinstance(record, (CleanGpuTelemetry, CleanNodeSync, CleanQubicTick)):
+        return "published"
+    return "raw"
+
+
+def require_single_shape(
+    *, source: str, row: int, previous: ShapeProfile | None, current: ShapeProfile
+) -> ShapeProfile:
+    """Refuse mixed collector / published / LIVE_COLUMNS rows in one file."""
+    if previous is None:
+        return current
+    if previous != current:
+        raise ContractError(
+            mixed_shapes_message(
+                source=source, row=row, previous=previous, current=current
+            ),
+            code=CONTRACT_MIXED_SHAPES,
+        )
+    return previous
 
 
 def _v1_shaped(payload: dict[str, Any]) -> bool:

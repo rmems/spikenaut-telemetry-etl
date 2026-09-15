@@ -106,6 +106,13 @@ class RawGpuRecord(StrictRecord):
     telemetry: RawGpuTelemetry
 
 
+# Published Vault ``full_data/neuromorphic_data.jsonl`` is the *cleaned* form
+# (``CleanGpuTelemetry`` below): flat ``row_index`` + sensors, ``gpu_clock_mhz``,
+# no nested ``telemetry``. Ingest accepts that published shape. It is **not**
+# LiveStimAdapter input — that requires ``sm_clock_mhz`` from
+# ``v3/state_telemetry/*.parquet`` (STATE_BACKFILL). Do not invent the mapping.
+
+
 # --------------------------------------------------------------------------- #
 # Source: node_sync_harvest.jsonl  (mining telemetry, legacy nested)
 # --------------------------------------------------------------------------- #
@@ -137,7 +144,9 @@ class RawNodeSyncTelemetry(StrictRecord):
 class RawNodeSyncRecord(StrictRecord):
     # Either an ISO-ish datetime ("2026-03-19 11:55:13.132") or a "coin:height"
     # tag ("dynex:919876"). Both are real and must survive -- see
-    # spikenaut_etl.timestamps.
+    # spikenaut_etl.timestamps. Published CleanNodeSync rows instead carry
+    # ``timestamp: null`` on coin-tagged rows (typed null, never a synthesized
+    # clock). Null is not legal on this nested collector shape.
     timestamp: str
     telemetry: RawNodeSyncTelemetry
 

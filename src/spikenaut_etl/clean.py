@@ -17,9 +17,19 @@ from pathlib import Path
 from typing import Any
 
 from . import system_telemetry, timestamps, v1
-from .ingest import IngestError, IngestStats, read_validated
+from .contracts import LiveColumnsRecord, ShapeProfile
+from .ingest import (
+    IngestError,
+    IngestStats,
+    read_validated,
+    require_single_shape,
+    shape_of,
+)
 from .schemas import (
     SYSTEM_TELEMETRY_HARDWARE_INVARIANTS,
+    CleanGpuTelemetry,
+    CleanNodeSync,
+    CleanQubicTick,
     CleanSystemTelemetry,
     RawGpuRecord,
     RawNodeSyncRecord,
@@ -82,6 +92,8 @@ class CleanResult:
     dead_column_drift: list[str] = field(default_factory=list)
     coin_counts: Counter = field(default_factory=Counter)
     epochs: list[float] = field(default_factory=list)
+    # How the file was shaped: collector JSONL, published Clean*, or LIVE_COLUMNS.
+    profile: ShapeProfile = "raw"
 
 
 # --------------------------------------------------------------------------- #
@@ -232,6 +244,15 @@ def _require_v1_datetime(
 def clean_gpu_telemetry(path: Path) -> CleanResult:
     """``neuromorphic_data.jsonl`` -> flat GPU telemetry.
 
+    Accepts three shapes, never mixed in one file:
+
+    * nested collector ``RawGpuRecord`` (legacy backup)
+    * published Clean GPU (Vault ``full_data/neuromorphic_data.jsonl``)
+    * LIVE_COLUMNS projection (``sm_clock_mhz``). Default validate treats that
+      last shape as a contract error pointing at ``v3/state_telemetry``; pass
+      ``--profile live-columns`` to validate it. ``gpu_clock_mhz`` is never
+      renamed to ``sm_clock_mhz`` here.
+
     The source carries no timestamp field at all, so output is positional
     (``row_index``). That is a genuine limitation of the capture and is documented
     rather than concealed behind a generated clock.
@@ -240,7 +261,12 @@ def clean_gpu_telemetry(path: Path) -> CleanResult:
     quarantine = timestamps.QuarantineLog(source="neuromorphic_data")
     raw: list[dict[str, Any]] = []
     epochs: list[float] = []
+    file_profile: ShapeProfile | None = None
     for row, record in read_validated(path, RawGpuRecord, stats):
+        current = shape_of(record)
+        file_profile = require_single_shape(
+            source=path.name, row=row, previous=file_profile, current=current
+        )
         if isinstance(record, TelemetryEnvelope):
             parsed = _require_v1_datetime(
                 record.timestamp, row=row, source=path.name
@@ -248,10 +274,36 @@ def clean_gpu_telemetry(path: Path) -> CleanResult:
             payload = v1.map_envelope_to_gpu(record, row, source=path.name)
             if parsed.epoch is not None:
                 epochs.append(parsed.epoch)
-        else:
+            raw.append(payload)
+            continue
+        if isinstance(record, CleanGpuTelemetry):
+            raw.append(record.model_dump())
+            continue
+        if isinstance(record, LiveColumnsRecord):
+            raw.append(record.model_dump(exclude_none=True))
+            continue
+        if isinstance(record, RawGpuRecord):
             payload = record.telemetry.model_dump()
             payload["row_index"] = row
-        raw.append(payload)
+            raw.append(payload)
+            continue
+        raise IngestError(
+            f"{path.name}:{row}: unhandled GPU record type {type(record).__name__}; "
+            "refusing to guess a mapping",
+            kind="schema",
+        )
+
+    profile: ShapeProfile = file_profile or "raw"
+    if profile in ("published", "live-columns"):
+        return CleanResult(
+            name="neuromorphic_data",
+            rows=raw,
+            n_in=stats.n_lines,
+            ingest=stats,
+            quarantine=quarantine,
+            epochs=epochs,
+            profile=profile,
+        )
 
     dead = find_dead_columns(raw) - {"row_index"}
     present = {key for row in raw for key in row}
@@ -267,6 +319,7 @@ def clean_gpu_telemetry(path: Path) -> CleanResult:
         dead_columns=dead,
         dead_column_drift=drift,
         epochs=epochs,
+        profile=profile,
     )
 
 
@@ -277,12 +330,22 @@ def clean_node_sync(path: Path) -> CleanResult:
     ``coin:height`` form. Rows without a chain label get ``blockchain=None``,
     never ``""`` -- the prior output wrote the empty string for all 120,314 rows
     and the card then advertised a per-coin breakdown that did not exist.
+
+    Published Vault ``full_data`` rows are already this shape: coin-tagged rows
+    carry ``timestamp: null`` (typed null, not a missing clock to invent). Those
+    rows are kept and reported through ``coin_counts``; they are not dropped and
+    they are not given a synthesized datetime.
     """
     stats = IngestStats(source="node_sync_harvest")
     quarantine = timestamps.QuarantineLog(source="node_sync_harvest")
     parsed_rows: list[tuple[int, dict[str, Any], timestamps.ParsedTimestamp]] = []
+    file_profile: ShapeProfile | None = None
 
     for row, record in read_validated(path, RawNodeSyncRecord, stats):
+        current = shape_of(record)
+        file_profile = require_single_shape(
+            source=path.name, row=row, previous=file_profile, current=current
+        )
         if isinstance(record, TelemetryEnvelope):
             payload = v1.map_envelope_to_node_sync(
                 record, source=path.name, row=row
@@ -293,6 +356,21 @@ def clean_node_sync(path: Path) -> CleanResult:
             payload["timestamp"] = parsed.iso
             parsed_rows.append((row, payload, parsed))
             continue
+
+        if isinstance(record, CleanNodeSync):
+            parsed = _parsed_from_clean_node_sync(record)
+            if record.timestamp is not None and not parsed.ok:
+                quarantine.record(row, record.timestamp, timestamps.UNPARSEABLE)
+                continue
+            parsed_rows.append((row, record.model_dump(), parsed))
+            continue
+
+        if not isinstance(record, RawNodeSyncRecord):
+            raise IngestError(
+                f"{path.name}:{row}: unhandled node_sync record type "
+                f"{type(record).__name__}; refusing to guess a mapping",
+                kind="schema",
+            )
 
         parsed = timestamps.parse(record.timestamp)
         if not parsed.ok:
@@ -305,6 +383,8 @@ def clean_node_sync(path: Path) -> CleanResult:
         payload["block_height"] = parsed.height
         payload["chain_epoch"] = parsed.epoch_number
         parsed_rows.append((row, payload, parsed))
+
+    profile: ShapeProfile = file_profile or "raw"
 
     # Records appended out of time order came from a different run. Quarantine a
     # short trailing burst of them; anything larger is left in place for the
@@ -327,6 +407,18 @@ def clean_node_sync(path: Path) -> CleanResult:
     )
     epochs = [p.epoch for _, _, p in kept if p.epoch is not None]
 
+    if profile == "published":
+        return CleanResult(
+            name="node_sync_harvest",
+            rows=raw,
+            n_in=stats.n_lines,
+            ingest=stats,
+            quarantine=quarantine,
+            coin_counts=coins,
+            epochs=epochs,
+            profile=profile,
+        )
+
     identity = {"timestamp", "blockchain", "block_height", "chain_epoch"}
     dead = find_dead_columns(raw) - identity
     present = {key for row in raw for key in row}
@@ -343,6 +435,25 @@ def clean_node_sync(path: Path) -> CleanResult:
         dead_column_drift=drift,
         coin_counts=coins,
         epochs=epochs,
+        profile=profile,
+    )
+
+
+def _parsed_from_clean_node_sync(
+    record: CleanNodeSync,
+) -> timestamps.ParsedTimestamp:
+    """Typed-null policy: a published null timestamp is not a clock to invent.
+
+    Coin attribution is already on the row. An ISO timestamp is re-parsed for
+    the ordering gate. Neither path synthesizes a datetime.
+    """
+    if record.timestamp is not None:
+        return timestamps.parse(record.timestamp)
+    return timestamps.ParsedTimestamp(
+        raw="",
+        coin=record.blockchain,
+        height=record.block_height,
+        epoch_number=record.chain_epoch,
     )
 
 
@@ -357,13 +468,43 @@ def clean_qubic_ticks(path: Path) -> CleanResult:
     stats = IngestStats(source="qubic_ticks")
     quarantine = timestamps.QuarantineLog(source="qubic_ticks")
     records: list[tuple[int, RawQubicTick]] = []
+    published: list[dict[str, Any]] = []
+    file_profile: ShapeProfile | None = None
     for row, record in read_validated(path, RawQubicTick, stats):
+        current = shape_of(record)
+        file_profile = require_single_shape(
+            source=path.name, row=row, previous=file_profile, current=current
+        )
         if isinstance(record, TelemetryEnvelope):
             raise IngestError(
                 f"{path.name}:{row}: Theseus-Quarry schema v1 envelope cannot "
                 "be read as qubic_ticks; refusing to invent a mapping"
             )
+        if isinstance(record, CleanQubicTick):
+            published.append(record.model_dump())
+            continue
+        if not isinstance(record, RawQubicTick):
+            raise IngestError(
+                f"{path.name}:{row}: unhandled qubic_ticks record type "
+                f"{type(record).__name__}; refusing to invent a mapping",
+                kind="schema",
+            )
         records.append((row, record))
+    if published:
+        published_epochs: list[float] = []
+        for published_row in published:
+            parsed = timestamps.parse(published_row["timestamp"])
+            if parsed.epoch is not None:
+                published_epochs.append(parsed.epoch)
+        return CleanResult(
+            name="qubic_ticks_snn",
+            rows=published,
+            n_in=stats.n_lines,
+            ingest=stats,
+            quarantine=quarantine,
+            epochs=published_epochs,
+            profile="published",
+        )
     if not records:
         return CleanResult(
             name="qubic_ticks_snn",
@@ -371,6 +512,7 @@ def clean_qubic_ticks(path: Path) -> CleanResult:
             n_in=stats.n_lines,
             ingest=stats,
             quarantine=quarantine,
+            profile=file_profile or "raw",
         )
 
     rates = [r.tick_rate for _, r in records]
@@ -381,7 +523,7 @@ def clean_qubic_ticks(path: Path) -> CleanResult:
     tick_span = (tick_max - tick_min) or 1
 
     rows: list[dict[str, Any]] = []
-    epochs: list[float] = []
+    raw_epochs: list[float] = []
     for _, rec in records:
         parsed = timestamps.parse(rec.ts)
         norm_rate = (rec.tick_rate - rate_min) / rate_span
@@ -400,7 +542,7 @@ def clean_qubic_ticks(path: Path) -> CleanResult:
             }
         )
         if parsed.epoch is not None:
-            epochs.append(parsed.epoch)
+            raw_epochs.append(parsed.epoch)
 
     dead = find_dead_columns(rows) - {"timestamp", "tick"}
     rows = drop_columns(rows, dead)
@@ -412,7 +554,7 @@ def clean_qubic_ticks(path: Path) -> CleanResult:
         ingest=stats,
         quarantine=quarantine,
         dead_columns=dead,
-        epochs=epochs,
+        epochs=raw_epochs,
     )
 
 
@@ -432,6 +574,12 @@ def clean_trading_log(path: Path) -> CleanResult:
             raise IngestError(
                 f"{path.name}:{row}: Theseus-Quarry schema v1 envelope cannot "
                 "be read as ghost_market_log; refusing to invent a mapping"
+            )
+        if not isinstance(record, RawTradingLog):
+            raise IngestError(
+                f"{path.name}:{row}: unhandled ghost_market_log record type "
+                f"{type(record).__name__}; refusing to invent a mapping",
+                kind="schema",
             )
         parsed = timestamps.parse(record.timestamp)
         if not parsed.ok:

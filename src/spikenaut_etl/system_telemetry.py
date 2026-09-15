@@ -244,6 +244,12 @@ def _parse_row(payload: dict[str, Any], *, row: int, source: str) -> RawSystemTe
             "as system_telemetry_v1; refusing to invent a mapping",
             kind="schema",
         )
+    if not isinstance(record, RawSystemTelemetry):
+        raise IngestError(
+            f"{source}:{row}: unexpected record type {type(record).__name__}; "
+            "refusing to ingest as system_telemetry_v1",
+            kind="schema",
+        )
     return record
 
 
