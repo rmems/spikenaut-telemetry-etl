@@ -17,7 +17,15 @@ from pathlib import Path
 from typing import Any
 
 from . import clean, report, system_telemetry
-from .ingest import IngestError
+from .contracts import (
+    CONTRACT_LIVE_COLUMNS_REQUIRED,
+    CONTRACT_PROFILE_MISMATCH,
+    LIVE_COLUMNS,
+    LIVE_COLUMNS_ALLOWED,
+    IngestProfile,
+    live_columns_required_message,
+)
+from .ingest import ContractError, IngestError
 from .schemas import (
     CLEAN_COLUMNS,
     SYSTEM_TELEMETRY_HARDWARE_INVARIANTS,
@@ -47,6 +55,8 @@ class SourceSpec:
     # An explicit ``--only`` selection that includes this key still fails.
     # Use only for sources from a separate producer (system_telemetry_v1).
     optional: bool = False
+    # Published file uses the same schema as the collector (ghost_market_log).
+    identity_schema: bool = False
 
     def input_path(self, root: Path) -> Path:
         return root / self.filename
@@ -55,10 +65,22 @@ class SourceSpec:
         primary = self.input_path(root)
         if primary.exists():
             return primary
-        if self.discover is None:
-            return primary
-        found = self.discover(root)
-        return found if found is not None else primary
+        # Prefer discovered raw (Hub parquet) over generated full_data JSONL.
+        # Published CleanSystemTelemetry is still accepted when no raw source
+        # exists — see clean_system_telemetry.
+        if self.discover is not None:
+            found = self.discover(root)
+            if found is not None:
+                return found
+        # Dataset-repo / Vault checkout: published files live under full_data/.
+        published = root / self.output
+        if published.exists():
+            return published
+        # ``--input full_data``: qubic publishes as qubic_ticks_snn.jsonl.
+        published_name = root / Path(self.output).name
+        if published_name.exists() and published_name != primary:
+            return published_name
+        return primary
 
 
 # ``timestamp`` on node_sync is legitimately null for coin-tagged rows, and
@@ -104,6 +126,7 @@ SOURCES: tuple[SourceSpec, ...] = (
         output="full_data/ghost_market_log.jsonl",
         gates=GateConfig(),
         sample_prefix="hft",
+        identity_schema=True,
     ),
     SourceSpec(
         key=system_telemetry.SOURCE_KEY,
@@ -147,6 +170,7 @@ def run_source(
     *,
     write_output: bool = True,
     require_present: bool = False,
+    profile: IngestProfile = "auto",
 ) -> RunOutcome:
     """Clean and validate one source. Writes output only if every gate passes.
 
@@ -161,6 +185,7 @@ def run_source(
 
     try:
         result = spec.cleaner(path)
+        _assert_ingest_profile(spec, result, profile, path)
     except IngestError as exc:
         file_report = report.ingest_failure(spec.key, str(exc))
         report_path = report.write(file_report, report_dir)
@@ -180,12 +205,19 @@ def run_source(
             f"{report.render(file_report)}\n{detail}",
             report_path,
         )
+    gates = spec.gates
+    if result.profile == "live-columns":
+        gates = GateConfig(
+            require_timestamp_jitter=False,
+            allow_constant=spec.gates.allow_constant | {"episode_id"},
+            identity_columns=spec.gates.identity_columns | {"episode_id"},
+        )
     validation = check_all(
         spec.key,
         result.rows,
         n_in=result.n_in,
-        config=spec.gates,
-        expected_columns=_expected_columns(spec, result.rows),
+        config=gates,
+        expected_columns=_expected_columns(spec, result),
         timestamps=result.epochs or None,
     )
     file_report = report.build(result, validation)
@@ -200,6 +232,20 @@ def run_source(
     output_path = None
     sample_paths: list[Path] = []
     if write_output:
+        if result.profile == "live-columns":
+            file_report = report.ingest_failure(
+                spec.key,
+                live_columns_required_message(source=path.name)
+                + " Refusing to write LIVE_COLUMNS JSONL as published "
+                "full_data/neuromorphic_data.jsonl.",
+            )
+            report_path = report.write(file_report, report_dir)
+            return RunOutcome(
+                spec.key,
+                False,
+                f"{report.render(file_report)}",
+                report_path,
+            )
         output_path = output_root / spec.output
         write_jsonl(result.rows, output_path)
 
@@ -225,6 +271,7 @@ def run_all(
     *,
     only: Sequence[str] | None = None,
     write_output: bool = True,
+    profile: IngestProfile = "auto",
 ) -> list[RunOutcome]:
     selected = [s for s in SOURCES if not only or s.key in only]
     require_present = bool(only)
@@ -236,6 +283,7 @@ def run_all(
             report_dir,
             write_output=write_output,
             require_present=require_present,
+            profile=profile,
         )
         for s in selected
     ]
@@ -271,8 +319,60 @@ def write_sample(
     return write_jsonl([rows[i] for i in picked], path)
 
 
+def _assert_ingest_profile(
+    spec: SourceSpec,
+    result: clean.CleanResult,
+    requested: IngestProfile,
+    path: Path,
+) -> None:
+    """Fail loud when ``--profile`` disagrees with the file that was ingested."""
+    observed = result.profile
+    if requested == "auto":
+        if spec.key == "neuromorphic_data" and observed == "live-columns":
+            raise ContractError(
+                live_columns_required_message(source=path.name)
+                + " This file already looks like a LIVE_COLUMNS projection; "
+                "pass --profile live-columns to validate it, or point validate "
+                "at full_data/ for published Clean GPU.",
+                code=CONTRACT_LIVE_COLUMNS_REQUIRED,
+            )
+        return
+    if requested == "raw":
+        if observed != "raw":
+            raise ContractError(
+                f"{path.name}: --profile raw requires nested collector JSONL, "
+                f"got {observed!r} shape",
+                code=CONTRACT_PROFILE_MISMATCH,
+            )
+        return
+    if requested == "published":
+        if observed == "published":
+            return
+        if spec.identity_schema and observed == "raw":
+            return
+        raise ContractError(
+            f"{path.name}: --profile published requires cleaned Vault "
+            f"full_data JSONL, got {observed!r} shape",
+            code=CONTRACT_PROFILE_MISMATCH,
+        )
+    if requested == "live-columns":
+        if spec.key != "neuromorphic_data":
+            raise ContractError(
+                f"{path.name}: --profile live-columns requires LIVE_COLUMNS GPU "
+                f"JSONL (neuromorphic_data); {spec.key} is not that contract",
+                code=CONTRACT_LIVE_COLUMNS_REQUIRED,
+            )
+        if observed != "live-columns":
+            raise ContractError(
+                live_columns_required_message(source=path.name),
+                code=CONTRACT_LIVE_COLUMNS_REQUIRED,
+            )
+        return
+    raise AssertionError(f"unhandled ingest profile: {requested!r}")
+
+
 def _expected_columns(
-    spec: SourceSpec, rows: Sequence[dict[str, Any]]
+    spec: SourceSpec, result: clean.CleanResult
 ) -> AbstractSet[str] | None:
     """Declared columns minus any dropped as dead in this run.
 
@@ -280,14 +380,27 @@ def _expected_columns(
     survived is a subset of the contract -- not that every declared field is
     present regardless of whether the source still carries it.
     """
+    rows = result.rows
+    if result.profile == "live-columns":
+        if not rows:
+            return None
+        present: set[str] = set()
+        for row in rows:
+            present.update(row)
+        extra = present - LIVE_COLUMNS_ALLOWED
+        missing = set(LIVE_COLUMNS) - present
+        if extra or missing:
+            return LIVE_COLUMNS_ALLOWED
+        return present
+
     declared = CLEAN_COLUMNS.get(spec.key)
     if declared is None or not rows:
         return None
-    present: set[str] = set()
+    present_cols: set[str] = set()
     for row in rows:
-        present.update(row)
-    undeclared = present - declared
+        present_cols.update(row)
+    undeclared = present_cols - declared
     if undeclared:
         # Let the gate report it rather than silently narrowing the contract.
         return declared
-    return present
+    return present_cols

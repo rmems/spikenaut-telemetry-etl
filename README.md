@@ -116,6 +116,40 @@ spikenaut-etl report --input ~/spikenaut-data-backup/2026-08-03
 
 Restrict to one source with `--only node_sync_harvest` (or `--only system_telemetry_v1`).
 
+`--profile` selects which JSONL shape `validate` / `clean` will accept:
+
+| Profile | Accepts | Refuses |
+|---------|---------|---------|
+| `auto` (default) | nested collector JSONL **or** published Clean* `full_data` | LIVE_COLUMNS JSONL (named `CONTRACT_LIVE_COLUMNS_REQUIRED`) |
+| `raw` | nested `{telemetry: ...}` collector files | published Clean* |
+| `published` | already-flattened Vault `full_data` | nested collector JSONL |
+| `live-columns` | stripped `sm_clock_mhz` LIVE_COLUMNS JSONL (`--only neuromorphic_data`). Parquet is **not** discovered. | v2 GPU `gpu_clock_mhz` (will **not** invent `sm_clock_mhz`); non-GPU sources |
+
+---
+
+## Vault paths for Spikenaut consumers
+
+ShipOfTheseus / `rmems/Spikenaut-SNN-Telemetry` checkouts have two GPU-shaped
+trees. They are not interchangeable.
+
+| Path | Shape | Legal consumer |
+|------|-------|----------------|
+| `full_data/neuromorphic_data.jsonl` | Published **Clean GPU**: `row_index` + sensors, **`gpu_clock_mhz`**, no nested `telemetry` | Dataset / ETL re-validate (`--profile auto` or `published`). **Not** LiveStimAdapter. |
+| `full_data/node_sync_harvest.jsonl` | Published **CleanNodeSync**: coin-tagged rows have **`timestamp: null`** (typed null; coin is on `blockchain`) | ETL re-validate. Null is not a clock and is not filled. |
+| `full_data/qubic_ticks_snn.jsonl` | Published CleanQubicTick (`*_derived` suffixes) | Dataset / ETL re-validate |
+| `full_data/ghost_market_log.jsonl` | Same schema as collector | Dataset / ETL re-validate |
+| **`v3/state_telemetry/{train,validation,test}-00000.parquet`** | Full v3 state schema. **`sm_clock_mhz`** is STATE_BACKFILL from v2 `gpu_clock_mhz` | **Spikenaut live-bank / LiveStimAdapter.** Project to `LIVE_COLUMNS` = `mem_util_pct`, `power_w`, `gpu_temp_c`, `sm_clock_mhz`, `mem_clock_mhz` (forbidden sensors stripped). |
+
+`spikenaut-etl validate --input <Vault>` discovers `full_data/*.jsonl` when the
+raw collector filenames are absent. That path validates published Clean*
+shapes. It does **not** make `full_data` GPU JSONL legal live-bank input, and
+it does **not** read `v3/state_telemetry/*.parquet`. `--profile live-columns`
+requires an explicitly prepared LIVE_COLUMNS JSONL file.
+
+Do not copy `gpu_clock_mhz` to `sm_clock_mhz` at ingest time, and do not
+zero-fill missing live sensors. The v3 builder is the only place that mapping
+is recorded, and LiveStimAdapter reads the parquet projection.
+
 ---
 
 ## Sources

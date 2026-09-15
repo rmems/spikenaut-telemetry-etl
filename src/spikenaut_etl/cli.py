@@ -7,6 +7,22 @@
 
 Exit status is 1 if any source fails a gate, so CI fails on corrupt data.
 
+``validate`` / ``clean`` accept collector JSONL *or* published Vault
+``full_data`` Clean* JSONL (flattened GPU, null timestamps on coin-tagged
+harvest rows). That is the ``--profile auto`` published-shape path.
+
+Spikenaut LiveStimAdapter live-bank input is **not** ``full_data`` GPU JSONL.
+It is the v3 parquet projection:
+
+    v3/state_telemetry/{train,validation,test}-00000.parquet
+
+which carries ``sm_clock_mhz`` after STATE_BACKFILL. Published v2 GPU JSONL
+has ``gpu_clock_mhz``; this CLI will not invent ``sm_clock_mhz`` from it.
+Use ``--profile live-columns`` to validate a stripped LIVE_COLUMNS JSONL
+projection of that parquet (this CLI does not read the parquet shards).
+``--profile published`` requires already-cleaned Vault ``full_data`` rows;
+``--profile raw`` requires nested collector JSONL.
+
 ``build-v3`` reads the *published v2 JSONL* in a dataset-repo checkout (not the
 raw backup) and writes the additive ``v3/`` Parquet tree plus the
 ``v2_parquet/`` config conversions; --output defaults to the same checkout. It
@@ -19,6 +35,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from .contracts import IngestProfile
 from .pipeline import SOURCES, run_all
 
 DEFAULT_REPORTS = Path("reports")
@@ -38,8 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--input",
         type=Path,
         required=True,
-        help="directory holding the source JSONL (for build-v3: the dataset "
-        "repo checkout holding full_data/)",
+        help="directory holding collector JSONL, published Vault full_data/, "
+        "or a dataset-repo checkout (full_data/*.jsonl is discovered). "
+        "--profile live-columns needs stripped sm_clock_mhz JSONL; "
+        "v3/state_telemetry parquet is the LiveStimAdapter consumer path, "
+        "not something validate reads. For build-v3: the dataset repo "
+        "checkout holding full_data/",
     )
     parser.add_argument(
         "--output", type=Path, help="dataset repo root (required for 'clean')"
@@ -52,6 +73,16 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         choices=[s.key for s in SOURCES],
         help="restrict to specific sources",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=("auto", "raw", "published", "live-columns"),
+        default="auto",
+        help="ingest shape: auto accepts collector JSONL or published Clean* "
+        "full_data; raw requires nested telemetry; published requires cleaned "
+        "Vault JSONL; live-columns requires stripped sm_clock_mhz LIVE_COLUMNS "
+        "JSONL (project v3/state_telemetry parquet yourself). Does not invent "
+        "sm_clock from gpu_clock",
     )
     return parser
 
@@ -94,12 +125,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     write_output = args.command == "clean"
+    profile: IngestProfile = args.profile
     outcomes = run_all(
         input_root=args.input,
         output_root=args.output or Path("."),
         report_dir=args.reports,
         only=args.only,
         write_output=write_output,
+        profile=profile,
     )
 
     for outcome in outcomes:
@@ -112,8 +145,10 @@ def main(argv: list[str] | None = None) -> int:
     failed = [o for o in outcomes if not o.ok]
     print()
     if failed:
-        print(f"{len(failed)}/{len(outcomes)} source(s) failed validation: "
-              f"{', '.join(o.key for o in failed)}")
+        print(
+            f"{len(failed)}/{len(outcomes)} source(s) failed validation: "
+            f"{', '.join(o.key for o in failed)}"
+        )
         return 1
     print(f"All {len(outcomes)} source(s) passed.")
     return 0
