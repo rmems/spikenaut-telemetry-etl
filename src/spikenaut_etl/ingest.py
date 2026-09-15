@@ -11,8 +11,9 @@ Dispatch is per line on ``schema_version``, then on shape:
 * any other ``schema_version`` → raise; this reader does not guess.
 * a v1-shaped line with no ``schema_version`` → raise.
 * nested ``telemetry`` → the caller's legacy ``Raw*`` model.
-* published Clean GPU / CleanNodeSync / CleanQubicTick → re-validated as-is
-  (typed-null timestamps on coin-tagged harvest rows are kept, never filled).
+* published Clean GPU / sparse CleanNodeSync / CleanQubicTick → re-validated
+  without filling missing sensors (typed-null timestamps on coin-tagged
+  harvest rows are kept, never filled).
 * LIVE_COLUMNS (``sm_clock_mhz`` without ``gpu_clock_mhz``) → named contract
   unless ``--profile live-columns``. Never invent ``sm_clock_mhz`` from
   ``gpu_clock_mhz``.
@@ -42,6 +43,8 @@ from .contracts import (
     CONTRACT_LIVE_COLUMNS_REQUIRED,
     CONTRACT_MIXED_SHAPES,
     LiveColumnsRecord,
+    PublishedNodeSync,
+    PublishedQubicTick,
     ShapeProfile,
     live_columns_required_message,
     looks_like_clean_gpu,
@@ -183,8 +186,7 @@ def parse_record(
             envelope = TelemetryEnvelope.model_validate(payload)
         except PydanticValidationError as exc:
             raise IngestError(
-                f"{source}:{row}: schema violation: {_terse(exc)}; "
-                "refusing to ingest",
+                f"{source}:{row}: schema violation: {_terse(exc)}; refusing to ingest",
                 kind="schema",
             ) from exc
         _reject_empty_v1(envelope, row=row, source=source)
@@ -242,13 +244,13 @@ def _parse_node_sync_payload(
     if looks_like_nested_raw(payload):
         return _validate_model(payload, RawNodeSyncRecord, row=row, source=source)
     if looks_like_clean_node_sync(payload):
-        return _validate_model(payload, CleanNodeSync, row=row, source=source)
+        return _validate_model(payload, PublishedNodeSync, row=row, source=source)
     return _validate_model(payload, RawNodeSyncRecord, row=row, source=source)
 
 
 def _parse_qubic_payload(payload: dict[str, Any], *, row: int, source: str) -> BaseModel:
     if looks_like_clean_qubic(payload):
-        return _validate_model(payload, CleanQubicTick, row=row, source=source)
+        return _validate_model(payload, PublishedQubicTick, row=row, source=source)
     return _validate_model(payload, RawQubicTick, row=row, source=source)
 
 
@@ -272,7 +274,16 @@ def shape_of(record: BaseModel) -> ShapeProfile:
     """Classify one parsed record as raw, published, or live-columns."""
     if isinstance(record, LiveColumnsRecord):
         return "live-columns"
-    if isinstance(record, (CleanGpuTelemetry, CleanNodeSync, CleanQubicTick)):
+    if isinstance(
+        record,
+        (
+            CleanGpuTelemetry,
+            CleanNodeSync,
+            CleanQubicTick,
+            PublishedNodeSync,
+            PublishedQubicTick,
+        ),
+    ):
         return "published"
     return "raw"
 

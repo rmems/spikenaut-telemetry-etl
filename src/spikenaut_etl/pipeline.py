@@ -55,6 +55,8 @@ class SourceSpec:
     # An explicit ``--only`` selection that includes this key still fails.
     # Use only for sources from a separate producer (system_telemetry_v1).
     optional: bool = False
+    # Published file uses the same schema as the collector (ghost_market_log).
+    identity_schema: bool = False
 
     def input_path(self, root: Path) -> Path:
         return root / self.filename
@@ -63,6 +65,13 @@ class SourceSpec:
         primary = self.input_path(root)
         if primary.exists():
             return primary
+        # Prefer discovered raw (Hub parquet) over generated full_data JSONL.
+        # Published CleanSystemTelemetry is still accepted when no raw source
+        # exists — see clean_system_telemetry.
+        if self.discover is not None:
+            found = self.discover(root)
+            if found is not None:
+                return found
         # Dataset-repo / Vault checkout: published files live under full_data/.
         published = root / self.output
         if published.exists():
@@ -71,10 +80,7 @@ class SourceSpec:
         published_name = root / Path(self.output).name
         if published_name.exists() and published_name != primary:
             return published_name
-        if self.discover is None:
-            return primary
-        found = self.discover(root)
-        return found if found is not None else primary
+        return primary
 
 
 # ``timestamp`` on node_sync is legitimately null for coin-tagged rows, and
@@ -120,6 +126,7 @@ SOURCES: tuple[SourceSpec, ...] = (
         output="full_data/ghost_market_log.jsonl",
         gates=GateConfig(),
         sample_prefix="hft",
+        identity_schema=True,
     ),
     SourceSpec(
         key=system_telemetry.SOURCE_KEY,
@@ -339,16 +346,22 @@ def _assert_ingest_profile(
             )
         return
     if requested == "published":
-        if observed != "published":
-            raise ContractError(
-                f"{path.name}: --profile published requires cleaned Vault "
-                f"full_data JSONL, got {observed!r} shape",
-                code=CONTRACT_PROFILE_MISMATCH,
-            )
-        return
+        if observed == "published":
+            return
+        if spec.identity_schema and observed == "raw":
+            return
+        raise ContractError(
+            f"{path.name}: --profile published requires cleaned Vault "
+            f"full_data JSONL, got {observed!r} shape",
+            code=CONTRACT_PROFILE_MISMATCH,
+        )
     if requested == "live-columns":
         if spec.key != "neuromorphic_data":
-            return
+            raise ContractError(
+                f"{path.name}: --profile live-columns requires LIVE_COLUMNS GPU "
+                f"JSONL (neuromorphic_data); {spec.key} is not that contract",
+                code=CONTRACT_LIVE_COLUMNS_REQUIRED,
+            )
         if observed != "live-columns":
             raise ContractError(
                 live_columns_required_message(source=path.name),

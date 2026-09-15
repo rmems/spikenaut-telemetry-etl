@@ -25,6 +25,7 @@ from spikenaut_etl.contracts import (
 from spikenaut_etl.ingest import ContractError, IngestError, parse_record
 from spikenaut_etl.pipeline import SOURCES, run_source, write_jsonl
 from spikenaut_etl.schemas import CleanGpuTelemetry, RawGpuRecord, RawNodeSyncRecord
+from spikenaut_etl.system_telemetry import SOURCE_KEY, discover_input
 
 FIXTURES = Path(__file__).parent / "fixtures"
 CORRUPT = FIXTURES / "corrupt"
@@ -295,7 +296,154 @@ def test_cli_live_columns_profile_on_v2_gpu_exits_1(tmp_path):
 
 
 def test_cli_help_names_vault_v3_live_columns():
-    parser_help = build_parser().format_help()
+    parser_help = " ".join(build_parser().format_help().split())
     assert "v3/state_telemetry" in parser_help
     assert "live-columns" in parser_help
     assert "sm_clock" in parser_help
+    assert "v3/state_telemetry/ are discovered" not in parser_help
+    assert "stripped sm_clock_mhz JSONL" in parser_help
+
+
+def test_live_columns_profile_rejects_non_gpu_source(tmp_path):
+    spec = next(s for s in SOURCES if s.key == "node_sync_harvest")
+    outcome = run_source(
+        spec,
+        FIXTURES,
+        tmp_path / "out",
+        tmp_path / "reports",
+        write_output=False,
+        profile="live-columns",
+    )
+    assert not outcome.ok
+    assert CONTRACT_LIVE_COLUMNS_REQUIRED in outcome.rendered
+    assert "node_sync_harvest" in outcome.rendered
+
+
+def test_live_columns_rejects_bool_sensor_not_coerced_to_one():
+    row = _live_row(0)
+    row["sm_clock_mhz"] = True
+    with pytest.raises((ContractError, IngestError), match="bool"):
+        parse_record(row, RawGpuRecord, row=0, source="live.jsonl")
+
+
+def test_published_qubic_roundtrip_without_constant_epoch(tmp_path):
+    first = clean.clean_qubic_ticks(FIXTURES / "qubic_ticks.jsonl")
+    assert first.rows
+    assert "epoch" not in first.rows[0]
+    assert "epoch_progress" not in first.rows[0]
+    published = tmp_path / "qubic_ticks_snn.jsonl"
+    write_jsonl(first.rows, published)
+    second = clean.clean_qubic_ticks(published)
+    assert second.profile == "published"
+    assert second.rows == first.rows
+    assert all("epoch" not in row for row in second.rows)
+
+
+def test_published_qubic_invalid_timestamp_fails_loud(tmp_path):
+    first = clean.clean_qubic_ticks(FIXTURES / "qubic_ticks.jsonl")
+    bad = dict(first.rows[0], timestamp="not-a-clock")
+    path = _write_jsonl(tmp_path / "qubic_ticks.jsonl", [bad])
+    with pytest.raises(IngestError, match="invalid timestamp"):
+        clean.clean_qubic_ticks(path)
+
+
+def test_published_node_sync_leftover_coin_tag_fails_loud(tmp_path):
+    first = clean.clean_node_sync(FIXTURES / "node_sync_harvest.jsonl")
+    dated = next(r for r in first.rows if r.get("timestamp"))
+    bad = dict(dated, timestamp="dynex:919876")
+    path = _write_jsonl(tmp_path / "node_sync_harvest.jsonl", [bad])
+    with pytest.raises(IngestError, match="ISO datetime"):
+        clean.clean_node_sync(path)
+
+
+def test_published_node_sync_unattributed_null_fails_loud(tmp_path):
+    first = clean.clean_node_sync(FIXTURES / "node_sync_harvest.jsonl")
+    dated = next(r for r in first.rows if r.get("timestamp"))
+    bad = dict(dated, timestamp=None, blockchain=None)
+    path = _write_jsonl(tmp_path / "node_sync_harvest.jsonl", [bad])
+    with pytest.raises(IngestError, match="blockchain attribution"):
+        clean.clean_node_sync(path)
+
+
+def test_sparse_published_node_sync_from_v1_miner_perf_roundtrip(tmp_path):
+    first = clean.clean_node_sync(FIXTURES / "schema_v1" / "miner_perf.jsonl")
+    assert first.rows
+    assert "power_w" not in first.rows[0]
+    published = tmp_path / "node_sync_harvest.jsonl"
+    write_jsonl(first.rows, published)
+    second = clean.clean_node_sync(published)
+    assert second.profile == "published"
+    assert second.rows == first.rows
+    assert all("power_w" not in row for row in second.rows)
+    assert all(row.get("timestamp") for row in second.rows)
+
+    spec = next(s for s in SOURCES if s.key == "node_sync_harvest")
+    source_dir = tmp_path / "in"
+    source_dir.mkdir()
+    (source_dir / spec.filename).write_bytes(published.read_bytes())
+    outcome = run_source(spec, source_dir, tmp_path / "out", tmp_path / "reports")
+    assert outcome.ok, outcome.rendered
+
+
+def test_published_profile_accepts_identity_schema_ghost(tmp_path):
+    spec = next(s for s in SOURCES if s.key == "ghost_market_log")
+    assert spec.identity_schema
+    outcome = run_source(
+        spec,
+        FIXTURES,
+        tmp_path / "out",
+        tmp_path / "reports",
+        write_output=False,
+        profile="published",
+    )
+    assert outcome.ok, outcome.rendered
+
+
+def test_published_system_telemetry_with_ts_utc_roundtrip(tmp_path):
+    first = clean.clean_system_telemetry(FIXTURES / "system_telemetry_v1.jsonl")
+    assert first.profile == "raw"
+    assert "ts_utc" in first.rows[0]
+    vault = tmp_path / "vault"
+    full_data = vault / "full_data"
+    full_data.mkdir(parents=True)
+    write_jsonl(first.rows, full_data / "system_telemetry_v1.jsonl")
+    second = clean.clean_system_telemetry(full_data / "system_telemetry_v1.jsonl")
+    assert second.profile == "published"
+    assert second.rows == first.rows
+    spec = next(s for s in SOURCES if s.key == SOURCE_KEY)
+    outcome = run_source(spec, vault, tmp_path / "out", tmp_path / "reports")
+    assert outcome.ok, outcome.rendered
+
+
+def test_resolve_input_prefers_hub_parquet_over_published_system_telemetry(tmp_path):
+    pyarrow = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    raw_rows = [
+        json.loads(line)
+        for line in (FIXTURES / "system_telemetry_v1.jsonl").read_text().splitlines()
+        if line
+    ]
+    vault = tmp_path / "vault"
+    parquet_path = vault / "re4" / "train-00000.parquet"
+    parquet_path.parent.mkdir(parents=True)
+    pq.write_table(pyarrow.Table.from_pylist(raw_rows), parquet_path)
+
+    published = clean.clean_system_telemetry(FIXTURES / "system_telemetry_v1.jsonl")
+    shifted = []
+    for row in published.rows:
+        clone = dict(row)
+        clone["timestamp_ms"] = int(clone["timestamp_ms"]) + 1_000_000
+        clone["ts_utc"] = timestamps.from_epoch_ms(clone["timestamp_ms"]).isoformat()
+        shifted.append(clone)
+    full_data = vault / "full_data"
+    full_data.mkdir()
+    write_jsonl(shifted, full_data / "system_telemetry_v1.jsonl")
+
+    spec = next(s for s in SOURCES if s.key == SOURCE_KEY)
+    resolved = spec.resolve_input(vault)
+    assert discover_input(vault) == vault
+    assert resolved == vault
+    result = clean.clean_system_telemetry(resolved)
+    assert result.profile == "raw"
+    assert result.rows[0]["timestamp_ms"] == raw_rows[0]["timestamp_ms"]

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from pydantic import ValidationInfo, field_validator, model_validator
+
 from .schemas import StrictRecord
 
 # Spikenaut-SNN ``encode::LIVE_COLUMNS`` / ``tools/hamming_const.py`` order.
@@ -63,6 +65,77 @@ class LiveColumnsRecord(StrictRecord):
     sm_clock_mhz: float
     mem_clock_mhz: float
     episode_id: str | None = None
+
+    @field_validator(
+        "mem_util_pct",
+        "power_w",
+        "gpu_temp_c",
+        "sm_clock_mhz",
+        "mem_clock_mhz",
+        mode="before",
+    )
+    @classmethod
+    def _reject_bool_sensor_fields(cls, value: object, info: ValidationInfo) -> object:
+        # StrictRecord keeps strict=False for legacy GPU coercion; bools would
+        # otherwise become 1.0 / 0.0 and look like real live-bank measurements.
+        if type(value) is bool:
+            raise ValueError(
+                f"{info.field_name} must be a number, not bool; "
+                "refusing to coerce True/False onto a LIVE_COLUMNS sensor"
+            )
+        return value
+
+
+class PublishedNodeSync(StrictRecord):
+    """Published ``full_data/node_sync_harvest.jsonl`` as actually written.
+
+    Schema-v1 ``miner_perf`` / ``node_health`` emit a subset of CleanNodeSync
+    columns. Missing measurements stay absent — never zero-filled. ``timestamp``
+    must be present as a key: ISO datetime, or JSON null with ``blockchain``
+    attribution (enforced at clean time).
+    """
+
+    timestamp: str | None = None
+    blockchain: str | None = None
+    block_height: int | None = None
+    chain_epoch: int | None = None
+    hashrate_mh: float | None = None
+    power_w: float | None = None
+    gpu_temp_c: float | None = None
+    reward_hint: float | None = None
+    qubic_tick_trace: float | None = None
+    qubic_tick_rate: float | None = None
+    qubic_epoch_progress: float | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_timestamp_key(cls, data: object) -> object:
+        if isinstance(data, dict) and "timestamp" not in data:
+            raise ValueError(
+                "published node_sync requires a timestamp key "
+                "(ISO datetime or null); refusing to invent a clock"
+            )
+        return data
+
+
+class PublishedQubicTick(StrictRecord):
+    """Published ``full_data/qubic_ticks_snn.jsonl`` after dead-column removal.
+
+    Constant ``epoch`` / ``epoch_progress`` are dropped by the cleaner, so they
+    are optional on re-ingest. Extra fields are forbidden. Missing derived
+    columns stay absent — never zero-filled.
+    """
+
+    timestamp: str
+    tick: int | None = None
+    epoch: int | None = None
+    tick_rate: float | None = None
+    epoch_progress: float | None = None
+    qubic_tick_trace: float | None = None
+    hashrate_mh_derived: float | None = None
+    power_w_derived: float | None = None
+    gpu_temp_c_derived: float | None = None
+    reward_hint_derived: float | None = None
 
 
 def live_columns_required_message(*, source: str, row: int | None = None) -> str:

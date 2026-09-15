@@ -17,7 +17,12 @@ from pathlib import Path
 from typing import Any
 
 from . import system_telemetry, timestamps, v1
-from .contracts import LiveColumnsRecord, ShapeProfile
+from .contracts import (
+    LiveColumnsRecord,
+    PublishedNodeSync,
+    PublishedQubicTick,
+    ShapeProfile,
+)
 from .ingest import (
     IngestError,
     IngestStats,
@@ -34,6 +39,7 @@ from .schemas import (
     RawGpuRecord,
     RawNodeSyncRecord,
     RawQubicTick,
+    RawSystemTelemetry,
     RawTradingLog,
     TelemetryEnvelope,
 )
@@ -268,9 +274,7 @@ def clean_gpu_telemetry(path: Path) -> CleanResult:
             source=path.name, row=row, previous=file_profile, current=current
         )
         if isinstance(record, TelemetryEnvelope):
-            parsed = _require_v1_datetime(
-                record.timestamp, row=row, source=path.name
-            )
+            parsed = _require_v1_datetime(record.timestamp, row=row, source=path.name)
             payload = v1.map_envelope_to_gpu(record, row, source=path.name)
             if parsed.epoch is not None:
                 epochs.append(parsed.epoch)
@@ -347,9 +351,7 @@ def clean_node_sync(path: Path) -> CleanResult:
             source=path.name, row=row, previous=file_profile, current=current
         )
         if isinstance(record, TelemetryEnvelope):
-            payload = v1.map_envelope_to_node_sync(
-                record, source=path.name, row=row
-            )
+            payload = v1.map_envelope_to_node_sync(record, source=path.name, row=row)
             parsed = _require_v1_datetime(
                 payload.get("timestamp"), row=row, source=path.name
             )
@@ -357,12 +359,22 @@ def clean_node_sync(path: Path) -> CleanResult:
             parsed_rows.append((row, payload, parsed))
             continue
 
-        if isinstance(record, CleanNodeSync):
+        if isinstance(record, (CleanNodeSync, PublishedNodeSync)):
+            if record.timestamp is None and not record.blockchain:
+                raise IngestError(
+                    f"{path.name}:{row}: null timestamp requires blockchain "
+                    "attribution; refusing to ingest",
+                    kind="schema",
+                )
             parsed = _parsed_from_clean_node_sync(record)
-            if record.timestamp is not None and not parsed.ok:
-                quarantine.record(row, record.timestamp, timestamps.UNPARSEABLE)
-                continue
-            parsed_rows.append((row, record.model_dump(), parsed))
+            if record.timestamp is not None and parsed.moment is None:
+                raise IngestError(
+                    f"{path.name}:{row}: published timestamp must be an ISO "
+                    "datetime (not a leftover coin tag or unparseable value); "
+                    "refusing to ingest",
+                    kind="schema",
+                )
+            parsed_rows.append((row, record.model_dump(exclude_unset=True), parsed))
             continue
 
         if not isinstance(record, RawNodeSyncRecord):
@@ -390,9 +402,7 @@ def clean_node_sync(path: Path) -> CleanResult:
     # short trailing burst of them; anything larger is left in place for the
     # ordering gate to reject, so this can never quietly delete real capture.
     stamped = [
-        (pos, p.epoch)
-        for pos, (_, _, p) in enumerate(parsed_rows)
-        if p.epoch is not None
+        (pos, p.epoch) for pos, (_, _, p) in enumerate(parsed_rows) if p.epoch is not None
     ]
     disordered = set(find_trailing_disorder(stamped, total_rows=len(parsed_rows)))
     for pos in sorted(disordered):
@@ -440,7 +450,7 @@ def clean_node_sync(path: Path) -> CleanResult:
 
 
 def _parsed_from_clean_node_sync(
-    record: CleanNodeSync,
+    record: CleanNodeSync | PublishedNodeSync,
 ) -> timestamps.ParsedTimestamp:
     """Typed-null policy: a published null timestamp is not a clock to invent.
 
@@ -480,8 +490,8 @@ def clean_qubic_ticks(path: Path) -> CleanResult:
                 f"{path.name}:{row}: Theseus-Quarry schema v1 envelope cannot "
                 "be read as qubic_ticks; refusing to invent a mapping"
             )
-        if isinstance(record, CleanQubicTick):
-            published.append(record.model_dump())
+        if isinstance(record, (CleanQubicTick, PublishedQubicTick)):
+            published.append(record.model_dump(exclude_unset=True))
             continue
         if not isinstance(record, RawQubicTick):
             raise IngestError(
@@ -492,10 +502,15 @@ def clean_qubic_ticks(path: Path) -> CleanResult:
         records.append((row, record))
     if published:
         published_epochs: list[float] = []
-        for published_row in published:
+        for published_index, published_row in enumerate(published):
             parsed = timestamps.parse(published_row["timestamp"])
-            if parsed.epoch is not None:
-                published_epochs.append(parsed.epoch)
+            if parsed.moment is None:
+                raise IngestError(
+                    f"{path.name}: published row {published_index} has an invalid "
+                    "timestamp; refusing to ingest",
+                    kind="schema",
+                )
+            published_epochs.append(parsed.moment.timestamp())
         return CleanResult(
             name="qubic_ticks_snn",
             rows=published,
@@ -607,13 +622,21 @@ def clean_system_telemetry(path: Path) -> CleanResult:
     (``session_label``, ``memory_total_mb``, encoder/decoder util when
     observed-zero) are kept for ``GateConfig.allow_constant`` rather than dropped
     as dead. ``session_label`` is session hygiene, not a Spikenaut axon.
+
+    Published ``full_data/system_telemetry_v1.jsonl`` already carries ``ts_utc``.
+    Those rows are re-validated, not re-derived, and missing sensors stay absent.
     """
     stats = IngestStats(source=system_telemetry.SOURCE_KEY)
     quarantine = timestamps.QuarantineLog(source=system_telemetry.SOURCE_KEY)
     rows: list[dict[str, Any]] = []
     epochs: list[float] = []
+    file_profile: ShapeProfile | None = None
 
     for row, record in system_telemetry.read_records(path, stats):
+        current = shape_of_system_telemetry(record)
+        file_profile = require_single_shape(
+            source=path.name, row=row, previous=file_profile, current=current
+        )
         system_telemetry.reject_empty_sensors(record, row=row, source=path.name)
         try:
             moment = timestamps.from_epoch_ms(record.timestamp_ms)
@@ -622,6 +645,24 @@ def clean_system_telemetry(path: Path) -> CleanResult:
                 f"{path.name}:{row}: {exc}; refusing to ingest",
                 kind="schema",
             ) from exc
+        if isinstance(record, CleanSystemTelemetry):
+            expected_ts = moment.isoformat()
+            if record.ts_utc != expected_ts:
+                raise IngestError(
+                    f"{path.name}:{row}: published ts_utc {record.ts_utc!r} does "
+                    f"not match timestamp_ms conversion {expected_ts!r}; "
+                    "refusing to ingest",
+                    kind="schema",
+                )
+            rows.append(record.model_dump(exclude_unset=True))
+            epochs.append(moment.timestamp())
+            continue
+        if not isinstance(record, RawSystemTelemetry):
+            raise IngestError(
+                f"{path.name}:{row}: unhandled system_telemetry record type "
+                f"{type(record).__name__}; refusing to guess a mapping",
+                kind="schema",
+            )
         payload = record.model_dump()
         payload["ts_utc"] = moment.isoformat()
         CleanSystemTelemetry.model_validate(payload)
@@ -636,6 +677,18 @@ def clean_system_telemetry(path: Path) -> CleanResult:
             kind="schema",
         )
 
+    profile: ShapeProfile = file_profile or "raw"
+    if profile == "published":
+        return CleanResult(
+            name=system_telemetry.SOURCE_KEY,
+            rows=rows,
+            n_in=stats.n_lines,
+            ingest=stats,
+            quarantine=quarantine,
+            epochs=epochs,
+            profile=profile,
+        )
+
     keep = SYSTEM_TELEMETRY_HARDWARE_INVARIANTS | {"timestamp_ms", "ts_utc"}
     dead = find_dead_columns(rows) - keep
     rows = drop_columns(rows, dead)
@@ -648,4 +701,15 @@ def clean_system_telemetry(path: Path) -> CleanResult:
         quarantine=quarantine,
         dead_columns=dead,
         epochs=epochs,
+        profile=profile,
+    )
+
+
+def shape_of_system_telemetry(record: object) -> ShapeProfile:
+    if isinstance(record, CleanSystemTelemetry):
+        return "published"
+    if isinstance(record, RawSystemTelemetry):
+        return "raw"
+    raise AssertionError(
+        f"unhandled system_telemetry record type {type(record).__name__}"
     )

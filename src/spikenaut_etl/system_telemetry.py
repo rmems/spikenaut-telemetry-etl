@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .ingest import IngestError, IngestStats, parse_record
-from .schemas import RawSystemTelemetry, TelemetryEnvelope
+from .schemas import CleanSystemTelemetry, RawSystemTelemetry, TelemetryEnvelope
 
 try:
     import pyarrow.parquet as pq
@@ -98,9 +98,12 @@ def iter_source_files(path: Path) -> list[Path]:
     return sorted(session_files)
 
 
+SystemTelemetryRecord = RawSystemTelemetry | CleanSystemTelemetry
+
+
 def read_records(
     path: Path, stats: IngestStats
-) -> Iterator[tuple[int, RawSystemTelemetry]]:
+) -> Iterator[tuple[int, SystemTelemetryRecord]]:
     """Yield ``(row_index, record)`` from a file or session directory."""
     files = iter_source_files(path)
     row_index = 0
@@ -110,9 +113,7 @@ def read_records(
             row_index += 1
 
 
-def reject_empty_sensors(
-    record: RawSystemTelemetry, *, row: int, source: str
-) -> None:
+def reject_empty_sensors(record: SystemTelemetryRecord, *, row: int, source: str) -> None:
     values = record.model_dump()
     sensors = {k: values[k] for k in _SENSOR_COLUMNS if k in values}
     if not sensors or all(v is None for v in sensors.values()):
@@ -171,7 +172,7 @@ def _require_supported_file(path: Path) -> None:
 
 def _read_file(
     path: Path, stats: IngestStats, row_offset: int
-) -> Iterator[RawSystemTelemetry]:
+) -> Iterator[SystemTelemetryRecord]:
     suffix = path.suffix.lower()
     if suffix == ".jsonl":
         yield from _read_jsonl(path, stats, row_offset)
@@ -179,14 +180,12 @@ def _read_file(
     if suffix == ".parquet":
         yield from _read_parquet(path, stats, row_offset)
         return
-    raise IngestError(
-        f"{path.name}: unsupported system_telemetry_v1 suffix {suffix!r}"
-    )
+    raise IngestError(f"{path.name}: unsupported system_telemetry_v1 suffix {suffix!r}")
 
 
 def _read_jsonl(
     path: Path, stats: IngestStats, row_offset: int
-) -> Iterator[RawSystemTelemetry]:
+) -> Iterator[SystemTelemetryRecord]:
     with path.open("r", encoding="utf-8") as handle:
         for local_row, line in enumerate(handle):
             stats.n_lines += 1
@@ -213,7 +212,7 @@ def _read_jsonl(
 
 def _read_parquet(
     path: Path, stats: IngestStats, row_offset: int
-) -> Iterator[RawSystemTelemetry]:
+) -> Iterator[SystemTelemetryRecord]:
     if pq is None:
         raise IngestError(
             f"{path.name}: parquet ingest needs pyarrow; install "
@@ -230,27 +229,32 @@ def _read_parquet(
         stats.n_parsed += 1
 
 
-def _parse_row(payload: dict[str, Any], *, row: int, source: str) -> RawSystemTelemetry:
+def _parse_row(
+    payload: dict[str, Any], *, row: int, source: str
+) -> SystemTelemetryRecord:
     if "schema_version" in payload or _v1_shaped(payload):
         raise IngestError(
             f"{source}:{row}: Theseus-Quarry schema v1 envelope cannot be read "
             "as system_telemetry_v1; refusing to invent a mapping",
             kind="schema",
         )
-    record = parse_record(payload, RawSystemTelemetry, row=row, source=source)
+    if "ts_utc" in payload:
+        record = parse_record(payload, CleanSystemTelemetry, row=row, source=source)
+    else:
+        record = parse_record(payload, RawSystemTelemetry, row=row, source=source)
     if isinstance(record, TelemetryEnvelope):
         raise IngestError(
             f"{source}:{row}: Theseus-Quarry schema v1 envelope cannot be read "
             "as system_telemetry_v1; refusing to invent a mapping",
             kind="schema",
         )
-    if not isinstance(record, RawSystemTelemetry):
-        raise IngestError(
-            f"{source}:{row}: unexpected record type {type(record).__name__}; "
-            "refusing to ingest as system_telemetry_v1",
-            kind="schema",
-        )
-    return record
+    if isinstance(record, (RawSystemTelemetry, CleanSystemTelemetry)):
+        return record
+    raise IngestError(
+        f"{source}:{row}: unexpected record type {type(record).__name__}; "
+        "refusing to ingest as system_telemetry_v1",
+        kind="schema",
+    )
 
 
 def _v1_shaped(payload: dict[str, Any]) -> bool:

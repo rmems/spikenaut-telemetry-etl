@@ -123,7 +123,7 @@ Restrict to one source with `--only node_sync_harvest` (or `--only system_teleme
 | `auto` (default) | nested collector JSONL **or** published Clean* `full_data` | LIVE_COLUMNS JSONL (named `CONTRACT_LIVE_COLUMNS_REQUIRED`) |
 | `raw` | nested `{telemetry: ...}` collector files | published Clean* |
 | `published` | already-flattened Vault `full_data` | nested collector JSONL |
-| `live-columns` | stripped `sm_clock_mhz` LIVE_COLUMNS JSONL (`--only neuromorphic_data`) | v2 GPU `gpu_clock_mhz` (will **not** invent `sm_clock_mhz`) |
+| `live-columns` | stripped `sm_clock_mhz` LIVE_COLUMNS JSONL (`--only neuromorphic_data`). Parquet is **not** discovered. | v2 GPU `gpu_clock_mhz` (will **not** invent `sm_clock_mhz`); non-GPU sources |
 
 ---
 
@@ -142,7 +142,9 @@ trees. They are not interchangeable.
 
 `spikenaut-etl validate --input <Vault>` discovers `full_data/*.jsonl` when the
 raw collector filenames are absent. That path validates published Clean*
-shapes. It does **not** make `full_data` GPU JSONL legal live-bank input.
+shapes. It does **not** make `full_data` GPU JSONL legal live-bank input, and
+it does **not** read `v3/state_telemetry/*.parquet`. `--profile live-columns`
+requires an explicitly prepared LIVE_COLUMNS JSONL file.
 
 Do not copy `gpu_clock_mhz` to `sm_clock_mhz` at ingest time, and do not
 zero-fill missing live sensors. The v3 builder is the only place that mapping
