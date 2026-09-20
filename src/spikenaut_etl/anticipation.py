@@ -430,15 +430,30 @@ def _prepare_campaign(campaign_path: Path, output_dir: Path) -> dict[str, Any]:
         session_path = (
             raw_path if raw_path.is_absolute() else campaign_path.parent / raw_path
         )
-        collector_manifest, manifest_path = _load_manifest(session_path, session_id)
-        rows, parquet_paths = _read_rows(session_path, session_id)
-        if collector_manifest["timing"]["sample_count"] != len(rows):
-            raise PreparationError(
-                f"session {session_id} timing sample_count does not equal persisted rows"
-            )
-        session_rejections: Counter[str] = Counter()
-        frames = _frames(rows)
-        examples = _examples(frames, rows, session_rejections)
+        try:
+            collector_manifest, manifest_path = _load_manifest(session_path, session_id)
+            rows, parquet_paths = _read_rows(session_path, session_id)
+            if collector_manifest["timing"]["sample_count"] != len(rows):
+                raise PreparationError(
+                    f"session {session_id} timing sample_count does not equal "
+                    "persisted rows"
+                )
+            session_rejections: Counter[str] = Counter()
+            frames = _frames(rows)
+            examples = _examples(frames, rows, session_rejections)
+            manifest_sha256 = _sha256(manifest_path)
+            parquet_provenance = [
+                {"path": path.name, "sha256": _sha256(path)} for path in parquet_paths
+            ]
+        except (PreparationError, OSError) as exc:
+            details = {
+                "session_summaries": summaries,
+                "provenance": provenance_sources,
+                "failed_session_id": session_id,
+            }
+            if isinstance(exc, PreparationError):
+                details.update(exc.details)
+            raise PreparationError(str(exc), details) from exc
         total_rejections.update(session_rejections)
         input_rejections: Counter[str] = Counter()
         for frame in frames:
@@ -476,10 +491,8 @@ def _prepare_campaign(campaign_path: Path, output_dir: Path) -> dict[str, Any]:
             {
                 "session_id": session_id,
                 "collector_session_id": collector_manifest["session_id"],
-                "manifest_sha256": _sha256(manifest_path),
-                "parquet": [
-                    {"path": path.name, "sha256": _sha256(path)} for path in parquet_paths
-                ],
+                "manifest_sha256": manifest_sha256,
+                "parquet": parquet_provenance,
             }
         )
     if deficiencies:

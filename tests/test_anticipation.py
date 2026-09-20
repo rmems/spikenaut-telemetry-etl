@@ -393,3 +393,29 @@ def test_malformed_path_still_writes_incomplete_reports(tmp_path: Path) -> None:
         json.loads((tmp_path / "out" / "manifest.json").read_text())["status"]
         == "incomplete"
     )
+
+
+def test_later_session_failure_preserves_prior_verified_evidence(tmp_path: Path) -> None:
+    campaign = _campaign(
+        tmp_path,
+        [
+            ("session-01", "train", _rows()),
+            ("session-02", "train", _rows(start=2_000_000)),
+        ],
+    )
+    second_manifest = tmp_path / "session-02" / "session_manifest.json"
+    body = json.loads(second_manifest.read_text())
+    body["ended_at_utc"] = None
+    second_manifest.write_text(json.dumps(body))
+
+    with pytest.raises(PreparationError, match="session-02.*ended_at_utc"):
+        prepare_campaign(campaign, tmp_path / "out")
+
+    quality = json.loads((tmp_path / "out" / "quality-report.json").read_text())
+    assert [item["session_id"] for item in quality["assignments"]] == [
+        "session-01",
+        "session-02",
+    ]
+    assert quality["session_summaries"][0]["session_id"] == "session-01"
+    assert quality["provenance"][0]["session_id"] == "session-01"
+    assert quality["failed_session_id"] == "session-02"
