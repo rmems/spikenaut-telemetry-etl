@@ -4,6 +4,8 @@
     spikenaut-etl clean    --input <dir> --output <dir>
     spikenaut-etl report   --input <dir>
     spikenaut-etl build-v3 --input <dataset-repo> [--output <dataset-repo>]
+    spikenaut-etl audit-v3 --input <dataset-repo> --output <audit-dir>
+    spikenaut-etl prepare-anticipation --input <campaign.json> --output <prepared-dir>
 
 Exit status is 1 if any source fails a gate, so CI fails on corrupt data.
 
@@ -67,10 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile live-columns needs stripped sm_clock_mhz JSONL; "
         "v3/state_telemetry parquet is the LiveStimAdapter consumer path, "
         "not something validate reads. For build-v3: the dataset repo "
-        "checkout holding full_data/",
+        "checkout holding full_data/. For audit-v3: the v3 dataset checkout; "
+        "for prepare-anticipation: the preassigned campaign JSON",
     )
     parser.add_argument(
-        "--output", type=Path, help="dataset repo root (required for 'clean')"
+        "--output",
+        type=Path,
+        help="output directory (required for clean, audit-v3, prepare-anticipation)",
     )
     parser.add_argument(
         "--reports", type=Path, default=DEFAULT_REPORTS, help="report output directory"
