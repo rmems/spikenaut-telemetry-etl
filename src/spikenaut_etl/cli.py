@@ -48,7 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "command",
-        choices=("validate", "clean", "report", "build-v3"),
+        choices=(
+            "validate",
+            "clean",
+            "report",
+            "build-v3",
+            "audit-v3",
+            "prepare-anticipation",
+        ),
         help="action to perform",
     )
     parser.add_argument(
@@ -93,6 +100,44 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "clean" and args.output is None:
         print("error: --output is required for 'clean'", file=sys.stderr)
         return 2
+
+    if args.command == "prepare-anticipation":
+        if args.output is None:
+            print(
+                "error: --output is required for 'prepare-anticipation'", file=sys.stderr
+            )
+            return 2
+        try:
+            from .anticipation import PreparationError, prepare_campaign
+
+            prepared = prepare_campaign(args.input, args.output)
+        except (ImportError, PreparationError) as exc:
+            print(f"prepare-anticipation failed: {exc}", file=sys.stderr)
+            return 1
+        examples = sum(len(session["examples"]) for session in prepared["sessions"])
+        print(
+            f"prepare-anticipation complete: {len(prepared['sessions'])} sessions, "
+            f"{examples} eligible examples; wrote {args.output / 'prepared.json'}"
+        )
+        return 0
+
+    if args.command == "audit-v3":
+        if args.output is None:
+            print("error: --output is required for 'audit-v3'", file=sys.stderr)
+            return 2
+        try:
+            from .audit_v3 import AuditError, audit_v3
+
+            audit = audit_v3(args.input, args.output)
+        except (ImportError, AuditError) as exc:
+            print(f"audit-v3 failed: {exc}", file=sys.stderr)
+            return 1
+        counts = ", ".join(
+            f"{split}={details['eligible_rows']}/{details['source_rows']}"
+            for split, details in sorted(audit.splits.items())
+        )
+        print(f"audit-v3 complete: {audit.view_id}; {counts}")
+        return 0
 
     if args.command == "build-v3":
         # Deferred import: the base install stays pyarrow-free for validate/clean.
