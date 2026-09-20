@@ -108,6 +108,36 @@ def test_audit_preserves_rows_splits_indices_and_missing_fields(tmp_path: Path) 
     assert report.splits["train"]["eligible_rows"] == 2
     assert report.splits["train"]["gpu_temp_c"]["min"] == 40.0
     assert report.splits["train"]["gpu_temp_c"]["max"] == 105.0
+    assert report.splits["train"]["numeric_sensor_columns"]["mem_util_pct"] == {
+        "count": 66,
+        "null_count": 0,
+        "non_finite_count": 0,
+        "zero_count": 0,
+        "min": 20.0,
+        "max": 24.0,
+        "mean": pytest.approx(21.9696969697),
+    }
+    assert report.splits["train"]["numeric_sensor_columns"]["cpu_temp_c"] == {
+        "count": 66,
+        "null_count": 66,
+        "non_finite_count": 0,
+        "zero_count": 0,
+        "min": None,
+        "max": None,
+        "mean": None,
+    }
+    assert report.integrity == {
+        "duplicate_keys": "passed",
+        "state_outcome_joins": "passed",
+        "episode_split_membership": "passed",
+        "episodes_by_split": {"test": 1, "train": 1, "validation": 1},
+        "overlapping_episode_count": 0,
+    }
+    assert report.splits["train"]["missing_fields"] == {
+        "action_label_missing_count": 66,
+        "reward_missing_count": 66,
+        "timestamp_missing_count": 66,
+    }
 
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["view_id"] == "v3-forecast-eligible-v1"
@@ -181,8 +211,16 @@ def test_duplicate_join_keys_fail_closed(tmp_path: Path, duplicate_side: str) ->
     table = pq.read_table(path)
     pq.write_table(pa.concat_tables([table, table.slice(0, 1)]), path)
 
+    output = tmp_path / "audit"
     with pytest.raises(AuditError, match="duplicate"):
-        audit_v3(source, tmp_path / "audit")
+        audit_v3(source, output)
+    report = json.loads((output / "audit-report.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert report["status"] == "incomplete"
+    assert report["failure"]["category"] == "structural_integrity"
+    assert "duplicate" in report["failure"]["reason"]
+    assert manifest["status"] == "incomplete"
+    assert manifest["outputs"] == {}
 
 
 def test_state_outcome_join_mismatch_fails_closed(tmp_path: Path) -> None:
@@ -251,3 +289,12 @@ def test_non_finite_sensor_is_excluded(tmp_path: Path) -> None:
         == 2
     )
     assert report.splits["train"]["exclusion_reasons"]["non_finite_gpu_temp_c"] == 1
+
+
+@pytest.mark.parametrize("relative_output", [".", "v3", "v3/state_telemetry/audit"])
+def test_output_cannot_overlap_source_tree(tmp_path: Path, relative_output: str) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+
+    with pytest.raises(AuditError, match="overlap source"):
+        audit_v3(source, source / relative_output)

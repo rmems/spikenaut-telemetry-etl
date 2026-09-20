@@ -33,6 +33,9 @@ class AuditReport:
     view_id: str
     horizon_samples: int
     splits: dict[str, dict[str, Any]]
+    integrity: dict[str, Any]
+    status: str = "complete"
+    failure: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -40,6 +43,9 @@ class AuditReport:
             "view_id": self.view_id,
             "horizon_samples": self.horizon_samples,
             "splits": self.splits,
+            "integrity": self.integrity,
+            "status": self.status,
+            "failure": self.failure,
         }
 
 
@@ -173,6 +179,69 @@ def _load_split(v3_root: Path, split: str) -> tuple[Path, Path, pa.Table, pa.Tab
     return state_path, outcome_path, state, outcomes
 
 
+def _numeric_sensor_columns(state: pa.Table) -> tuple[str, ...]:
+    alignment_or_metadata = {"ts_utc", "step_idx", "window_ms"}
+    return tuple(
+        field.name
+        for field in state.schema
+        if field.name not in alignment_or_metadata
+        and (pa.types.is_integer(field.type) or pa.types.is_floating(field.type))
+    )
+
+
+def _action_label_counts(v3_root: Path, split: str, state_rows: int) -> tuple[int, int]:
+    path = v3_root / "action_proposals" / f"{split}-00000.parquet"
+    if not path.is_file():
+        return state_rows, 0
+    try:
+        table = pq.read_table(path, columns=["proposed_action", "teacher_action"])
+    except (OSError, pa.ArrowException) as exc:
+        raise AuditError(f"cannot read {split} action-proposal shard: {exc}") from exc
+    observed = sum(
+        proposed is not None or teacher is not None
+        for proposed, teacher in zip(
+            table.column("proposed_action").to_pylist(),
+            table.column("teacher_action").to_pylist(),
+            strict=True,
+        )
+    )
+    return max(0, state_rows - observed), observed
+
+
+def _guard_output_path(dataset_root: Path, v3_root: Path, output_root: Path) -> None:
+    overlaps = (
+        output_root == dataset_root
+        or output_root == v3_root
+        or output_root.is_relative_to(v3_root)
+        or dataset_root.is_relative_to(output_root)
+    )
+    if overlaps:
+        raise AuditError(f"output directory would overlap source corpus: {output_root}")
+
+
+def _clean_owned_outputs(output_root: Path) -> None:
+    for name in ("manifest.json", "audit-report.json", "exclusions.parquet"):
+        path = output_root / name
+        if path.is_file():
+            path.unlink()
+    view_root = output_root / VIEW_ID
+    if view_root.is_dir():
+        for split in SPLITS:
+            path = view_root / f"{split}-00000.parquet"
+            if path.is_file():
+                path.unlink()
+
+
+def _available_source_hashes(dataset_root: Path, v3_root: Path) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for config in ("state_telemetry", "outcomes", "action_proposals"):
+        for split in SPLITS:
+            path = v3_root / config / f"{split}-00000.parquet"
+            if path.is_file():
+                hashes[path.relative_to(dataset_root).as_posix()] = _sha256(path)
+    return dict(sorted(hashes.items()))
+
+
 def _append_output_columns(
     state: pa.Table,
     outcomes: pa.Table,
@@ -207,23 +276,14 @@ def _append_output_columns(
     return selected
 
 
-def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
-    """Audit historical v3 and write a provenance-bound additive eligible view.
-
-    Structural corruption (duplicate keys, mismatched joins, or cross-split
-    episode membership) fails closed. Row-level sensor and target defects are
-    retained in ``exclusions.parquet`` with exact reasons and omitted from the
-    additive eligible view. Source files are read only.
-    """
-    dataset_root, v3_root = _source_root(Path(source_dir))
-    output_root = Path(output_dir).resolve()
-
+def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> AuditReport:
     loaded: dict[str, tuple[Path, Path, pa.Table, pa.Table]] = {}
     episode_split: dict[str, str] = {}
-    source_hashes: dict[str, str] = {}
+    episodes_by_split: dict[str, set[str]] = {}
+    source_hashes = _available_source_hashes(dataset_root, v3_root)
     for split in SPLITS:
         loaded[split] = _load_split(v3_root, split)
-        state_path, outcome_path, state, outcomes = loaded[split]
+        _, _, state, outcomes = loaded[split]
         state_keys = _key_columns(state)
         outcome_keys = _key_columns(outcomes)
         _assert_unique(state_keys, f"state_telemetry/{split}")
@@ -235,17 +295,14 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
                 f"{split} state/outcome join keys differ: "
                 f"missing_outcomes={missing_outcomes}, orphan_outcomes={orphan_outcomes}"
             )
-        for episode_id, _ in state_keys:
+        episodes_by_split[split] = {episode_id for episode_id, _ in state_keys}
+        for episode_id in episodes_by_split[split]:
             previous = episode_split.setdefault(episode_id, split)
             if previous != split:
                 raise AuditError(
                     f"episode {episode_id!r} belongs to multiple splits: "
                     f"{previous}, {split}"
                 )
-        for path in (state_path, outcome_path):
-            relative = path.relative_to(dataset_root).as_posix()
-            source_hashes[relative] = _sha256(path)
-
     split_reports: dict[str, dict[str, Any]] = {}
     eligible_tables: dict[str, pa.Table] = {}
     exclusion_rows: list[dict[str, object]] = []
@@ -342,14 +399,37 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
             "eligible_rows": len(eligible_state_indices),
             "excluded_rows": state.num_rows - len(eligible_state_indices),
             "exclusion_reasons": dict(sorted(reason_counts.items())),
+            "numeric_sensor_columns": {
+                name: _distribution(state.column(name))
+                for name in _numeric_sensor_columns(state)
+            },
+            "missing_fields": {
+                "timestamp_missing_count": state.column("ts_utc").null_count,
+                "reward_missing_count": outcomes.column("reward").null_count,
+                "action_label_missing_count": _action_label_counts(
+                    v3_root, split, state.num_rows
+                )[0],
+            },
             **{name: _distribution(state.column(name)) for name in SENSOR_COLUMNS},
         }
 
+    integrity = {
+        "duplicate_keys": "passed",
+        "state_outcome_joins": "passed",
+        "episode_split_membership": "passed",
+        "episodes_by_split": dict(
+            sorted(
+                (split, len(episodes)) for split, episodes in episodes_by_split.items()
+            )
+        ),
+        "overlapping_episode_count": 0,
+    }
     report = AuditReport(
         audit_version=AUDIT_VERSION,
         view_id=VIEW_ID,
         horizon_samples=HORIZON_SAMPLES,
         splits=split_reports,
+        integrity=integrity,
     )
     output_root.mkdir(parents=True, exist_ok=True)
     view_root = output_root / VIEW_ID
@@ -370,6 +450,7 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
         output_root / "exclusions.parquet",
     )
     manifest = {
+        "status": "complete",
         "audit_version": AUDIT_VERSION,
         "view_id": VIEW_ID,
         "horizon_samples": HORIZON_SAMPLES,
@@ -390,3 +471,48 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
     return report
+
+
+def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
+    """Audit historical v3 and write a provenance-bound additive eligible view.
+
+    Structural corruption (duplicate keys, mismatched joins, or cross-split
+    episode membership) fails closed after recording an incomplete report and
+    manifest. Row-level defects are written with exact reasons. Source files
+    are read only and the output is forbidden from overlapping their tree.
+    """
+    dataset_root, v3_root = _source_root(Path(source_dir))
+    output_root = Path(output_dir).resolve()
+    _guard_output_path(dataset_root, v3_root, output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    _clean_owned_outputs(output_root)
+    try:
+        return _audit_v3_impl(dataset_root, v3_root, output_root)
+    except AuditError as exc:
+        failure = {"category": "structural_integrity", "reason": str(exc)}
+        incomplete_report = {
+            "audit_version": AUDIT_VERSION,
+            "view_id": VIEW_ID,
+            "horizon_samples": HORIZON_SAMPLES,
+            "status": "incomplete",
+            "failure": failure,
+            "integrity": {"status": "failed"},
+            "splits": {},
+        }
+        incomplete_manifest = {
+            "audit_version": AUDIT_VERSION,
+            "view_id": VIEW_ID,
+            "horizon_samples": HORIZON_SAMPLES,
+            "status": "incomplete",
+            "failure": failure,
+            "source_git_commit": _git_head(dataset_root),
+            "source_files": _available_source_hashes(dataset_root, v3_root),
+            "outputs": {},
+        }
+        (output_root / "audit-report.json").write_text(
+            json.dumps(incomplete_report, indent=2, sort_keys=True) + "\n"
+        )
+        (output_root / "manifest.json").write_text(
+            json.dumps(incomplete_manifest, indent=2, sort_keys=True) + "\n"
+        )
+        raise
