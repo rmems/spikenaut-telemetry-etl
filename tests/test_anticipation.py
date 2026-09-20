@@ -124,6 +124,26 @@ def test_first_future_observation_cannot_be_skipped_when_its_sensor_is_invalid(
     assert prepared["quality"]["rejections"]["target_invalid"] >= 1
 
 
+def test_later_invalid_read_does_not_retroactively_poison_valid_target(
+    tmp_path: Path,
+) -> None:
+    rows = _rows(count=180)
+    rows[101]["timestamp_ms"] += 20
+    invalid = dict(rows[101])
+    invalid["timestamp_ms"] += 30
+    invalid["temperature_c"] = 0
+    rows.insert(102, invalid)
+
+    prepared = prepare_campaign(
+        _campaign(tmp_path, [("session-01", "train", rows)]), tmp_path / "out"
+    )
+
+    example = next(
+        item for item in prepared["sessions"][0]["examples"] if item["frame_index"] == 51
+    )
+    assert example["target_timestamps_ms"][1] == 1_010_120
+
+
 def test_invalid_gap_splits_segments_and_blocks_history_and_targets(
     tmp_path: Path,
 ) -> None:
@@ -326,6 +346,8 @@ def test_predeclared_minimum_keeps_deficient_session_visible_and_fails(
     assert failure_manifest["status"] == "incomplete"
     assert failure_manifest["assignments"][0]["session_id"] == "session-01"
     assert "requires 500" in quality["failure_reasons"][0]
+    assert quality["session_summaries"][0]["eligible_examples"] == 11
+    assert quality["provenance"][0]["manifest_sha256"]
     assert not (tmp_path / "out" / "prepared.json").exists()
 
 
@@ -342,3 +364,32 @@ def test_cli_registers_prepare_anticipation(tmp_path: Path) -> None:
     assert prepared["feature_map_id"] == "anticipation-observed-gpu-v1"
     assert prepared["feature_map"][0]["unit"] == "MiB"
     assert json.loads((output / "manifest.json").read_text())["status"] == "complete"
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["session_counts"][0]["source_rows"] == 111
+    assert manifest["sources"][0]["manifest_sha256"]
+
+
+def test_malformed_path_still_writes_incomplete_reports(tmp_path: Path) -> None:
+    campaign = tmp_path / "campaign.json"
+    campaign.write_text(
+        json.dumps(
+            {
+                "min_examples_per_session": 1,
+                "sessions": [
+                    {
+                        "session_id": "session-01",
+                        "split": "train",
+                        "path": None,
+                        "seed": 1,
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(PreparationError, match="path"):
+        prepare_campaign(campaign, tmp_path / "out")
+    assert (
+        json.loads((tmp_path / "out" / "manifest.json").read_text())["status"]
+        == "incomplete"
+    )

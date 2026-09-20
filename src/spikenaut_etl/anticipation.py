@@ -48,6 +48,10 @@ _BATCH_PATTERN = re.compile(r"^(?:gpu_telemetry_v2_|telemetry_)batch_(\d+)\.parq
 class PreparationError(ValueError):
     """The campaign cannot be prepared without weakening its declared contract."""
 
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -95,6 +99,10 @@ def _load_campaign(campaign_path: Path) -> tuple[dict[str, Any], int]:
             )
         if not isinstance(item["seed"], int) or isinstance(item["seed"], bool):
             raise PreparationError(f"session {session_id} seed must be an integer")
+        if not isinstance(item["path"], str) or not item["path"]:
+            raise PreparationError(
+                f"session {session_id} path must be a non-empty string"
+            )
     if not any(item["split"] == "train" for item in sessions):
         raise PreparationError("campaign needs at least one training session")
     return campaign, minimum
@@ -112,6 +120,8 @@ def _load_manifest(session_path: Path, expected_id: str) -> tuple[dict[str, Any]
         ) from exc
     if manifest.get("schema_version") != 1:
         raise PreparationError(f"session {expected_id} manifest schema_version must be 1")
+    if not isinstance(manifest.get("session_id"), str) or not manifest["session_id"]:
+        raise PreparationError(f"session {expected_id} manifest session_id is incomplete")
     workload = manifest.get("workload")
     if (
         manifest.get("session_label") != expected_id
@@ -285,6 +295,16 @@ def _examples(
     for row in sorted(rows, key=lambda item: (item["timestamp_ms"], item["_ordinal"])):
         sources.append((row["timestamp_ms"], _row_features(row), row["_clock_reversal"]))
     source_timestamps = [item[0] for item in sources]
+    boundary_timestamps: list[int] = []
+    previous_timestamp: int | None = None
+    for row in rows:
+        timestamp = row["timestamp_ms"]
+        if _row_features(row) is None or (
+            previous_timestamp is not None
+            and timestamp - previous_timestamp > MAX_SOURCE_AGE_MS
+        ):
+            boundary_timestamps.append(timestamp)
+        previous_timestamp = timestamp
     examples: list[dict[str, Any]] = []
     for frame_index, frame in enumerate(frames):
         if not frame["valid"]:
@@ -320,23 +340,9 @@ def _examples(
             if candidate[1] is None or candidate[2]:
                 rejections["target_invalid"] += 1
                 break
-            candidate_grid_timestamp = (
-                frames[0]["timestamp_ms"]
-                + math.ceil(
-                    (candidate[0] - frames[0]["timestamp_ms"]) / FRAME_INTERVAL_MS
-                )
-                * FRAME_INTERVAL_MS
-            )
-            candidate_frame_index = frame_at.get(candidate_grid_timestamp)
-            # A source may be between grid ticks. Its first grid consumer is the
-            # following tick, which is the segment ownership relevant to reset.
-            if candidate_frame_index is None:
-                rejections["target_missing"] += 1
-                break
-            candidate_frame = frames[candidate_frame_index]
-            if (
-                not candidate_frame["valid"]
-                or candidate_frame["segment_id"] != frame["segment_id"]
+            if any(
+                frame["timestamp_ms"] < boundary <= candidate[0]
+                for boundary in boundary_timestamps
             ):
                 rejections["target_gap"] += 1
                 break
@@ -477,7 +483,10 @@ def _prepare_campaign(campaign_path: Path, output_dir: Path) -> dict[str, Any]:
             }
         )
     if deficiencies:
-        raise PreparationError("; ".join(deficiencies))
+        raise PreparationError(
+            "; ".join(deficiencies),
+            {"session_summaries": summaries, "provenance": provenance_sources},
+        )
 
     train_x = [
         frame["x"]
@@ -560,6 +569,7 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             "status": "incomplete",
             "assignments": assignments,
             "failure_reasons": [str(exc)],
+            **exc.details,
         }
         (output_dir / "prepared.json").unlink(missing_ok=True)
         _write_json(output_dir / "quality-report.json", incomplete)
@@ -570,6 +580,8 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
         "status": "complete",
         "assignments": assignments,
         "prepared_sha256": _sha256(output_dir / "prepared.json"),
+        "session_counts": prepared["quality"]["session_summaries"],
+        "sources": prepared["provenance"]["sources"],
     }
     _write_json(output_dir / "quality-report.json", prepared["quality"])
     _write_json(output_dir / "manifest.json", manifest)
