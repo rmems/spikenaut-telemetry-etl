@@ -303,6 +303,10 @@ def _load_split(
                 raise AuditError(
                     f"source schema field missing or wrong type: {field.name}"
                 )
+        if not table.schema.equals(schema, check_metadata=False):
+            raise AuditError(
+                "source schema must use the canonical field order and nullability"
+            )
     if state.num_rows == 0 or outcomes.num_rows == 0:
         raise AuditError(f"{split} source split is empty")
     return state_path, outcome_path, state, outcomes

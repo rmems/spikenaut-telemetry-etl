@@ -728,13 +728,49 @@ def _campaign_assignments(campaign: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _remove_owned_preparation_outputs(output_dir: Path) -> None:
+def _source_owned_root_artifacts(
+    campaign_path: Path, output_dir: Path, campaign_bytes: bytes
+) -> set[str]:
+    protected: set[str] = set()
+    for item in _assignments(campaign_bytes):
+        raw_path = item.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        session_path = Path(raw_path)
+        if not session_path.is_absolute():
+            session_path = campaign_path.parent / session_path
+        try:
+            session_path = session_path.resolve(strict=True)
+        except (OSError, RuntimeError, UnicodeError, ValueError):
+            continue
+        sources = (
+            session_path / "session_manifest.json",
+            *session_path.glob("*.parquet"),
+        )
+        for source in sources:
+            try:
+                source_identity = source.resolve(strict=True)
+            except (OSError, RuntimeError, UnicodeError, ValueError):
+                continue
+            for name in ("prepared.json", "quality-report.json", "manifest.json"):
+                artifact = output_dir / name
+                try:
+                    if artifact.resolve(strict=True) == source_identity:
+                        protected.add(name)
+                except (OSError, RuntimeError, UnicodeError):
+                    continue
+    return protected
+
+
+def _remove_owned_preparation_outputs(output_dir: Path, protected: set[str]) -> None:
     clean_artifacts(
         output_dir,
         (
-            "prepared.json",
-            "quality-report.json",
-            "manifest.json",
+            *(
+                name
+                for name in ("prepared.json", "quality-report.json", "manifest.json")
+                if name not in protected
+            ),
             "prepared.json.tmp",
             "quality-report.json.tmp",
             "manifest.json.tmp",
@@ -961,9 +997,14 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
                 **getattr(exc, "details", {}),
             }
             try:
-                _remove_owned_preparation_outputs(output_dir)
-                _write_json(output_dir / "quality-report.json", incomplete)
-                _write_json(output_dir / "manifest.json", incomplete)
+                protected = _source_owned_root_artifacts(
+                    campaign_path, output_dir, campaign_bytes
+                )
+                _remove_owned_preparation_outputs(output_dir, protected)
+                if "quality-report.json" not in protected:
+                    _write_json(output_dir / "quality-report.json", incomplete)
+                if "manifest.json" not in protected:
+                    _write_json(output_dir / "manifest.json", incomplete)
             except OSError as publication_error:
                 raise PreparationError(str(exc)) from publication_error
             raise
