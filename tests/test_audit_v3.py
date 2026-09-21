@@ -1572,3 +1572,68 @@ def test_outcome_timestamps_join_by_key_after_reordering(tmp_path):
     assert (
         json.loads((tmp_path / "audit/manifest.json").read_text())["status"] == "complete"
     )
+
+
+@pytest.mark.parametrize("phase", ["before_snapshot", "before_manifest"])
+def test_git_provenance_drops_revision_when_source_state_changes(
+    tmp_path, monkeypatch, phase
+):
+    import subprocess
+
+    source = tmp_path / "source"
+    _write_corpus(source)
+    subprocess.run(["git", "init", str(source)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(source), "add", "."], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "source corpus",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    original_head = audit_module._git_head
+    original_write = audit_module.write_json
+    changed = False
+
+    def change_before_snapshot(*args):
+        nonlocal changed
+        revision = original_head(*args)
+        if phase == "before_snapshot" and not changed:
+            changed = True
+            shard = source / "v3/state_telemetry/train-00000.parquet"
+            table = pq.read_table(shard)
+            table = table.set_column(
+                table.schema.get_field_index("mem_util_pct"),
+                "mem_util_pct",
+                pa.array(
+                    [50.0] * table.num_rows, type=table.schema.field("mem_util_pct").type
+                ),
+            )
+            pq.write_table(table, shard)
+        return revision
+
+    def change_before_manifest(path, value):
+        if phase == "before_manifest" and path.name == "audit-report.json":
+            (source / "new-source.txt").write_text("untracked source")
+        original_write(path, value)
+
+    monkeypatch.setattr(audit_module, "_git_head", change_before_snapshot)
+    monkeypatch.setattr(audit_module, "write_json", change_before_manifest)
+    output = tmp_path / "out"
+    audit_v3(source, output)
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    assert manifest["source_git_commit"] is None

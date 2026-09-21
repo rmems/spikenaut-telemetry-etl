@@ -1283,3 +1283,19 @@ def test_positive_extreme_held_out_targets_remain_finite(
     examples = prepared["sessions"][1]["examples"]
     assert examples
     assert all(math.isfinite(value) for example in examples for value in example["y"])
+
+
+@pytest.mark.parametrize("basis", [None, "monotonic"])
+def test_session_requires_utc_wall_clock_rows(tmp_path: Path, basis: str | None) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    sidecar = tmp_path / "session-01/session_manifest.json"
+    manifest = json.loads(sidecar.read_text())
+    if basis is None:
+        manifest["timing"].pop("row_timestamp_basis")
+    else:
+        manifest["timing"]["row_timestamp_basis"] = basis
+    sidecar.write_text(json.dumps(manifest))
+    output = tmp_path / "out"
+    with pytest.raises(PreparationError, match="row_timestamp_basis"):
+        prepare_campaign(campaign, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"

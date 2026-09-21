@@ -105,6 +105,14 @@ def _git_head(path: Path, output_root: Path | None = None) -> str | None:
     return lines[1] or None
 
 
+def _retained_revision(
+    dataset_root: Path, output_root: Path, expected: str | None
+) -> str | None:
+    if expected is not None and _git_head(dataset_root, output_root) == expected:
+        return expected
+    return None
+
+
 def _key_columns(table: pa.Table, label: str) -> list[tuple[str, int]]:
     raw_keys = list(
         zip(
@@ -520,6 +528,7 @@ def _audit_v3_impl(
     episode_split: dict[str, str] = {}
     episodes_by_split: dict[str, set[str]] = {}
     source_hashes = _available_source_hashes(dataset_root, v3_root)
+    source_git_commit = _retained_revision(dataset_root, output_root, source_git_commit)
     expected_hashes = {
         dataset_root / name: digest for name, digest in source_hashes.items()
     }
@@ -736,6 +745,9 @@ def _audit_v3_impl(
     if directory_identity(output_root) != publication_identity:
         raise AuditError("publication directory changed during audit")
     _check_output_snapshot(output_root, view_root, manifest["outputs"])
+    manifest["source_git_commit"] = _retained_revision(
+        dataset_root, output_root, source_git_commit
+    )
     write_json(output_root / "manifest.json", manifest)
     if directory_identity(output_root) != publication_identity:
         raise AuditError("publication directory changed during audit")
@@ -787,6 +799,10 @@ def _write_incomplete_evidence(
         ),
         "outputs": {},
     }
+    if dataset_root is not None:
+        incomplete_manifest["source_git_commit"] = _retained_revision(
+            dataset_root, output_root, source_git_commit
+        )
     write_json(output_root / "audit-report.json", incomplete_report)
     write_json(output_root / "manifest.json", incomplete_manifest)
 

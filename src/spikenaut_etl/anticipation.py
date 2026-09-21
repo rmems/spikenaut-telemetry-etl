@@ -204,6 +204,10 @@ def _load_manifest(
     timing = manifest.get("timing")
     if not isinstance(timing, dict):
         raise PreparationError(f"session {expected_id} manifest timing is incomplete")
+    if timing.get("row_timestamp_basis") != "utc_wall_clock":
+        raise PreparationError(
+            f"session {expected_id} row_timestamp_basis must be utc_wall_clock"
+        )
     if timing.get("poll_interval_ms_requested") != FRAME_INTERVAL_MS:
         raise PreparationError(
             f"session {expected_id} timing does not confirm 100 ms polling"
