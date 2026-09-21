@@ -326,6 +326,13 @@ def _available_source_hashes(
             except OSError:
                 if not tolerate_unreadable:
                     raise
+        final_paths = sorted(directory.glob("*.parquet"))
+        if not tolerate_unreadable and [path.name for path in final_paths] != [
+            path.name for path in paths
+        ]:
+            raise AuditError(
+                f"{directory.name} source shard membership changed during hashing"
+            )
     return dict(sorted(hashes.items()))
 
 
@@ -623,8 +630,10 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
             provisional_source = source_path.resolve()
         except RuntimeError:
             provisional_source = source_path.absolute()
-        if output_root == provisional_source or output_root.is_relative_to(
-            provisional_source
+        if (
+            output_root == provisional_source
+            or output_root.is_relative_to(provisional_source)
+            or provisional_source.is_relative_to(output_root)
         ):
             raise AuditError(
                 f"output directory would overlap supplied source path: {output_root}"

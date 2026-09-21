@@ -302,6 +302,24 @@ def test_invalid_source_output_overlap_is_rejected_before_cleanup(
     assert {name: (source / name).read_bytes() for name in sentinels} == sentinels
 
 
+def test_invalid_nested_source_cannot_clean_ancestor_output(tmp_path: Path) -> None:
+    output = tmp_path / "corpus"
+    source = output / "invalid-source"
+    source.mkdir(parents=True)
+    sentinels = {
+        "manifest.json": b"source manifest",
+        "audit-report.json": b"source audit report",
+        "exclusions.parquet": b"source exclusions",
+    }
+    for name, content in sentinels.items():
+        (output / name).write_bytes(content)
+
+    with pytest.raises(AuditError, match="overlap supplied source path"):
+        audit_v3(source, output)
+
+    assert {name: (output / name).read_bytes() for name in sentinels} == sentinels
+
+
 def test_missing_timestamp_column_fails_closed_with_evidence(tmp_path: Path) -> None:
     source = tmp_path / "source"
     output = tmp_path / "audit"
@@ -545,6 +563,31 @@ def test_late_unexpected_source_shard_fails_final_snapshot(
     )
 
     with pytest.raises(AuditError, match="unexpected source shards"):
+        audit_v3(source, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_source_shard_membership_is_rechecked_after_directory_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original_sha256 = audit_module._sha256
+    inserted = False
+
+    def add_shard_during_hash(path: Path) -> str:
+        nonlocal inserted
+        digest = original_sha256(path)
+        if not inserted and path.parent.name == "state_telemetry":
+            inserted = True
+            (path.parent / "train-00001.parquet").write_bytes(path.read_bytes())
+        return digest
+
+    monkeypatch.setattr(audit_module, "_sha256", add_shard_during_hash)
+
+    with pytest.raises(AuditError, match="membership changed during hashing"):
         audit_v3(source, output)
 
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 
 import pyarrow as pa
@@ -484,6 +485,34 @@ def test_cyclic_output_symlink_routes_through_incomplete_cleanup(
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
+def test_cyclic_campaign_path_routes_through_incomplete_cleanup(tmp_path: Path) -> None:
+    campaign = tmp_path / "campaign-loop.json"
+    campaign.symlink_to(campaign)
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "prepared.json").write_text("stale complete result")
+
+    with pytest.raises(PreparationError, match="campaign path has a symlink loop"):
+        prepare_campaign(campaign, output)
+
+    assert not (output / "prepared.json").exists()
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_hardlinked_staging_path_cannot_truncate_campaign(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    original = campaign.read_bytes()
+    output = tmp_path / "out"
+    output.mkdir()
+    os.link(campaign, output / "prepared.json.tmp")
+
+    with pytest.raises(PreparationError, match="multiply linked"):
+        prepare_campaign(campaign, output)
+
+    assert campaign.read_bytes() == original
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
 def test_collision_is_preserved_when_another_output_artifact_is_cyclic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -586,6 +615,36 @@ def test_late_parquet_batch_fails_final_membership_snapshot(
     )
 
 
+def test_parquet_membership_is_rechecked_after_final_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    session = tmp_path / "session-01"
+    canonical = session / "gpu_telemetry_v2_batch_0.parquet"
+    original_sha256 = anticipation._sha256
+    inserted = False
+
+    def add_batch_during_hash(path: Path) -> str:
+        nonlocal inserted
+        digest = original_sha256(path)
+        if not inserted:
+            inserted = True
+            (session / "gpu_telemetry_v2_batch_1.parquet").write_bytes(
+                canonical.read_bytes()
+            )
+        return digest
+
+    monkeypatch.setattr(anticipation, "_sha256", add_batch_during_hash)
+
+    with pytest.raises(PreparationError, match="Parquet membership"):
+        prepare_campaign(campaign, tmp_path / "out")
+
+    assert (
+        json.loads((tmp_path / "out" / "manifest.json").read_text())["status"]
+        == "incomplete"
+    )
+
+
 def test_final_report_write_failure_removes_complete_payload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -673,6 +732,20 @@ def test_invalid_utf8_campaign_writes_incomplete_reports(tmp_path: Path) -> None
     assert (
         json.loads((output / "quality-report.json").read_text())["status"] == "incomplete"
     )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_oversized_campaign_integer_writes_incomplete_reports(tmp_path: Path) -> None:
+    campaign = tmp_path / "campaign.json"
+    campaign.write_text('{"min_examples_per_session":' + "9" * 5000 + ',"sessions":[]}')
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "prepared.json").write_text("stale complete result")
+
+    with pytest.raises(PreparationError, match="cannot read campaign"):
+        prepare_campaign(campaign, output)
+
+    assert not (output / "prepared.json").exists()
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 

@@ -79,9 +79,10 @@ def _require_mapping(value: Any, context: str) -> dict[str, Any]:
 def _load_campaign(campaign_path: Path) -> tuple[dict[str, Any], int, str]:
     try:
         campaign_bytes = campaign_path.read_bytes()
-        campaign = _require_mapping(json.loads(campaign_bytes.decode()), "campaign")
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        campaign_raw = json.loads(campaign_bytes.decode())
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise PreparationError(f"cannot read campaign {campaign_path}: {exc}") from exc
+    campaign = _require_mapping(campaign_raw, "campaign")
     minimum = campaign.get("min_examples_per_session")
     if not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 1:
         raise PreparationError(
@@ -659,6 +660,12 @@ def _prepare_campaign(
             raise PreparationError(f"source changed during preparation: {path}") from exc
         if current_sha256 != expected_sha256:
             raise PreparationError(f"source changed during preparation: {path}")
+    for session_path, expected_names in source_memberships:
+        current_names = frozenset(path.name for path in session_path.glob("*.parquet"))
+        if current_names != expected_names:
+            raise PreparationError(
+                f"source changed during preparation: {session_path} Parquet membership"
+            )
     _write_json(output_dir / "prepared.json", prepared)
     return prepared
 
@@ -666,6 +673,8 @@ def _prepare_campaign(
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
+    if temporary.is_symlink() or temporary.is_file():
+        temporary.unlink()
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
     temporary.replace(path)
 
@@ -673,7 +682,7 @@ def _write_json(path: Path, value: Any) -> None:
 def _assignments(campaign_path: Path) -> list[dict[str, Any]]:
     try:
         raw = json.loads(campaign_path.read_text()).get("sessions", [])
-    except OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError:
+    except OSError, UnicodeDecodeError, ValueError, AttributeError:
         return []
     if not isinstance(raw, list):
         return []
@@ -714,7 +723,17 @@ def _remove_owned_preparation_outputs(output_dir: Path) -> None:
 def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[str, Any]:
     """Prepare a campaign and always publish a versioned completion report."""
 
-    campaign_path = Path(campaign_path).resolve()
+    supplied_campaign_path = Path(campaign_path)
+    campaign_resolution_error: PreparationError | None = None
+    try:
+        campaign_path = supplied_campaign_path.resolve(strict=True)
+    except FileNotFoundError:
+        campaign_path = supplied_campaign_path.resolve()
+    except OSError, RuntimeError:
+        campaign_path = supplied_campaign_path.absolute()
+        campaign_resolution_error = PreparationError(
+            f"campaign path has a symlink loop: {campaign_path}"
+        )
     output_dir = Path(output_dir).resolve()
     output_paths = [
         output_dir / name
@@ -743,10 +762,21 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
     try:
         if resolution_error is not None:
             raise resolution_error
+        if campaign_resolution_error is not None:
+            raise campaign_resolution_error
         staging_symlinks = [path for path in output_paths if path.is_symlink()]
         if staging_symlinks:
             raise PreparationError(
                 f"output staging path is a symlink: {staging_symlinks[0]}"
+            )
+        hardlinked_staging = [
+            path
+            for path in output_paths
+            if path.is_file() and not path.is_symlink() and path.stat().st_nlink > 1
+        ]
+        if hardlinked_staging:
+            raise PreparationError(
+                f"output staging path is multiply linked: {hardlinked_staging[0]}"
             )
         campaign, minimum, campaign_sha256 = _load_campaign(campaign_path)
         assignments = _campaign_assignments(campaign)
