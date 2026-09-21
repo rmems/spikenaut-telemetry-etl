@@ -541,14 +541,14 @@ def _prepare_campaign(
                 session_path, session_id
             )
             rows, parquet_snapshots = _read_rows(session_path, session_id)
-            if ended_ms < max(row["timestamp_ms"] for row in rows):
-                raise PreparationError(
-                    f"session {session_id} completion precedes last row timestamp"
-                )
             if collector_manifest["timing"]["sample_count"] != len(rows):
                 raise PreparationError(
                     f"session {session_id} timing sample_count does not equal "
                     "persisted rows"
+                )
+            if ended_ms < max(row["timestamp_ms"] for row in rows):
+                raise PreparationError(
+                    f"session {session_id} completion precedes last row timestamp"
                 )
             session_rejections: Counter[str] = Counter()
             frames = _frames(rows)

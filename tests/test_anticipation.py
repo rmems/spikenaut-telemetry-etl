@@ -1233,3 +1233,53 @@ def test_session_file_link_into_output_is_preserved(
     with pytest.raises(PreparationError, match="overlap"):
         prepare_campaign(campaign, output)
     assert target.read_bytes() == before
+
+
+def test_empty_collector_batch_removes_stale_prepared_output(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    session = Path(json.loads(campaign.read_text())["sessions"][0]["path"])
+    batch = session / "gpu_telemetry_v2_batch_0.parquet"
+    pq.write_table(pq.read_table(batch).slice(0, 0), batch)
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "prepared.json").write_text("stale")
+    with pytest.raises(PreparationError, match="sample_count"):
+        prepare_campaign(campaign, output)
+    assert not (output / "prepared.json").exists()
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("split", ["validation", "test"])
+def test_held_out_nonfinite_target_is_rejected(tmp_path: Path, split: str) -> None:
+    campaign = _campaign(
+        tmp_path, [("train", "train", _rows()), ("held", split, _rows())]
+    )
+    session = Path(json.loads(campaign.read_text())["sessions"][1]["path"])
+    batch = session / "gpu_telemetry_v2_batch_0.parquet"
+    rows = pq.read_table(batch).to_pylist()
+    for index, row in enumerate(rows):
+        row["temperature_c"] = -1.7e308 if index <= 60 else 1.7e308
+    pq.write_table(pa.Table.from_pylist(rows), batch)
+    output = tmp_path / "out"
+    with pytest.raises(PreparationError, match="eligible examples"):
+        prepare_campaign(campaign, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("split", ["validation", "test"])
+def test_positive_extreme_held_out_targets_remain_finite(
+    tmp_path: Path, split: str
+) -> None:
+    campaign = _campaign(
+        tmp_path, [("train", "train", _rows()), ("held", split, _rows())]
+    )
+    session = Path(json.loads(campaign.read_text())["sessions"][1]["path"])
+    batch = session / "gpu_telemetry_v2_batch_0.parquet"
+    rows = pq.read_table(batch).to_pylist()
+    for index, row in enumerate(rows):
+        row["temperature_c"] = 1.0 if index <= 60 else 1.7e308
+    pq.write_table(pa.Table.from_pylist(rows), batch)
+    prepared = prepare_campaign(campaign, tmp_path / "out")
+    examples = prepared["sessions"][1]["examples"]
+    assert examples
+    assert all(math.isfinite(value) for example in examples for value in example["y"])

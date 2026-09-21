@@ -1462,3 +1462,47 @@ def test_invalid_corpus_preserves_linked_source_in_output(tmp_path: Path) -> Non
     with pytest.raises(AuditError, match="overlap"):
         audit_v3(source, output)
     assert sentinel.read_bytes() == b"source sentinel"
+
+
+def test_unencodable_audit_source_has_incomplete_evidence(tmp_path: Path) -> None:
+    output = tmp_path / "out"
+    with pytest.raises(AuditError, match="cannot resolve source"):
+        audit_v3(tmp_path / "\ud800", output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_git_provenance_precedes_sibling_output_publication(tmp_path: Path) -> None:
+    import subprocess
+
+    source = tmp_path / "repo"
+    _write_corpus(source)
+    subprocess.run(["git", "init", str(source)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(source), "add", "."], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "source corpus",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    expected = audit_module._git_head(source)
+    assert expected is not None
+    output = source / "audit"
+    audit_v3(source / "v3", output)
+    assert (
+        json.loads((output / "manifest.json").read_text())["source_git_commit"]
+        == expected
+    )

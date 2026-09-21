@@ -1,5 +1,6 @@
 """Exclusive artifact staging through pinned, non-symlink directory handles."""
 
+import fcntl
 import json
 import os
 import secrets
@@ -33,15 +34,21 @@ def pinned_publication(
 ) -> Iterator[None]:
     ensure_directory(path)
     descriptor = _open_directory(path)
-    opened = os.fstat(descriptor)
-    if expected is not None and (opened.st_dev, opened.st_ino) != expected:
-        os.close(descriptor)
-        raise OSError("publication directory changed before pinning")
-    token = _PINNED_ROOT.set((path, (opened.st_dev, opened.st_ino)))
     try:
-        yield
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise OSError("another publisher owns the output directory") from exc
+        opened = os.fstat(descriptor)
+        if expected is not None and (opened.st_dev, opened.st_ino) != expected:
+            raise OSError("publication directory changed before pinning")
+        token = _PINNED_ROOT.set((path, (opened.st_dev, opened.st_ino)))
+        try:
+            yield
+        finally:
+            _PINNED_ROOT.reset(token)
     finally:
-        _PINNED_ROOT.reset(token)
+        # Closing the retained descriptor also releases the publication lock.
         os.close(descriptor)
 
 

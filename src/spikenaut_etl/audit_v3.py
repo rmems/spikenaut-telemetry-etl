@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import math
+import os
 import re
 import subprocess
 from collections import Counter
@@ -215,9 +216,11 @@ def _source_root(source_dir: Path) -> tuple[Path, Path, bool]:
         source_dir = source_dir.resolve(strict=True)
     except FileNotFoundError:
         source_dir = source_dir.resolve()
-    except (OSError, RuntimeError) as exc:
-        if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
-            raise AuditError(f"cannot resolve source path {source_dir}: {exc}") from exc
+    except (OSError, RuntimeError, UnicodeError) as exc:
+        if isinstance(exc, UnicodeError) or (
+            isinstance(exc, OSError) and exc.errno != errno.ELOOP
+        ):
+            raise AuditError(f"cannot resolve source path {source_dir!r}: {exc}") from exc
         raise AuditError(f"source path has a symlink loop: {source_dir}") from exc
     v3 = source_dir / "v3"
     if (v3 / "state_telemetry").is_dir():
@@ -506,7 +509,9 @@ def _append_action_columns(
     return selected
 
 
-def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> AuditReport:
+def _audit_v3_impl(
+    dataset_root: Path, v3_root: Path, output_root: Path, source_git_commit: str | None
+) -> AuditReport:
     publication_identity = directory_identity(output_root)
     loaded: dict[str, tuple[Path, Path, pa.Table, pa.Table]] = {}
     episode_split: dict[str, str] = {}
@@ -700,7 +705,7 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
         "audit_version": AUDIT_VERSION,
         "view_id": VIEW_ID,
         "horizon_samples": HORIZON_SAMPLES,
-        "source_git_commit": _git_head(dataset_root),
+        "source_git_commit": source_git_commit,
         "source_files": dict(sorted(source_hashes.items())),
         "outputs": {
             f"{VIEW_ID}/{split}-00000.parquet": _sha256(
@@ -745,6 +750,7 @@ def _write_incomplete_evidence(
     error: AuditError,
     dataset_root: Path | None,
     v3_root: Path | None,
+    source_git_commit: str | None = None,
 ) -> None:
     failure = {"category": "structural_integrity", "reason": str(error)}
     incomplete_report = {
@@ -762,7 +768,7 @@ def _write_incomplete_evidence(
         "horizon_samples": HORIZON_SAMPLES,
         "status": "incomplete",
         "failure": failure,
-        "source_git_commit": _git_head(dataset_root) if dataset_root else None,
+        "source_git_commit": source_git_commit,
         "source_files": (
             _available_source_hashes(dataset_root, v3_root, tolerate_unreadable=True)
             if dataset_root is not None and v3_root is not None
@@ -785,6 +791,11 @@ def _guard_supplied_source(source_path: Path, output_root: Path) -> None:
         raise AuditError(
             f"output directory would overlap supplied source path: {output_root}"
         )
+    try:
+        os.fsencode(provisional_source)
+    except UnicodeError:
+        # No filesystem entry can exist at an unencodable path.
+        return
     for root in (provisional_source, provisional_source / "v3"):
         _guard_source_members(root, output_root)
 
@@ -821,6 +832,7 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
         raise
 
     _guard_output_path(dataset_root, v3_root, output_root, source_is_dataset_root)
+    source_git_commit = _git_head(dataset_root)
     with pinned_publication(output_root, initial_identity):
         _guard_output_path(
             dataset_root.resolve(), v3_root.resolve(), output_root, source_is_dataset_root
@@ -828,7 +840,7 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
         try:
             ensure_directory(output_root)
             _clean_owned_outputs(output_root)
-            return _audit_v3_impl(dataset_root, v3_root, output_root)
+            return _audit_v3_impl(dataset_root, v3_root, output_root, source_git_commit)
         except (AuditError, OSError, pa.ArrowException) as raw_error:
             audit_error = (
                 raw_error
@@ -843,7 +855,7 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
                 pass
             try:
                 _write_incomplete_evidence(
-                    output_root, audit_error, dataset_root, v3_root
+                    output_root, audit_error, dataset_root, v3_root, source_git_commit
                 )
             except OSError as publication_error:
                 # A replaced output root is no longer ours, even for error evidence.

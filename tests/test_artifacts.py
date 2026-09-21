@@ -49,3 +49,31 @@ def test_cleanup_names_must_be_single_components(tmp_path, name):
     with pytest.raises(OSError, match="single path component"):
         clean_artifacts(output, (str(outside) if name == "absolute" else name,))
     assert outside.read_text() == "sentinel"
+
+
+def test_overlapping_publishers_cannot_mix_generations(tmp_path):
+    from spikenaut_etl.artifacts import pinned_publication
+
+    output = tmp_path / "output"
+    artifact = output / "manifest.json"
+    with pinned_publication(output):
+        write_json(artifact, {"generation": 1})
+        original = artifact.read_bytes()
+        with pytest.raises(OSError, match="publisher"):
+            with pinned_publication(output):
+                write_json(artifact, {"generation": 2})
+        assert artifact.read_bytes() == original
+    with pinned_publication(output):
+        write_json(artifact, {"generation": 3})
+    assert '"generation": 3' in artifact.read_text()
+
+
+def test_publisher_lock_released_after_failure(tmp_path):
+    from spikenaut_etl.artifacts import pinned_publication
+
+    output = tmp_path / "output"
+    with pytest.raises(ValueError, match="fixture failure"):
+        with pinned_publication(output):
+            raise ValueError("fixture failure")
+    with pinned_publication(output):
+        write_json(output / "manifest.json", {"complete": True})
