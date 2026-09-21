@@ -306,7 +306,7 @@ def _clean_owned_outputs(output_root: Path) -> None:
         raise AuditError(f"audit view directory must not be a symlink: {view_root}")
     if view_root.is_dir():
         for path in view_root.rglob("*.parquet"):
-            if path.is_file():
+            if path.is_symlink() or path.is_file():
                 path.unlink()
 
 

@@ -390,6 +390,24 @@ def test_dangling_root_artifact_symlink_is_removed_without_following(
     assert (output / artifact_name).is_file()
 
 
+def test_dangling_view_shard_symlink_is_removed_without_following(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    outside = tmp_path / "outside" / "train-00000.parquet"
+    _write_corpus(source)
+    shard = output / "v3-forecast-eligible-v1" / "train-00000.parquet"
+    shard.parent.mkdir(parents=True)
+    shard.symlink_to(outside)
+
+    audit_v3(source, output)
+
+    assert not outside.exists()
+    assert not shard.is_symlink()
+    assert shard.is_file()
+
+
 def test_incomplete_evidence_tolerates_unreadable_source_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

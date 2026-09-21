@@ -695,11 +695,19 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             "manifest.json.tmp",
         )
     ]
-    output_artifacts = {path.resolve() for path in output_paths}
+    resolution_error: PreparationError | None
+    try:
+        output_artifacts = {path.resolve() for path in output_paths}
+        resolution_error = None
+    except RuntimeError as exc:
+        output_artifacts = set()
+        resolution_error = PreparationError(f"output artifact symlink loop: {exc}")
     if campaign_path in output_artifacts:
         raise PreparationError(f"campaign {campaign_path} collides with output artifact")
     assignments: list[dict[str, Any]] = []
     try:
+        if resolution_error is not None:
+            raise resolution_error
         staging_symlinks = [path for path in output_paths if path.is_symlink()]
         if staging_symlinks:
             raise PreparationError(

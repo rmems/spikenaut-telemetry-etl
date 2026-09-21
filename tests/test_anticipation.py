@@ -457,6 +457,33 @@ def test_noncampaign_output_symlink_routes_through_incomplete_cleanup(
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
+def test_cyclic_output_symlink_routes_through_incomplete_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    output.mkdir()
+    loop = output / "prepared.json"
+    loop.symlink_to(loop)
+    real_resolve = Path.resolve
+
+    def reject_loop(path: Path, *args: object, **kwargs: object) -> Path:
+        if path == loop:
+            raise RuntimeError("Symlink loop")
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", reject_loop)
+
+    with pytest.raises(PreparationError, match="symlink loop"):
+        prepare_campaign(campaign, output)
+
+    assert not loop.is_symlink()
+    assert (
+        json.loads((output / "quality-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
 def test_final_report_write_failure_removes_complete_payload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
