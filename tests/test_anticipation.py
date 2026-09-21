@@ -1202,7 +1202,8 @@ def test_preparation_rechecks_source_overlap_after_output_pin(
     with pytest.raises((PreparationError, OSError)):
         prepare_campaign(campaign, output)
     assert not (output / "prepared.json").exists()
-    assert not (output / "manifest.json").exists()
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+    assert (output / "gpu_telemetry_v2_batch_0.parquet").exists()
 
 
 def test_post_pin_source_guard_invalidates_prior_completion(

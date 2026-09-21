@@ -951,11 +951,6 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             if directory_identity(output_dir) != publication_identity:
                 raise PreparationError(PUBLICATION_DIRECTORY_ERROR)
         except (OSError, PreparationError) as exc:
-            if (
-                isinstance(exc, PreparationError)
-                and str(exc).startswith("output directory overlaps session source")
-            ):
-                raise
             if not assignments:
                 assignments = _assignments(campaign_bytes)
             incomplete = {
