@@ -1040,10 +1040,11 @@ def _write_incomplete_evidence(
     retained = source_identities or set()
     report_path = output_root / AUDIT_REPORT_NAME
     manifest_path = output_root / MANIFEST_NAME
-    if not _matches_source_identity(report_path, retained):
-        write_json(report_path, incomplete_report)
-    if not _matches_source_identity(manifest_path, retained):
-        write_json(manifest_path, incomplete_manifest)
+    with no_replace_publication():
+        if not _matches_source_identity(report_path, retained):
+            write_json(report_path, incomplete_report)
+        if not _matches_source_identity(manifest_path, retained):
+            write_json(manifest_path, incomplete_manifest)
 
 
 def _guard_supplied_source(source_path: Path, output_root: Path) -> None:
@@ -1118,8 +1119,8 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
             try:
                 _clean_owned_outputs(output_root)
             except AuditError:
-                # A view symlink must not prevent publishing safe root-level evidence.
-                pass
+                # A view symlink must not prevent replacing owned root evidence.
+                _clean_root_evidence(output_root, source_identities)
             _write_incomplete_evidence(output_root, exc, None, None)
 
         raise

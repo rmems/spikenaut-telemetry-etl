@@ -1608,6 +1608,40 @@ def test_atomic_publication_preserves_source_moved_after_destination_guard(
     assert artifact.read_bytes() == source_bytes
 
 
+@pytest.mark.parametrize(
+    "artifact_name",
+    [audit_module.AUDIT_REPORT_NAME, audit_module.MANIFEST_NAME],
+)
+def test_atomic_incomplete_evidence_preserves_source_moved_after_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact_name: str
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    shard = source / "v3/action_proposals/train-00000.parquet"
+    source_bytes = shard.read_bytes()
+    output = tmp_path / "audit"
+    artifact = output / artifact_name
+    original_json = audit_module.write_json
+    moved = False
+
+    def fail_publication(*_args: object, **_kwargs: object) -> None:
+        raise AuditError("forced publication failure")
+
+    def move_source_before_incomplete_write(path: Path, value: object) -> None:
+        nonlocal moved
+        if path == artifact and not moved:
+            moved = True
+            shard.rename(artifact)
+        original_json(path, value)
+
+    monkeypatch.setattr(audit_module, "_publish_audit", fail_publication)
+    monkeypatch.setattr(audit_module, "write_json", move_source_before_incomplete_write)
+
+    with pytest.raises(AuditError, match="forced publication failure"):
+        audit_v3(source, output)
+    assert artifact.read_bytes() == source_bytes
+
+
 def test_invalid_corpus_preserves_linked_source_in_output(tmp_path: Path) -> None:
     source = tmp_path / "source"
     config = source / "v3" / "outcomes"
