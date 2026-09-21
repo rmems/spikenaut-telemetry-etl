@@ -968,3 +968,17 @@ def test_later_session_failure_preserves_prior_verified_evidence(tmp_path: Path)
     assert quality["session_summaries"][0]["session_id"] == "session-01"
     assert quality["provenance"][0]["session_id"] == "session-01"
     assert quality["failed_session_id"] == "session-02"
+
+
+def test_recursive_manifest_writes_incomplete_reports(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    (tmp_path / "session-01/session_manifest.json").write_text(
+        "[" * 100000 + "0" + "]" * 100000
+    )
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "prepared.json").write_text("stale complete result")
+    with pytest.raises(PreparationError, match="manifest unavailable"):
+        prepare_campaign(campaign, output)
+    assert not (output / "prepared.json").exists()
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"

@@ -11,7 +11,7 @@ import pytest
 import spikenaut_etl.audit_v3 as audit_module
 from spikenaut_etl.audit_v3 import AuditError, audit_v3
 from spikenaut_etl.cli import main
-from spikenaut_etl.v3_build import OUTCOMES_SCHEMA, STATE_SCHEMA
+from spikenaut_etl.v3_build import OUTCOMES_SCHEMA, PROPOSALS_SCHEMA, STATE_SCHEMA
 
 SPLITS = ("train", "validation", "test")
 
@@ -99,6 +99,11 @@ def _write_corpus(
         episode = f"gpu-{split_index:06d}"
         state_dir = root / "v3" / "state_telemetry"
         outcomes_dir = root / "v3" / "outcomes"
+        proposal_dir = root / "v3" / "action_proposals"
+        proposal_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            PROPOSALS_SCHEMA.empty_table(), proposal_dir / f"{split}-00000.parquet"
+        )
         state_dir.mkdir(parents=True, exist_ok=True)
         outcomes_dir.mkdir(parents=True, exist_ok=True)
         pq.write_table(
@@ -379,7 +384,7 @@ def test_unexpected_action_proposal_shard_fails_closed(tmp_path: Path) -> None:
     output = tmp_path / "audit"
     _write_corpus(source)
     proposal_dir = source / "v3" / "action_proposals"
-    proposal_dir.mkdir()
+    proposal_dir.mkdir(exist_ok=True)
     pq.write_table(
         pa.Table.from_pylist(
             [
@@ -716,7 +721,7 @@ def test_action_proposal_keys_must_be_unique_and_match_state(
     output = tmp_path / "audit"
     _write_corpus(source)
     proposal_dir = source / "v3" / "action_proposals"
-    proposal_dir.mkdir()
+    proposal_dir.mkdir(exist_ok=True)
     rows = [
         {
             "episode_id": "gpu-000000",
@@ -851,3 +856,52 @@ def test_output_cannot_overlap_source_tree(tmp_path: Path, relative_output: str)
         audit_v3(source, output)
 
     assert sentinel.read_text() == "source-owned evidence"
+
+
+@pytest.mark.parametrize("location", ["target", "child", "parent"])
+def test_symlinked_v3_target_cannot_overlap_output(tmp_path: Path, location: str) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    target = tmp_path / "external" / "v3"
+    target.parent.mkdir()
+    (source / "v3").rename(target)
+    (source / "v3").symlink_to(target, target_is_directory=True)
+    output = {"target": target, "child": target / "audit", "parent": target.parent}[
+        location
+    ]
+    output.mkdir(exist_ok=True)
+    sentinel = output / "manifest.json"
+    sentinel.write_text("source sentinel")
+    with pytest.raises(AuditError, match="overlap"):
+        audit_v3(source, output)
+    assert sentinel.read_text() == "source sentinel"
+
+
+def test_missing_action_shard_is_incomplete(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    (source / "v3/action_proposals/train-00000.parquet").unlink()
+    output = tmp_path / "audit"
+    with pytest.raises(AuditError, match="missing source shard"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("config", ["state_telemetry", "outcomes"])
+@pytest.mark.parametrize("version", ["missing", "4.0.0", None])
+def test_unsupported_source_schema_is_incomplete(
+    tmp_path: Path, config: str, version: str | None
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3" / config / "train-00000.parquet"
+    table = pq.read_table(path).drop(["schema_version"])
+    if version != "missing":
+        table = table.append_column(
+            "schema_version", pa.array([version] * table.num_rows, type=pa.string())
+        )
+    pq.write_table(table, path)
+    output = tmp_path / "audit"
+    with pytest.raises(AuditError, match="schema_version"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"

@@ -219,6 +219,12 @@ def _load_split(v3_root: Path, split: str) -> tuple[Path, Path, pa.Table, pa.Tab
         ("episode_id", "step_idx", "reward", "d_gpu_temp_c"),
         f"outcomes/{split}",
     )
+    for table, config in ((state, "state_telemetry"), (outcomes, "outcomes")):
+        _require_columns(table, ("schema_version",), f"{config}/{split}")
+        if any(
+            version != "3.0.0" for version in table.column("schema_version").to_pylist()
+        ):
+            raise AuditError(f"{config}/{split} schema_version must be 3.0.0")
     _require_numeric_columns(state, SENSOR_COLUMNS, f"state_telemetry/{split}")
     _require_numeric_columns(outcomes, ("d_gpu_temp_c",), f"outcomes/{split}")
     if state.num_rows == 0 or outcomes.num_rows == 0:
@@ -241,7 +247,7 @@ def _action_label_counts(
 ) -> tuple[int, int]:
     path = v3_root / "action_proposals" / f"{split}-00000.parquet"
     if not path.is_file():
-        return len(state_keys), 0
+        raise AuditError(f"missing source shard {path}")
     try:
         table = pq.read_table(
             path,
@@ -278,8 +284,12 @@ def _guard_output_path(
     output_root: Path,
     source_is_dataset_root: bool,
 ) -> None:
+    resolved_v3 = v3_root.resolve()
     overlaps = (
-        output_root == dataset_root
+        output_root == resolved_v3
+        or output_root.is_relative_to(resolved_v3)
+        or resolved_v3.is_relative_to(output_root)
+        or output_root == dataset_root
         or output_root == v3_root
         or output_root.is_relative_to(v3_root)
         or (source_is_dataset_root and output_root.is_relative_to(dataset_root))

@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import re
+import tempfile
 from bisect import bisect_left, bisect_right
 from collections import Counter
 from datetime import datetime, timedelta
@@ -80,7 +81,7 @@ def _load_campaign(campaign_path: Path) -> tuple[dict[str, Any], int, str]:
     try:
         campaign_bytes = campaign_path.read_bytes()
         campaign_raw = json.loads(campaign_bytes.decode())
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise PreparationError(f"cannot read campaign {campaign_path}: {exc}") from exc
     campaign = _require_mapping(campaign_raw, "campaign")
     minimum = campaign.get("min_examples_per_session")
@@ -128,7 +129,7 @@ def _load_manifest(
     try:
         manifest_bytes = manifest_path.read_bytes()
         manifest_raw = json.loads(manifest_bytes.decode())
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise PreparationError(
             f"session {expected_id} manifest unavailable: {exc}"
         ) from exc
@@ -671,17 +672,20 @@ def _prepare_campaign(
 
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    if temporary.is_symlink() or temporary.is_file():
-        temporary.unlink()
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
-    temporary.replace(path)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+            stream.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _assignments(campaign_path: Path) -> list[dict[str, Any]]:
     try:
         raw = json.loads(campaign_path.read_text()).get("sessions", [])
-    except OSError, UnicodeDecodeError, ValueError, AttributeError:
+    except OSError, ValueError, RecursionError, AttributeError:
         return []
     if not isinstance(raw, list):
         return []
