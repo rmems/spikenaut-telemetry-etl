@@ -1471,11 +1471,16 @@ def test_unencodable_audit_source_has_incomplete_evidence(tmp_path: Path) -> Non
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
-def test_git_provenance_precedes_sibling_output_publication(tmp_path: Path) -> None:
+@pytest.mark.parametrize("ignored", [False, True])
+def test_git_provenance_precedes_sibling_output_publication(
+    tmp_path: Path, ignored: bool
+) -> None:
     import subprocess
 
     source = tmp_path / "repo"
     _write_corpus(source)
+    if ignored:
+        (source / ".gitignore").write_text("audit/\nignored-sentinel\n")
     subprocess.run(["git", "init", str(source)], check=True, capture_output=True)
     subprocess.run(
         ["git", "-C", str(source), "add", "."], check=True, capture_output=True
@@ -1505,4 +1510,65 @@ def test_git_provenance_precedes_sibling_output_publication(tmp_path: Path) -> N
     assert (
         json.loads((output / "manifest.json").read_text())["source_git_commit"]
         == expected
+    )
+
+    audit_v3(source / "v3", output)
+    assert (
+        json.loads((output / "manifest.json").read_text())["source_git_commit"]
+        == expected
+    )
+    (source / "unrelated.txt").write_text("untracked input")
+    audit_v3(source / "v3", output)
+    assert json.loads((output / "manifest.json").read_text())["source_git_commit"] is None
+    (source / "unrelated.txt").unlink()
+    if ignored:
+        (source / "ignored-sentinel").write_text("untracked ignored input")
+        assert audit_module._git_head(source, output) is None
+        (source / "ignored-sentinel").unlink()
+    shard = source / "v3/state_telemetry/train-00000.parquet"
+    shard.write_bytes(shard.read_bytes() + b"changed")
+    assert audit_module._git_head(source, output) is None
+
+
+@pytest.mark.parametrize(
+    "state_time,outcome_time", [(None, 100), (100, None), (100, 200)]
+)
+def test_outcome_timestamp_must_match_joined_state(tmp_path, state_time, outcome_time):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    for config, timestamp in (
+        ("state_telemetry", state_time),
+        ("outcomes", outcome_time),
+    ):
+        path = source / "v3" / config / "train-00000.parquet"
+        table = pq.read_table(path)
+        table = table.set_column(
+            table.schema.get_field_index("ts_utc"),
+            "ts_utc",
+            pa.array([timestamp] * table.num_rows, type=pa.int64()),
+        )
+        pq.write_table(table, path)
+    output = tmp_path / "audit"
+    with pytest.raises(AuditError, match="timestamps differ"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_outcome_timestamps_join_by_key_after_reordering(tmp_path):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "train-00000.parquet"
+        table = pq.read_table(path)
+        table = table.set_column(
+            table.schema.get_field_index("ts_utc"),
+            "ts_utc",
+            pa.array(range(table.num_rows), type=pa.int64()),
+        )
+        if config == "outcomes":
+            table = table.take(pa.array(list(reversed(range(table.num_rows)))))
+        pq.write_table(table, path)
+    audit_v3(source, tmp_path / "audit")
+    assert (
+        json.loads((tmp_path / "audit/manifest.json").read_text())["status"] == "complete"
     )

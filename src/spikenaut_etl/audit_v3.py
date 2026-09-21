@@ -69,7 +69,7 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _git_head(path: Path) -> str | None:
+def _git_head(path: Path, output_root: Path | None = None) -> str | None:
     try:
         result = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--show-toplevel", "HEAD"],
@@ -82,24 +82,27 @@ def _git_head(path: Path) -> str | None:
     lines = result.stdout.strip().splitlines()
     if len(lines) != 2 or Path(lines[0]).resolve() != path.resolve():
         return None
-    try:
-        status = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(path),
-                "status",
-                "--porcelain",
-                "--untracked-files=all",
-                "--ignored=matching",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except OSError, subprocess.CalledProcessError:
-        return None
-    return None if status.stdout.strip() else lines[1] or None
+    pathspecs = ["--", "."]
+    if output_root is not None and output_root.is_relative_to(path):
+        relative_output = output_root.relative_to(path).as_posix()
+        pathspecs.append(f":(top,exclude,literal){relative_output}")
+    commands = (
+        ["status", "--porcelain", "--untracked-files=all", "--ignored=no"],
+        ["ls-files", "--others", "--ignored", "--exclude-standard"],
+    )
+    for command in commands:
+        try:
+            status = subprocess.run(
+                ["git", "-C", str(path), *command, *pathspecs],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except OSError, subprocess.CalledProcessError:
+            return None
+        if status.stdout.strip():
+            return None
+    return lines[1] or None
 
 
 def _key_columns(table: pa.Table, label: str) -> list[tuple[str, int]]:
@@ -534,6 +537,14 @@ def _audit_v3_impl(
                 f"{split} state/outcome join keys differ: "
                 f"missing_outcomes={missing_outcomes}, orphan_outcomes={orphan_outcomes}"
             )
+        state_timestamps = dict(
+            zip(state_keys, state.column("ts_utc").to_pylist(), strict=True)
+        )
+        outcome_timestamps = dict(
+            zip(outcome_keys, outcomes.column("ts_utc").to_pylist(), strict=True)
+        )
+        if state_timestamps != outcome_timestamps:
+            raise AuditError(f"{split} state/outcome timestamps differ")
         episodes_by_split[split] = {episode_id for episode_id, _ in state_keys}
         for episode_id in episodes_by_split[split]:
             previous = episode_split.setdefault(episode_id, split)
@@ -832,7 +843,7 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
         raise
 
     _guard_output_path(dataset_root, v3_root, output_root, source_is_dataset_root)
-    source_git_commit = _git_head(dataset_root)
+    source_git_commit = _git_head(dataset_root, output_root)
     with pinned_publication(output_root, initial_identity):
         _guard_output_path(
             dataset_root.resolve(), v3_root.resolve(), output_root, source_is_dataset_root
