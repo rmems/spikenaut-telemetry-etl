@@ -14,7 +14,7 @@ import math
 import re
 from bisect import bisect_left, bisect_right
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -127,7 +127,7 @@ def _load_campaign(
 
 def _load_manifest(
     session_path: Path, expected_id: str
-) -> tuple[dict[str, Any], Path, str]:
+) -> tuple[dict[str, Any], Path, str, int]:
     manifest_path = session_path / "session_manifest.json"
     try:
         manifest_bytes = manifest_path.read_bytes()
@@ -207,7 +207,10 @@ def _load_manifest(
         raise PreparationError(f"session {expected_id} timing sample_count is incomplete")
     if not isinstance(workload, dict) or workload.get("class") != "ai-compute":
         raise PreparationError(f"session {expected_id} workload class must be ai-compute")
-    return manifest, manifest_path, hashlib.sha256(manifest_bytes).hexdigest()
+    ended_ms = (ended_at_parsed - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(
+        milliseconds=1
+    )
+    return manifest, manifest_path, hashlib.sha256(manifest_bytes).hexdigest(), ended_ms
 
 
 def _number(value: Any) -> float | None:
@@ -529,10 +532,14 @@ def _prepare_campaign(
             raw_path if raw_path.is_absolute() else campaign_path.parent / raw_path
         )
         try:
-            collector_manifest, manifest_path, manifest_sha256 = _load_manifest(
+            collector_manifest, manifest_path, manifest_sha256, ended_ms = _load_manifest(
                 session_path, session_id
             )
             rows, parquet_snapshots = _read_rows(session_path, session_id)
+            if ended_ms < max(row["timestamp_ms"] for row in rows):
+                raise PreparationError(
+                    f"session {session_id} completion precedes last row timestamp"
+                )
             if collector_manifest["timing"]["sample_count"] != len(rows):
                 raise PreparationError(
                     f"session {session_id} timing sample_count does not equal "

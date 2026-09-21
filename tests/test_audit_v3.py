@@ -1181,7 +1181,7 @@ def test_audit_output_generation_cannot_change_between_artifacts(
     monkeypatch.setattr(audit_module, "write_json", swap_after_report)
     with pytest.raises(AuditError, match="publication directory changed"):
         audit_v3(source, output)
-    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+    assert not (output / "manifest.json").exists()
 
 
 def test_audit_output_generation_cannot_change_at_manifest_publication(
@@ -1201,7 +1201,7 @@ def test_audit_output_generation_cannot_change_at_manifest_publication(
     monkeypatch.setattr(audit_module, "write_json", swap_before_manifest)
     with pytest.raises(AuditError, match="publication directory changed"):
         audit_v3(source, output)
-    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+    assert not (output / "manifest.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -1321,3 +1321,71 @@ def test_all_state_outcome_fields_match_schema(
     pq.write_table(table, path)
     with pytest.raises(AuditError, match="schema field"):
         audit_v3(source, tmp_path / "audit")
+
+
+def test_output_identity_survives_cleanup_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    sentinel = source / "manifest.json"
+    sentinel.write_text("source sentinel")
+    original = audit_module._clean_owned_outputs
+    swapped = False
+
+    def move_source_after_cleanup(path: Path) -> None:
+        nonlocal swapped
+        original(path)
+        if not swapped:
+            swapped = True
+            output.rename(tmp_path / "detached")
+            source.rename(output)
+            source.symlink_to(output, target_is_directory=True)
+
+    monkeypatch.setattr(audit_module, "_clean_owned_outputs", move_source_after_cleanup)
+    with pytest.raises((AuditError, OSError)):
+        audit_v3(source, output)
+    assert (output / "manifest.json").read_text() == "source sentinel"
+
+
+@pytest.mark.parametrize("config", ["state_telemetry", "outcomes", "action_proposals"])
+def test_duplicate_schema_fields_publish_incomplete(tmp_path: Path, config: str) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3" / config / "train-00000.parquet"
+    table = pq.read_table(path)
+    pq.write_table(table.append_column("step_idx", table.column("step_idx")), path)
+    output = tmp_path / "audit"
+    with pytest.raises(AuditError):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_git_provenance_rejects_ancestor_repository(tmp_path: Path) -> None:
+    import subprocess
+
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    dataset = tmp_path / "nested-dataset"
+    dataset.mkdir()
+    assert audit_module._git_head(dataset) is None
+    assert audit_module._git_head(tmp_path) is not None

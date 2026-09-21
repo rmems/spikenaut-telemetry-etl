@@ -1140,3 +1140,16 @@ def test_prepared_hash_rechecked_after_final_source_pass(
     monkeypatch.setattr(anticipation, "_check_preparation_sources", mutate_after_sources)
     with pytest.raises(PreparationError, match="prepared artifact changed"):
         prepare_campaign(campaign, output)
+
+
+def test_completion_marker_must_cover_last_row(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    manifest_path = (
+        Path(json.loads(campaign.read_text())["sessions"][0]["path"])
+        / "session_manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text())
+    manifest["ended_at_utc"] = "1970-01-01T00:00:01Z"
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(PreparationError, match="completion.*last.*timestamp"):
+        prepare_campaign(campaign, tmp_path / "out")

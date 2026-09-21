@@ -19,6 +19,7 @@ from .artifacts import (
     clean_artifacts,
     directory_identity,
     ensure_directory,
+    pinned_publication,
     write_json,
     write_parquet,
 )
@@ -70,14 +71,17 @@ def _sha256(path: Path) -> str:
 def _git_head(path: Path) -> str | None:
     try:
         result = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
         )
     except OSError, subprocess.CalledProcessError:
         return None
-    return result.stdout.strip() or None
+    lines = result.stdout.strip().splitlines()
+    if len(lines) != 2 or Path(lines[0]).resolve() != path.resolve():
+        return None
+    return lines[1] or None
 
 
 def _key_columns(table: pa.Table, label: str) -> list[tuple[str, int]]:
@@ -637,6 +641,7 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
     final_source_hashes = _available_source_hashes(dataset_root, v3_root)
     if final_source_hashes != source_hashes:
         raise AuditError("source shards changed during audit")
+    _guard_output_path(dataset_root.resolve(), v3_root.resolve(), output_root, False)
     ensure_directory(output_root)
     view_root = output_root / VIEW_ID
     ensure_directory(view_root)
@@ -742,6 +747,7 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
     episode membership) fails closed after recording an incomplete report and
     manifest. Row-level defects are written with exact reasons. Source files
     are read only and the output is forbidden from overlapping their tree.
+    If the output root is replaced, abort without writing into its replacement.
     """
     source_path = Path(source_dir)
     try:
@@ -773,23 +779,33 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
         raise
 
     _guard_output_path(dataset_root, v3_root, output_root, source_is_dataset_root)
-    try:
-        ensure_directory(output_root)
-        _clean_owned_outputs(output_root)
-        return _audit_v3_impl(dataset_root, v3_root, output_root)
-    except (AuditError, OSError, pa.ArrowException) as raw_error:
-        audit_error = (
-            raw_error
-            if isinstance(raw_error, AuditError)
-            else AuditError(f"cannot write audit outputs: {raw_error}")
+    with pinned_publication(output_root):
+        _guard_output_path(
+            dataset_root.resolve(), v3_root.resolve(), output_root, source_is_dataset_root
         )
         try:
+            ensure_directory(output_root)
             _clean_owned_outputs(output_root)
-        except AuditError:
-            # Preserve an unsafe view symlink without following it; the JSON
-            # evidence files live directly under the already-guarded root.
-            pass
-        _write_incomplete_evidence(output_root, audit_error, dataset_root, v3_root)
-        if audit_error is raw_error:
-            raise
-        raise audit_error from raw_error
+            return _audit_v3_impl(dataset_root, v3_root, output_root)
+        except (AuditError, OSError, pa.ArrowException) as raw_error:
+            audit_error = (
+                raw_error
+                if isinstance(raw_error, AuditError)
+                else AuditError(f"cannot write audit outputs: {raw_error}")
+            )
+            try:
+                _clean_owned_outputs(output_root)
+            except AuditError:
+                # Preserve an unsafe view symlink without following it; the JSON
+                # evidence files live directly under the already-guarded root.
+                pass
+            try:
+                _write_incomplete_evidence(
+                    output_root, audit_error, dataset_root, v3_root
+                )
+            except OSError as publication_error:
+                # A replaced output root is no longer ours, even for error evidence.
+                raise audit_error from publication_error
+            if audit_error is raw_error:
+                raise
+            raise audit_error from raw_error

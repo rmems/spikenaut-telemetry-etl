@@ -6,14 +6,42 @@ import secrets
 import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import IO, Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+_PINNED_ROOT: ContextVar[tuple[Path, tuple[int, int]] | None] = ContextVar(
+    "artifact_root", default=None
+)
+
+
+def _check_pinned_root() -> None:
+    pinned = _PINNED_ROOT.get()
+    if pinned is not None:
+        root, expected = pinned
+        actual = root.stat(follow_symlinks=False)
+        if (actual.st_dev, actual.st_ino) != expected:
+            raise OSError("publication directory changed during audit")
+
+
+@contextmanager
+def pinned_publication(path: Path) -> Iterator[None]:
+    ensure_directory(path)
+    descriptor = _open_directory(path)
+    opened = os.fstat(descriptor)
+    token = _PINNED_ROOT.set((path, (opened.st_dev, opened.st_ino)))
+    try:
+        yield
+    finally:
+        _PINNED_ROOT.reset(token)
+        os.close(descriptor)
+
 
 def directory_identity(path: Path) -> tuple[int, int]:
+    _check_pinned_root()
     metadata = path.stat(follow_symlinks=False)
     if not stat.S_ISDIR(metadata.st_mode):
         raise OSError(f"publication path is not a directory: {path}")
@@ -21,6 +49,7 @@ def directory_identity(path: Path) -> tuple[int, int]:
 
 
 def _check_directory(path: Path, descriptor: int) -> None:
+    _check_pinned_root()
     opened = os.fstat(descriptor)
     current = path.stat(follow_symlinks=False)
     if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
@@ -29,6 +58,7 @@ def _check_directory(path: Path, descriptor: int) -> None:
 
 def _open_directory(path: Path) -> int:
     """Walk from the filesystem root without following any symlink component."""
+    _check_pinned_root()
     absolute = path.absolute()
     descriptor = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -46,6 +76,7 @@ def _open_directory(path: Path) -> int:
             )
             os.close(descriptor)
             descriptor = child
+        _check_pinned_root()
         return descriptor
     except BaseException:
         os.close(descriptor)
