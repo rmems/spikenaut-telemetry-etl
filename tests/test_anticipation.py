@@ -1015,6 +1015,47 @@ def test_session_source_output_overlap_preserves_files(
     assert sentinel.read_text() == "source sentinel"
 
 
+@pytest.mark.parametrize(
+    ("source_name", "artifact_name"),
+    [
+        ("gpu_telemetry_v2_batch_0.parquet", "manifest.json"),
+        ("session_manifest.json", "quality-report.json"),
+    ],
+)
+def test_source_renamed_to_root_artifact_before_pin_is_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_name: str,
+    artifact_name: str,
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    session = tmp_path / "session-01"
+    source = session / source_name
+    source_bytes = source.read_bytes()
+    output = tmp_path / "out"
+    output.mkdir()
+    original = anticipation.ensure_directory
+    moved = False
+
+    def move_before_pin(path: Path) -> None:
+        nonlocal moved
+        if not moved and path == output:
+            moved = True
+            source.rename(output / artifact_name)
+        original(path)
+
+    monkeypatch.setattr(anticipation, "ensure_directory", move_before_pin)
+    with pytest.raises(PreparationError):
+        prepare_campaign(campaign, output)
+    assert (output / artifact_name).read_bytes() == source_bytes
+    evidence_name = (
+        "quality-report.json"
+        if artifact_name != "quality-report.json"
+        else "manifest.json"
+    )
+    assert json.loads((output / evidence_name).read_text())["status"] == "incomplete"
+
+
 def test_replacement_invalidates_prior_completion_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

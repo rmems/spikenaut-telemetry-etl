@@ -938,8 +938,10 @@ def test_audit_publication_does_not_follow_replacement_links(
     sentinel.write_text("source sentinel")
     original = audit_module._clean_owned_outputs
 
-    def replace_after_cleanup(root: Path) -> None:
-        original(root)
+    def replace_after_cleanup(
+        root: Path, source_identities: set[tuple[int, int]] | None = None
+    ) -> None:
+        original(root, source_identities)
         destination = root / "manifest.json"
         if link_kind == "symlink":
             destination.symlink_to(sentinel)
@@ -1040,8 +1042,10 @@ def test_parquet_publication_replaces_links(
     sentinel.write_bytes(b"preserve source bytes")
     original = audit_module._clean_owned_outputs
 
-    def replace_after_cleanup(root: Path) -> None:
-        original(root)
+    def replace_after_cleanup(
+        root: Path, source_identities: set[tuple[int, int]] | None = None
+    ) -> None:
+        original(root, source_identities)
         destination = root / artifact
         destination.parent.mkdir(parents=True, exist_ok=True)
         if link_kind == "symlink":
@@ -1065,9 +1069,11 @@ def test_publication_rejects_replaced_view_directory(
     original = audit_module._clean_owned_outputs
     replaced = False
 
-    def swap_after_cleanup(root: Path) -> None:
+    def swap_after_cleanup(
+        root: Path, source_identities: set[tuple[int, int]] | None = None
+    ) -> None:
         nonlocal replaced
-        original(root)
+        original(root, source_identities)
         if not replaced:
             view = root / "v3-forecast-eligible-v1"
             if view.exists():
@@ -1239,9 +1245,7 @@ def test_action_proposal_types_match_published_schema(tmp_path: Path, name: str)
 
 
 @pytest.mark.parametrize("mutation", ["order", "nullability"])
-def test_action_proposals_require_canonical_schema(
-    tmp_path: Path, mutation: str
-) -> None:
+def test_action_proposals_require_canonical_schema(tmp_path: Path, mutation: str) -> None:
     source = tmp_path / "source"
     _write_corpus(source)
     path = source / "v3/action_proposals/train-00000.parquet"
@@ -1373,9 +1377,11 @@ def test_output_identity_survives_cleanup_handoff(
     original = audit_module._clean_owned_outputs
     swapped = False
 
-    def move_source_after_cleanup(path: Path) -> None:
+    def move_source_after_cleanup(
+        path: Path, source_identities: set[tuple[int, int]] | None = None
+    ) -> None:
         nonlocal swapped
-        original(path)
+        original(path, source_identities)
         if not swapped:
             swapped = True
             output.rename(tmp_path / "detached")
@@ -1486,6 +1492,36 @@ def test_source_links_into_output_are_preserved(
         audit_v3(source, output)
     assert {path: path.read_bytes() for path in before} == before
     assert not (output / "manifest.json").exists()
+
+
+@pytest.mark.parametrize("config", ["state_telemetry", "outcomes", "action_proposals"])
+def test_source_shard_renamed_to_root_artifact_before_pin_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: str
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    shard = source / "v3" / config / "train-00000.parquet"
+    source_bytes = shard.read_bytes()
+    output = tmp_path / "audit"
+    output.mkdir()
+    artifact = output / "manifest.json"
+    original = audit_module._guard_output_path
+    calls = 0
+
+    def move_before_post_pin_guard(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            shard.rename(artifact)
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(audit_module, "_guard_output_path", move_before_post_pin_guard)
+    with pytest.raises(AuditError):
+        audit_v3(source, output)
+    assert artifact.read_bytes() == source_bytes
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
 
 
 def test_invalid_corpus_preserves_linked_source_in_output(tmp_path: Path) -> None:

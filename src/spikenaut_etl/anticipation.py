@@ -729,9 +729,20 @@ def _campaign_assignments(campaign: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _source_owned_root_artifacts(
-    campaign_path: Path, output_dir: Path, campaign_bytes: bytes
+    campaign_path: Path,
+    output_dir: Path,
+    campaign_bytes: bytes,
+    source_identities: set[tuple[int, int]],
 ) -> set[str]:
     protected: set[str] = set()
+    for name in ("prepared.json", "quality-report.json", "manifest.json"):
+        artifact = output_dir / name
+        try:
+            metadata = artifact.stat()
+        except OSError:
+            continue
+        if (metadata.st_dev, metadata.st_ino) in source_identities:
+            protected.add(name)
     for item in _assignments(campaign_bytes):
         raw_path = item.get("path")
         if not isinstance(raw_path, str) or not raw_path:
@@ -741,7 +752,7 @@ def _source_owned_root_artifacts(
             session_path = campaign_path.parent / session_path
         try:
             session_path = session_path.resolve(strict=True)
-        except (OSError, RuntimeError, UnicodeError, ValueError):
+        except OSError, RuntimeError, UnicodeError, ValueError:
             continue
         sources = (
             session_path / "session_manifest.json",
@@ -750,14 +761,14 @@ def _source_owned_root_artifacts(
         for source in sources:
             try:
                 source_identity = source.resolve(strict=True)
-            except (OSError, RuntimeError, UnicodeError, ValueError):
+            except OSError, RuntimeError, UnicodeError, ValueError:
                 continue
             for name in ("prepared.json", "quality-report.json", "manifest.json"):
                 artifact = output_dir / name
                 try:
                     if artifact.resolve(strict=True) == source_identity:
                         protected.add(name)
-                except (OSError, RuntimeError, UnicodeError):
+                except OSError, RuntimeError, UnicodeError:
                     continue
     return protected
 
@@ -779,7 +790,10 @@ def _remove_owned_preparation_outputs(output_dir: Path, protected: set[str]) -> 
 
 
 def _guard_assigned_sources(
-    campaign_path: Path, output_dir: Path, campaign_bytes: bytes
+    campaign_path: Path,
+    output_dir: Path,
+    campaign_bytes: bytes,
+    source_identities: set[tuple[int, int]] | None = None,
 ) -> PreparationError | None:
     resolution_error: PreparationError | None = None
     for item in _assignments(campaign_bytes):
@@ -823,6 +837,12 @@ def _guard_assigned_sources(
                 raise PreparationError(
                     f"output directory overlaps session source file: {source}"
                 )
+            if source_identities is not None:
+                try:
+                    metadata = resolved.stat()
+                except OSError:
+                    continue
+                source_identities.add((metadata.st_dev, metadata.st_ino))
     return resolution_error
 
 
@@ -910,7 +930,10 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
         campaign_read_error = PreparationError(
             f"cannot read campaign {campaign_path}: {exc}"
         )
-    source_error = _guard_assigned_sources(campaign_path, output_dir, campaign_bytes)
+    source_identities: set[tuple[int, int]] = set()
+    source_error = _guard_assigned_sources(
+        campaign_path, output_dir, campaign_bytes, source_identities
+    )
     resolution_error = resolution_error or source_error
     ensure_directory(output_dir)
     with pinned_publication(output_dir, initial_identity):
@@ -918,7 +941,7 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
         try:
             # Repeat resolved overlap checks after pinning and before any cleanup.
             source_error = _guard_assigned_sources(
-                campaign_path, output_dir, campaign_bytes
+                campaign_path, output_dir, campaign_bytes, source_identities
             )
             resolution_error = resolution_error or source_error
             if resolution_error is not None:
@@ -927,6 +950,14 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
                 raise campaign_resolution_error
             if campaign_read_error is not None:
                 raise campaign_read_error
+            protected_sources = _source_owned_root_artifacts(
+                campaign_path, output_dir, campaign_bytes, source_identities
+            )
+            if protected_sources:
+                name = min(protected_sources)
+                raise PreparationError(
+                    f"output artifact contains retained session source: {name}"
+                )
             staging_symlinks = [path for path in output_paths if path.is_symlink()]
             if staging_symlinks:
                 raise PreparationError(
@@ -998,7 +1029,7 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             }
             try:
                 protected = _source_owned_root_artifacts(
-                    campaign_path, output_dir, campaign_bytes
+                    campaign_path, output_dir, campaign_bytes, source_identities
                 )
                 _remove_owned_preparation_outputs(output_dir, protected)
                 if "quality-report.json" not in protected:

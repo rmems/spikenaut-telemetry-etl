@@ -342,9 +342,7 @@ def _load_actions(
                 or table.schema.field(field.name).type != field.type
             ):
                 raise AuditError(f"action proposal field type mismatch: {field.name}")
-        canonical_schema = table.schema.equals(
-            PROPOSALS_SCHEMA, check_metadata=False
-        )
+        canonical_schema = table.schema.equals(PROPOSALS_SCHEMA, check_metadata=False)
         _require_columns(
             table,
             (
@@ -392,6 +390,7 @@ def _guard_output_path(
     v3_root: Path,
     output_root: Path,
     source_is_dataset_root: bool,
+    source_identities: set[tuple[int, int]] | None = None,
 ) -> None:
     resolved_v3 = v3_root.resolve()
     overlaps = (
@@ -406,10 +405,14 @@ def _guard_output_path(
     )
     if overlaps:
         raise AuditError(f"output directory would overlap source corpus: {output_root}")
-    _guard_source_members(v3_root, output_root)
+    _guard_source_members(v3_root, output_root, source_identities)
 
 
-def _guard_source_members(v3_root: Path, output_root: Path) -> None:
+def _guard_source_members(
+    v3_root: Path,
+    output_root: Path,
+    source_identities: set[tuple[int, int]] | None = None,
+) -> None:
     for config in ("state_telemetry", "outcomes", "action_proposals"):
         directory = v3_root / config
         for source in (directory, *directory.glob(SHARD_GLOB)):
@@ -423,16 +426,77 @@ def _guard_source_members(v3_root: Path, output_root: Path) -> None:
                 raise AuditError(
                     f"output directory would overlap source member: {source}"
                 )
+            if source_identities is not None:
+                try:
+                    metadata = resolved.stat()
+                except OSError:
+                    continue
+                source_identities.add((metadata.st_dev, metadata.st_ino))
 
 
-def _clean_owned_outputs(output_root: Path) -> None:
+def _matches_source_identity(path: Path, source_identities: set[tuple[int, int]]) -> bool:
     try:
+        metadata = path.stat()
+    except OSError:
+        return False
+    return (metadata.st_dev, metadata.st_ino) in source_identities
+
+
+def _clean_root_evidence(
+    output_root: Path, source_identities: set[tuple[int, int]]
+) -> None:
+    names = ("manifest.json", "audit-report.json", "exclusions.parquet")
+    clean_artifacts(
+        output_root,
+        tuple(
+            name
+            for name in names
+            if not _matches_source_identity(output_root / name, source_identities)
+        ),
+    )
+
+
+def _clean_owned_outputs(
+    output_root: Path, source_identities: set[tuple[int, int]] | None = None
+) -> None:
+    retained = source_identities or set()
+    try:
+        root_outputs = (
+            output_root / "manifest.json",
+            output_root / "audit-report.json",
+            output_root / "exclusions.parquet",
+        )
+        protected = next(
+            (path for path in root_outputs if _matches_source_identity(path, retained)),
+            None,
+        )
+        if protected is not None:
+            raise AuditError(
+                f"audit output contains retained source identity: {protected}"
+            )
+        view_root = output_root / VIEW_ID
+        if _matches_source_identity(view_root, retained):
+            raise AuditError(
+                f"audit output contains retained source identity: {view_root}"
+            )
+        if view_root.is_symlink():
+            raise AuditError(f"audit view directory must not be a symlink: {view_root}")
+        if view_root.exists():
+            protected = next(
+                (
+                    path
+                    for path in view_root.rglob(SHARD_GLOB)
+                    if _matches_source_identity(path, retained)
+                ),
+                None,
+            )
+            if protected is not None:
+                raise AuditError(
+                    f"audit output contains retained source identity: {protected}"
+                )
         clean_artifacts(
             output_root, ("manifest.json", "audit-report.json", "exclusions.parquet")
         )
-        view_root = output_root / VIEW_ID
-        if view_root.is_symlink():
-            raise AuditError(f"audit view directory must not be a symlink: {view_root}")
         if view_root.exists():
             clean_artifacts(view_root)
     except OSError as exc:
@@ -905,6 +969,7 @@ def _write_incomplete_evidence(
     dataset_root: Path | None,
     v3_root: Path | None,
     source_git_commit: str | None = None,
+    source_identities: set[tuple[int, int]] | None = None,
 ) -> None:
     failure = {"category": "structural_integrity", "reason": str(error)}
     incomplete_report = {
@@ -934,8 +999,13 @@ def _write_incomplete_evidence(
         incomplete_manifest["source_git_commit"] = _retained_revision(
             dataset_root, v3_root, output_root, source_git_commit
         )
-    write_json(output_root / "audit-report.json", incomplete_report)
-    write_json(output_root / "manifest.json", incomplete_manifest)
+    retained = source_identities or set()
+    report_path = output_root / "audit-report.json"
+    manifest_path = output_root / "manifest.json"
+    if not _matches_source_identity(report_path, retained):
+        write_json(report_path, incomplete_report)
+    if not _matches_source_identity(manifest_path, retained):
+        write_json(manifest_path, incomplete_manifest)
 
 
 def _guard_supplied_source(source_path: Path, output_root: Path) -> None:
@@ -959,7 +1029,11 @@ def _guard_supplied_source(source_path: Path, output_root: Path) -> None:
 
 
 def _pin_audit_view(
-    output_root: Path, dataset_root: Path, v3_root: Path, source_git_commit: str | None
+    output_root: Path,
+    dataset_root: Path,
+    v3_root: Path,
+    source_git_commit: str | None,
+    source_identities: set[tuple[int, int]],
 ) -> None:
     try:
         view_root = output_root / VIEW_ID
@@ -968,11 +1042,14 @@ def _pin_audit_view(
         pin_directory(view_root)
     except OSError as exc:
         error = AuditError(f"cannot safely pin audit view: {exc}")
-        clean_artifacts(
-            output_root, ("manifest.json", "audit-report.json", "exclusions.parquet")
-        )
+        _clean_root_evidence(output_root, source_identities)
         _write_incomplete_evidence(
-            output_root, error, dataset_root, v3_root, source_git_commit
+            output_root,
+            error,
+            dataset_root,
+            v3_root,
+            source_git_commit,
+            source_identities,
         )
         raise error from exc
 
@@ -992,6 +1069,7 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
     except (RuntimeError, UnicodeError) as exc:
         raise AuditError(f"cannot resolve output path: {output_dir!r}") from exc
     initial_identity = directory_identity(output_root) if output_root.is_dir() else None
+    source_identities: set[tuple[int, int]] = set()
     try:
         dataset_root, v3_root, source_is_dataset_root = _source_root(source_path)
     except AuditError as exc:
@@ -1008,32 +1086,52 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
 
         raise
 
-    _guard_output_path(dataset_root, v3_root, output_root, source_is_dataset_root)
+    _guard_output_path(
+        dataset_root,
+        v3_root,
+        output_root,
+        source_is_dataset_root,
+        source_identities,
+    )
     source_git_commit = _git_head(dataset_root, output_root)
     with pinned_publication(output_root, initial_identity):
         _guard_output_path(
-            dataset_root.resolve(), v3_root.resolve(), output_root, source_is_dataset_root
+            dataset_root.resolve(),
+            v3_root.resolve(),
+            output_root,
+            source_is_dataset_root,
+            source_identities,
         )
-        _pin_audit_view(output_root, dataset_root, v3_root, source_git_commit)
+        _pin_audit_view(
+            output_root,
+            dataset_root,
+            v3_root,
+            source_git_commit,
+            source_identities,
+        )
         try:
             _guard_output_path(
                 dataset_root.resolve(),
                 v3_root.resolve(),
                 output_root,
                 source_is_dataset_root,
+                source_identities,
             )
         except AuditError as exc:
             # A substituted view may now hold source shards. Only replace root evidence.
-            clean_artifacts(
-                output_root, ("manifest.json", "audit-report.json", "exclusions.parquet")
-            )
+            _clean_root_evidence(output_root, source_identities)
             _write_incomplete_evidence(
-                output_root, exc, dataset_root, v3_root, source_git_commit
+                output_root,
+                exc,
+                dataset_root,
+                v3_root,
+                source_git_commit,
+                source_identities,
             )
             raise
         try:
             ensure_directory(output_root)
-            _clean_owned_outputs(output_root)
+            _clean_owned_outputs(output_root, source_identities)
             return _audit_v3_impl(dataset_root, v3_root, output_root, source_git_commit)
         except (AuditError, OSError, pa.ArrowException) as raw_error:
             audit_error = (
@@ -1042,14 +1140,19 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
                 else AuditError(f"cannot write audit outputs: {raw_error}")
             )
             try:
-                _clean_owned_outputs(output_root)
+                _clean_owned_outputs(output_root, source_identities)
             except AuditError:
                 # Preserve an unsafe view symlink without following it; the JSON
                 # evidence files live directly under the already-guarded root.
                 pass
             try:
                 _write_incomplete_evidence(
-                    output_root, audit_error, dataset_root, v3_root, source_git_commit
+                    output_root,
+                    audit_error,
+                    dataset_root,
+                    v3_root,
+                    source_git_commit,
+                    source_identities,
                 )
             except OSError as publication_error:
                 # A replaced output root is no longer ours, even for error evidence.
