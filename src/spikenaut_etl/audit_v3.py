@@ -831,6 +831,7 @@ class _AuditSources:
     v3_root: Path
     hashes: dict[str, str]
     git_commit: str | None
+    identities: set[tuple[int, int]]
 
 
 @dataclass(frozen=True)
@@ -845,6 +846,13 @@ def _verify_audit_directory(path: Path, identity: tuple[int, int]) -> None:
         raise AuditError("publication directory changed during audit")
 
 
+def _guard_publication_destination(
+    path: Path, source_identities: set[tuple[int, int]]
+) -> None:
+    if _matches_source_identity(path, source_identities):
+        raise AuditError(f"output artifact contains retained source identity: {path}")
+
+
 def _publish_audit(
     sources: _AuditSources,
     outputs: _AuditOutputs,
@@ -853,6 +861,7 @@ def _publish_audit(
 ) -> None:
     dataset_root, v3_root = sources.dataset_root, sources.v3_root
     source_hashes, source_git_commit = sources.hashes, sources.git_commit
+    source_identities = sources.identities
     report, eligible_tables = outputs.report, outputs.eligible_tables
     exclusion_rows = outputs.exclusions
     final_source_hashes = _available_source_hashes(dataset_root, v3_root)
@@ -861,10 +870,14 @@ def _publish_audit(
     _guard_output_path(dataset_root.resolve(), v3_root.resolve(), output_root, False)
     ensure_directory(output_root)
     view_root = output_root / VIEW_ID
+    _guard_publication_destination(view_root, source_identities)
     ensure_directory(view_root)
+    _guard_publication_destination(view_root, source_identities)
     view_identity = directory_identity(view_root)
     for split, table in eligible_tables.items():
-        write_parquet(view_root / f"{split}-00000.parquet", table)
+        path = view_root / f"{split}-00000.parquet"
+        _guard_publication_destination(path, source_identities)
+        write_parquet(path, table)
     exclusion_schema = pa.schema(
         [
             pa.field("source_split", pa.string()),
@@ -874,9 +887,10 @@ def _publish_audit(
             pa.field("reasons", pa.list_(pa.string())),
         ]
     )
+    exclusions_path = output_root / EXCLUSIONS_NAME
+    _guard_publication_destination(exclusions_path, source_identities)
     write_parquet(
-        output_root / EXCLUSIONS_NAME,
-        pa.Table.from_pylist(exclusion_rows, schema=exclusion_schema),
+        exclusions_path, pa.Table.from_pylist(exclusion_rows, schema=exclusion_schema)
     )
     manifest: dict[str, Any] = {
         "status": "complete",
@@ -893,7 +907,9 @@ def _publish_audit(
         }
         | {EXCLUSIONS_NAME: _sha256(output_root / EXCLUSIONS_NAME)},
     }
-    write_json(output_root / AUDIT_REPORT_NAME, report.to_dict())
+    report_path = output_root / AUDIT_REPORT_NAME
+    _guard_publication_destination(report_path, source_identities)
+    write_json(report_path, report.to_dict())
     _verify_audit_directory(output_root, publication_identity)
     manifest["outputs"][AUDIT_REPORT_NAME] = _sha256(output_root / AUDIT_REPORT_NAME)
     manifest["source_git_commit"] = _retained_revision(
@@ -905,13 +921,19 @@ def _publish_audit(
         raise AuditError("source shards changed during publication")
     _verify_audit_directory(output_root, publication_identity)
     _check_output_snapshot(output_root, view_root, manifest["outputs"])
-    write_json(output_root / MANIFEST_NAME, manifest)
+    manifest_path = output_root / MANIFEST_NAME
+    _guard_publication_destination(manifest_path, source_identities)
+    write_json(manifest_path, manifest)
     _verify_audit_directory(output_root, publication_identity)
     _verify_audit_directory(view_root, view_identity)
 
 
 def _audit_v3_impl(
-    dataset_root: Path, v3_root: Path, output_root: Path, source_git_commit: str | None
+    dataset_root: Path,
+    v3_root: Path,
+    output_root: Path,
+    source_git_commit: str | None,
+    source_identities: set[tuple[int, int]],
 ) -> AuditReport:
     publication_identity = directory_identity(output_root)
     source_hashes = _available_source_hashes(dataset_root, v3_root)
@@ -952,7 +974,13 @@ def _audit_v3_impl(
         integrity=integrity,
     )
     _publish_audit(
-        _AuditSources(dataset_root, v3_root, source_hashes, source_git_commit),
+        _AuditSources(
+            dataset_root,
+            v3_root,
+            source_hashes,
+            source_git_commit,
+            source_identities,
+        ),
         _AuditOutputs(report, eligible_tables, exclusion_rows),
         output_root,
         publication_identity,
@@ -1141,7 +1169,13 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
         try:
             ensure_directory(output_root)
             _clean_owned_outputs(output_root, source_identities)
-            return _audit_v3_impl(dataset_root, v3_root, output_root, source_git_commit)
+            return _audit_v3_impl(
+                dataset_root,
+                v3_root,
+                output_root,
+                source_git_commit,
+                source_identities,
+            )
         except (AuditError, OSError, pa.ArrowException) as raw_error:
             audit_error = (
                 raw_error

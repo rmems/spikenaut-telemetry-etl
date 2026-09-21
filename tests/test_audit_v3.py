@@ -1082,7 +1082,9 @@ def test_publication_rejects_replaced_view_directory(
             replaced = True
 
     monkeypatch.setattr(audit_module, "_clean_owned_outputs", swap_after_cleanup)
-    with pytest.raises(AuditError, match="cannot write audit outputs"):
+    with pytest.raises(
+        AuditError, match="cannot write audit outputs|retained source identity"
+    ):
         audit_v3(source, output)
     assert {p.name: p.read_bytes() for p in target.glob("*.parquet")} == before
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
@@ -1522,6 +1524,43 @@ def test_source_shard_renamed_to_root_artifact_before_pin_is_preserved(
     assert (
         json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
     )
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "snapshot_call"),
+    [
+        (audit_module.EXCLUSIONS_NAME, 2),
+        (audit_module.AUDIT_REPORT_NAME, 2),
+        (audit_module.MANIFEST_NAME, 3),
+    ],
+)
+def test_root_publication_preserves_source_renamed_after_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_name: str,
+    snapshot_call: int,
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    shard = source / "v3/action_proposals/train-00000.parquet"
+    source_bytes = shard.read_bytes()
+    output = tmp_path / "audit"
+    artifact = output / artifact_name
+    original = audit_module._available_source_hashes
+    calls = 0
+
+    def move_after_snapshot(*args: object, **kwargs: object) -> dict[str, str]:
+        nonlocal calls
+        hashes = original(*args, **kwargs)
+        calls += 1
+        if calls == snapshot_call:
+            shard.rename(artifact)
+        return hashes
+
+    monkeypatch.setattr(audit_module, "_available_source_hashes", move_after_snapshot)
+    with pytest.raises(AuditError):
+        audit_v3(source, output)
+    assert artifact.read_bytes() == source_bytes
 
 
 def test_invalid_corpus_preserves_linked_source_in_output(tmp_path: Path) -> None:
