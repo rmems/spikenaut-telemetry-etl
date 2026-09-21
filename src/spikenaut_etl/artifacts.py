@@ -148,7 +148,7 @@ def retain_regular_artifact(path: Path) -> Iterator[RetainedArtifact]:
         _check_directory(path.parent, directory)
         descriptor = os.open(
             path.name,
-            os.O_RDONLY | os.O_NOFOLLOW,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
             dir_fd=directory,
         )
         retained = RetainedArtifact(path, directory, descriptor)

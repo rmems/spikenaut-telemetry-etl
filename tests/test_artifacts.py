@@ -1,8 +1,11 @@
 """Artifact publication rejects substituted ancestor directories."""
 
+import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
 import pytest
 
-from spikenaut_etl.artifacts import write_json
+from spikenaut_etl.artifacts import retain_regular_artifact, write_json
 
 
 def test_ancestor_symlink_cannot_redirect_publication(tmp_path):
@@ -13,6 +16,30 @@ def test_ancestor_symlink_cannot_redirect_publication(tmp_path):
     with pytest.raises(OSError):
         write_json(ancestor / "nested" / "manifest.json", {"complete": True})
     assert list(destination.iterdir()) == []
+
+
+def test_retained_artifact_rejects_fifo_without_blocking(tmp_path):
+    fifo = tmp_path / "artifact.json"
+    os.mkfifo(fifo)
+
+    def retain() -> None:
+        with retain_regular_artifact(fifo):
+            pass
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(retain)
+        try:
+            future.result(timeout=0.5)
+        except TimeoutError:
+            writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer)
+            with pytest.raises(OSError):
+                future.result(timeout=1)
+            pytest.fail("retaining a FIFO blocked while waiting for a writer")
+        except OSError:
+            pass
+        else:
+            pytest.fail("retaining a FIFO unexpectedly succeeded")
 
 
 def test_cleanup_keeps_pinned_directory_when_path_is_replaced(tmp_path, monkeypatch):

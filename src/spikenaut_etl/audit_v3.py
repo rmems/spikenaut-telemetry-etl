@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 from collections import Counter
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,12 +18,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .artifacts import (
+    RetainedArtifact,
     clean_artifacts,
     directory_identity,
     ensure_directory,
     no_replace_publication,
     pin_directory,
     pinned_publication,
+    retain_regular_artifact,
     write_json,
     write_parquet,
 )
@@ -898,40 +901,53 @@ def _publish_audit(
     write_parquet(
         exclusions_path, pa.Table.from_pylist(exclusion_rows, schema=exclusion_schema)
     )
-    manifest: dict[str, Any] = {
-        "status": "complete",
-        "audit_version": AUDIT_VERSION,
-        "view_id": VIEW_ID,
-        "horizon_samples": HORIZON_SAMPLES,
-        "source_git_commit": source_git_commit,
-        "source_files": dict(sorted(source_hashes.items())),
-        "outputs": {
-            f"{VIEW_ID}/{split}-00000.parquet": _sha256(
-                view_root / f"{split}-00000.parquet"
-            )
-            for split in SPLITS
-        }
-        | {EXCLUSIONS_NAME: _sha256(output_root / EXCLUSIONS_NAME)},
-    }
     report_path = output_root / AUDIT_REPORT_NAME
     _guard_publication_destination(report_path, source_identities)
     write_json(report_path, report.to_dict())
     _verify_audit_directory(output_root, publication_identity)
-    manifest["outputs"][AUDIT_REPORT_NAME] = _sha256(output_root / AUDIT_REPORT_NAME)
-    manifest["source_git_commit"] = _retained_revision(
-        dataset_root, v3_root, output_root, source_git_commit
-    )
-    _verify_audit_directory(output_root, publication_identity)
-    _verify_audit_directory(view_root, view_identity)
-    if _available_source_hashes(dataset_root, v3_root) != source_hashes:
-        raise AuditError("source shards changed during publication")
-    _verify_audit_directory(output_root, publication_identity)
-    _check_output_snapshot(output_root, view_root, manifest["outputs"])
-    manifest_path = output_root / MANIFEST_NAME
-    _guard_publication_destination(manifest_path, source_identities)
-    write_json(manifest_path, manifest)
-    _verify_audit_directory(output_root, publication_identity)
-    _verify_audit_directory(view_root, view_identity)
+    artifact_paths = {
+        f"{VIEW_ID}/{split}-00000.parquet": view_root / f"{split}-00000.parquet"
+        for split in SPLITS
+    } | {
+        EXCLUSIONS_NAME: exclusions_path,
+        AUDIT_REPORT_NAME: report_path,
+    }
+    with ExitStack() as retained:
+        try:
+            retained_outputs = {
+                name: retained.enter_context(retain_regular_artifact(path))
+                for name, path in artifact_paths.items()
+            }
+        except OSError as exc:
+            raise AuditError("output artifacts changed during publication") from exc
+        output_hashes = _retained_output_hashes(retained_outputs)
+        manifest: dict[str, Any] = {
+            "status": "complete",
+            "audit_version": AUDIT_VERSION,
+            "view_id": VIEW_ID,
+            "horizon_samples": HORIZON_SAMPLES,
+            "source_git_commit": _retained_revision(
+                dataset_root, v3_root, output_root, source_git_commit
+            ),
+            "source_files": dict(sorted(source_hashes.items())),
+            "outputs": output_hashes,
+        }
+        _verify_audit_directory(output_root, publication_identity)
+        _verify_audit_directory(view_root, view_identity)
+        if _available_source_hashes(dataset_root, v3_root) != source_hashes:
+            raise AuditError("source shards changed during publication")
+        _verify_audit_directory(output_root, publication_identity)
+        _check_output_snapshot(
+            output_root, view_root, manifest["outputs"], retained_outputs
+        )
+        manifest_path = output_root / MANIFEST_NAME
+        _guard_publication_destination(manifest_path, source_identities)
+        write_json(manifest_path, manifest)
+        _verify_audit_directory(output_root, publication_identity)
+        _verify_audit_directory(view_root, view_identity)
+        _check_output_snapshot(
+            output_root, view_root, manifest["outputs"], retained_outputs
+        )
 
 
 def _audit_v3_impl(
@@ -994,13 +1010,28 @@ def _audit_v3_impl(
     return report
 
 
+def _retained_output_hashes(
+    retained: dict[str, RetainedArtifact],
+) -> dict[str, str]:
+    try:
+        return {name: artifact.sha256() for name, artifact in retained.items()}
+    except OSError as exc:
+        raise AuditError("output artifacts changed during publication") from exc
+
+
 def _check_output_snapshot(
-    output_root: Path, view_root: Path, expected: dict[str, str]
+    output_root: Path,
+    view_root: Path,
+    expected: dict[str, str],
+    retained: dict[str, RetainedArtifact],
 ) -> None:
     names = {f"{split}-00000.parquet" for split in SPLITS}
     if {path.name for path in view_root.glob(SHARD_GLOB)} != names:
         raise AuditError("output shard membership changed during publication")
-    if any(_sha256(output_root / name) != digest for name, digest in expected.items()):
+    if (
+        retained.keys() != expected.keys()
+        or _retained_output_hashes(retained) != expected
+    ):
         raise AuditError("output artifacts changed during publication")
     if {path.name for path in view_root.glob(SHARD_GLOB)} != names:
         raise AuditError("output shard membership changed during publication")

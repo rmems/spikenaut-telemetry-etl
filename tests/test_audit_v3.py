@@ -1313,6 +1313,42 @@ def test_audit_output_generation_cannot_change_at_manifest_publication(
 
 
 @pytest.mark.parametrize(
+    "relative_name",
+    [
+        audit_module.AUDIT_REPORT_NAME,
+        audit_module.EXCLUSIONS_NAME,
+        f"{audit_module.VIEW_ID}/train-00000.parquet",
+    ],
+)
+def test_audit_artifacts_retained_through_manifest_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_name: str,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original = audit_module.write_json
+    replaced = False
+
+    def replace_after_manifest(path: Path, value: object) -> None:
+        nonlocal replaced
+        original(path, value)
+        if path.name == audit_module.MANIFEST_NAME and not replaced:
+            replaced = True
+            artifact = output / relative_name
+            replacement = tmp_path / f"replacement-{artifact.name}"
+            replacement.write_bytes(artifact.read_bytes())
+            replacement.replace(artifact)
+
+    monkeypatch.setattr(audit_module, "write_json", replace_after_manifest)
+    with pytest.raises(AuditError, match="output artifacts changed"):
+        audit_v3(source, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
     "name", ["proposed_action", "teacher_action", "label_confidence"]
 )
 def test_action_proposal_types_match_published_schema(tmp_path: Path, name: str) -> None:
