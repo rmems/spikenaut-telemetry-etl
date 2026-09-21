@@ -1125,6 +1125,52 @@ def test_late_view_replacement_republishes_incomplete_root_evidence(
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
+def test_root_cleanup_preserves_source_moved_after_identity_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    shard = source / "v3/action_proposals/train-00000.parquet"
+    source_bytes = shard.read_bytes()
+    artifact = output / audit_module.AUDIT_REPORT_NAME
+    source_view = source / "v3/state_telemetry"
+    original_snapshot = audit_module._check_output_snapshot
+    original_clean = audit_module.clean_artifacts
+    replaced = False
+    moved = False
+
+    def replace_view_after_report(*args: object, **kwargs: object) -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            view = output / audit_module.VIEW_ID
+            view.rename(tmp_path / "detached-view")
+            view.symlink_to(source_view, target_is_directory=True)
+        original_snapshot(*args, **kwargs)
+
+    def move_source_before_root_cleanup(
+        path: Path, names: tuple[str, ...] | None = None, **kwargs: object
+    ) -> None:
+        nonlocal moved
+        if (
+            names == audit_module.ROOT_ARTIFACT_NAMES
+            and (output / audit_module.VIEW_ID).is_symlink()
+            and not moved
+        ):
+            moved = True
+            shard.rename(artifact)
+        original_clean(path, names, **kwargs)
+
+    monkeypatch.setattr(audit_module, "_check_output_snapshot", replace_view_after_report)
+    monkeypatch.setattr(audit_module, "clean_artifacts", move_source_before_root_cleanup)
+
+    with pytest.raises(AuditError):
+        audit_v3(source, output)
+    assert artifact.read_bytes() == source_bytes
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
 def test_source_change_during_publication_prevents_complete_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -86,6 +86,7 @@ def test_publication_syncs_file_before_install_and_directory_after(
     from spikenaut_etl import artifacts
 
     output = tmp_path / "output"
+    output.mkdir()
     artifact = output / "manifest.json"
     events = []
     original_fsync = artifacts.os.fsync
@@ -115,3 +116,28 @@ def test_publication_syncs_file_before_install_and_directory_after(
         write_json(artifact, {"complete": True})
 
     assert events == ["fsync", "publish", "fsync"]
+
+
+def test_directory_creation_syncs_each_parent(tmp_path, monkeypatch):
+    from spikenaut_etl import artifacts
+
+    events = []
+    original_fsync = artifacts.os.fsync
+    original_mkdir = artifacts.os.mkdir
+
+    def record_fsync(descriptor):
+        events.append("fsync")
+        original_fsync(descriptor)
+
+    def record_mkdir(name, *args, **kwargs):
+        original_mkdir(name, *args, **kwargs)
+        events.append(f"mkdir:{name}")
+
+    monkeypatch.setattr(artifacts.os, "fsync", record_fsync)
+    monkeypatch.setattr(artifacts.os, "mkdir", record_mkdir)
+
+    write_json(tmp_path / "output" / "nested" / "manifest.json", {"complete": True})
+
+    created = [index for index, event in enumerate(events) if event.startswith("mkdir:")]
+    assert [events[index] for index in created] == ["mkdir:output", "mkdir:nested"]
+    assert all(events[index + 1] == "fsync" for index in created)

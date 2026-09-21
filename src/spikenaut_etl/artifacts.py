@@ -111,10 +111,14 @@ def _open_directory(path: Path) -> int:
         for component in absolute.parts[1:]:
             if component == "..":
                 raise OSError("parent traversal is not allowed for artifact paths")
+            created = False
             try:
                 os.mkdir(component, dir_fd=descriptor)
+                created = True
             except FileExistsError:
                 pass
+            if created:
+                os.fsync(descriptor)
             child = os.open(
                 component,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -183,7 +187,12 @@ def write_parquet(path: Path, table: pa.Table) -> None:
         pq.write_table(table, stream)
 
 
-def clean_artifacts(path: Path, names: tuple[str, ...] | None = None) -> None:
+def clean_artifacts(
+    path: Path,
+    names: tuple[str, ...] | None = None,
+    *,
+    protected_identities: set[tuple[int, int]] | None = None,
+) -> None:
     """Delete owned files relative to a pinned directory, never through symlinks."""
     if names is not None and any(
         not name or name in {".", ".."} or Path(name).name != name or "\x00" in name
@@ -193,13 +202,54 @@ def clean_artifacts(path: Path, names: tuple[str, ...] | None = None) -> None:
     directory = _open_directory(path)
     try:
         _check_directory(path, directory)
-        _clean_entries(directory, names)
+        _clean_entries(directory, names, protected_identities or set())
         _check_directory(path, directory)
     finally:
         os.close(directory)
 
 
-def _clean_entries(directory: int, names: tuple[str, ...] | None) -> None:
+def _clean_file(
+    directory: int,
+    name: str,
+    protected_identities: set[tuple[int, int]],
+) -> None:
+    if not protected_identities:
+        os.unlink(name, dir_fd=directory)
+        return
+    temporary = ".artifact-cleanup-" + secrets.token_hex(16) + ".tmp"
+    try:
+        os.rename(name, temporary, src_dir_fd=directory, dst_dir_fd=directory)
+    except FileNotFoundError:
+        return
+    metadata = os.stat(temporary, dir_fd=directory, follow_symlinks=False)
+    if (
+        stat.S_ISREG(metadata.st_mode)
+        and (
+            metadata.st_dev,
+            metadata.st_ino,
+        )
+        in protected_identities
+    ):
+        try:
+            os.link(
+                temporary,
+                name,
+                src_dir_fd=directory,
+                dst_dir_fd=directory,
+                follow_symlinks=False,
+            )
+        except FileExistsError as exc:
+            raise OSError(
+                f"protected artifact destination changed during cleanup: {name}"
+            ) from exc
+    os.unlink(temporary, dir_fd=directory)
+
+
+def _clean_entries(
+    directory: int,
+    names: tuple[str, ...] | None,
+    protected_identities: set[tuple[int, int]],
+) -> None:
     selected = names if names is not None else tuple(os.listdir(directory))
     for name in selected:
         try:
@@ -211,13 +261,13 @@ def _clean_entries(directory: int, names: tuple[str, ...] | None) -> None:
                 name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory
             )
             try:
-                _clean_entries(child, None)
+                _clean_entries(child, None, protected_identities)
             finally:
                 os.close(child)
         elif names is None and not name.endswith(".parquet"):
             continue
         elif stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-            os.unlink(name, dir_fd=directory)
+            _clean_file(directory, name, protected_identities)
         elif stat.S_ISDIR(metadata.st_mode) and name.endswith(".tmp"):
             try:
                 os.rmdir(name, dir_fd=directory)

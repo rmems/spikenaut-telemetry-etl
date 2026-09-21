@@ -1116,6 +1116,60 @@ def test_atomic_preparation_failure_evidence_preserves_late_session_source(
     assert artifact.read_bytes() == source_bytes
 
 
+def test_cleanup_preserves_source_moved_after_ownership_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    session = Path(json.loads(campaign.read_text())["sessions"][0]["path"])
+    source = session / "session_manifest.json"
+    source_bytes = source.read_bytes()
+    output = tmp_path / "out"
+    artifact = output / "prepared.json"
+    original = anticipation._source_owned_root_artifacts
+    moved = False
+
+    def move_source_after_check(*args: object, **kwargs: object) -> set[str]:
+        nonlocal moved
+        protected = original(*args, **kwargs)
+        if not moved:
+            moved = True
+            source.rename(artifact)
+        return protected
+
+    monkeypatch.setattr(
+        anticipation, "_source_owned_root_artifacts", move_source_after_check
+    )
+
+    with pytest.raises((OSError, PreparationError)):
+        prepare_campaign(campaign, output)
+    assert artifact.read_bytes() == source_bytes
+
+
+def test_cleanup_preserves_campaign_moved_after_loaded_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    campaign_bytes = campaign.read_bytes()
+    output = tmp_path / "out"
+    artifact = output / "manifest.json"
+    original = anticipation._load_campaign
+    moved = False
+
+    def move_campaign_after_load(*args: object, **kwargs: object):
+        nonlocal moved
+        loaded = original(*args, **kwargs)
+        if not moved:
+            moved = True
+            campaign.rename(artifact)
+        return loaded
+
+    monkeypatch.setattr(anticipation, "_load_campaign", move_campaign_after_load)
+
+    with pytest.raises((OSError, PreparationError)):
+        prepare_campaign(campaign, output)
+    assert artifact.read_bytes() == campaign_bytes
+
+
 def test_replacement_invalidates_prior_completion_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

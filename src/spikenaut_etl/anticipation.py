@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 from bisect import bisect_left, bisect_right
 from collections import Counter
@@ -774,7 +775,11 @@ def _source_owned_root_artifacts(
     return protected
 
 
-def _remove_owned_preparation_outputs(output_dir: Path, protected: set[str]) -> None:
+def _remove_owned_preparation_outputs(
+    output_dir: Path,
+    protected: set[str],
+    source_identities: set[tuple[int, int]],
+) -> None:
     clean_artifacts(
         output_dir,
         (
@@ -787,6 +792,7 @@ def _remove_owned_preparation_outputs(output_dir: Path, protected: set[str]) -> 
             "quality-report.json.tmp",
             "manifest.json.tmp",
         ),
+        protected_identities=source_identities,
     )
 
 
@@ -924,14 +930,17 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
     if campaign_path in output_artifacts:
         raise PreparationError(f"campaign {campaign_path} collides with output artifact")
     campaign_read_error: PreparationError | None = None
+    source_identities: set[tuple[int, int]] = set()
     try:
-        campaign_bytes = campaign_path.read_bytes()
+        with campaign_path.open("rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            source_identities.add((metadata.st_dev, metadata.st_ino))
+            campaign_bytes = stream.read()
     except (OSError, UnicodeError) as exc:
         campaign_bytes = b""
         campaign_read_error = PreparationError(
             f"cannot read campaign {campaign_path}: {exc}"
         )
-    source_identities: set[tuple[int, int]] = set()
     source_error = _guard_assigned_sources(
         campaign_path, output_dir, campaign_bytes, source_identities
     )
@@ -979,7 +988,7 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             assignments = _campaign_assignments(campaign)
             ensure_directory(output_dir)
             publication_identity = directory_identity(output_dir)
-            _remove_owned_preparation_outputs(output_dir, set())
+            _remove_owned_preparation_outputs(output_dir, set(), source_identities)
             with no_replace_publication():
                 prepared, source_memberships, source_snapshots = _prepare_campaign(
                     campaign_path,
@@ -1033,7 +1042,9 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
                 protected = _source_owned_root_artifacts(
                     campaign_path, output_dir, campaign_bytes, source_identities
                 )
-                _remove_owned_preparation_outputs(output_dir, protected)
+                _remove_owned_preparation_outputs(
+                    output_dir, protected, source_identities
+                )
                 with no_replace_publication():
                     if "quality-report.json" not in protected:
                         _write_json(output_dir / "quality-report.json", incomplete)

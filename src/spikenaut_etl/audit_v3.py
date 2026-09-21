@@ -465,6 +465,7 @@ def _clean_root_evidence(
             for name in ROOT_ARTIFACT_NAMES
             if not _matches_source_identity(output_root / name, source_identities)
         ),
+        protected_identities=source_identities,
     )
 
 
@@ -506,9 +507,13 @@ def _clean_owned_outputs(
                 raise AuditError(
                     f"audit output contains retained source identity: {protected}"
                 )
-        clean_artifacts(output_root, ROOT_ARTIFACT_NAMES)
+        clean_artifacts(
+            output_root,
+            ROOT_ARTIFACT_NAMES,
+            protected_identities=retained,
+        )
         if view_root.exists():
-            clean_artifacts(view_root)
+            clean_artifacts(view_root, protected_identities=retained)
     except OSError as exc:
         raise AuditError(f"cannot safely clean audit outputs: {exc}") from exc
 
