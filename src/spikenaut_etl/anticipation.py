@@ -12,7 +12,6 @@ import hashlib
 import json
 import math
 import re
-import tempfile
 from bisect import bisect_left, bisect_right
 from collections import Counter
 from datetime import datetime, timedelta
@@ -21,6 +20,8 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from .artifacts import write_json as _write_json
 
 SCHEMA_VERSION = "anticipation-prepared-v1"
 FRAME_INTERVAL_MS = 100
@@ -77,9 +78,10 @@ def _require_mapping(value: Any, context: str) -> dict[str, Any]:
     return value
 
 
-def _load_campaign(campaign_path: Path) -> tuple[dict[str, Any], int, str]:
+def _load_campaign(
+    campaign_path: Path, campaign_bytes: bytes
+) -> tuple[dict[str, Any], int, str]:
     try:
-        campaign_bytes = campaign_path.read_bytes()
         campaign_raw = json.loads(campaign_bytes.decode())
     except (OSError, ValueError, RecursionError) as exc:
         raise PreparationError(f"cannot read campaign {campaign_path}: {exc}") from exc
@@ -670,21 +672,9 @@ def _prepare_campaign(
     return prepared
 
 
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
-        temporary = Path(stream.name)
-        try:
-            stream.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
-            stream.close()
-            temporary.replace(path)
-        finally:
-            temporary.unlink(missing_ok=True)
-
-
-def _assignments(campaign_path: Path) -> list[dict[str, Any]]:
+def _assignments(campaign_bytes: bytes) -> list[dict[str, Any]]:
     try:
-        raw = json.loads(campaign_path.read_text()).get("sessions", [])
+        raw = json.loads(campaign_bytes.decode()).get("sessions", [])
     except OSError, ValueError, RecursionError, AttributeError:
         return []
     if not isinstance(raw, list):
@@ -761,15 +751,36 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
                 )
     if campaign_path in output_artifacts:
         raise PreparationError(f"campaign {campaign_path} collides with output artifact")
+    campaign_read_error: PreparationError | None = None
+    try:
+        campaign_bytes = campaign_path.read_bytes()
+    except OSError as exc:
+        campaign_bytes = b""
+        campaign_read_error = PreparationError(
+            f"cannot read campaign {campaign_path}: {exc}"
+        )
     # Guard source directories before the error handler can clean or publish outputs.
-    for item in _assignments(campaign_path):
+    for item in _assignments(campaign_bytes):
         raw_path = item.get("path")
         if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
             continue
         session_path = Path(raw_path)
         if not session_path.is_absolute():
             session_path = campaign_path.parent / session_path
-        session_path = session_path.resolve()
+        if output_dir.is_relative_to(session_path) or session_path.is_relative_to(
+            output_dir
+        ):
+            raise PreparationError(
+                f"output directory overlaps session source: {session_path}"
+            )
+        try:
+            session_path = session_path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            if resolution_error is None:
+                resolution_error = PreparationError(
+                    f"cannot resolve session source {session_path}: {exc}"
+                )
+            continue
         if output_dir.is_relative_to(session_path) or session_path.is_relative_to(
             output_dir
         ):
@@ -782,6 +793,8 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             raise resolution_error
         if campaign_resolution_error is not None:
             raise campaign_resolution_error
+        if campaign_read_error is not None:
+            raise campaign_read_error
         staging_symlinks = [path for path in output_paths if path.is_symlink()]
         if staging_symlinks:
             raise PreparationError(
@@ -796,7 +809,7 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             raise PreparationError(
                 f"output staging path is multiply linked: {hardlinked_staging[0]}"
             )
-        campaign, minimum, campaign_sha256 = _load_campaign(campaign_path)
+        campaign, minimum, campaign_sha256 = _load_campaign(campaign_path, campaign_bytes)
         assignments = _campaign_assignments(campaign)
         (output_dir / "manifest.json").unlink(missing_ok=True)
         prepared = _prepare_campaign(
@@ -818,7 +831,7 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
         _write_json(output_dir / "manifest.json", manifest)
     except (OSError, PreparationError) as exc:
         if not assignments:
-            assignments = _assignments(campaign_path)
+            assignments = _assignments(campaign_bytes)
         incomplete = {
             "schema_version": SCHEMA_VERSION,
             "status": "incomplete",

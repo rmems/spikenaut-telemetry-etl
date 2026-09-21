@@ -1026,3 +1026,41 @@ def test_replacement_invalidates_prior_completion_marker(
 
     monkeypatch.setattr(anticipation, "_write_json", check_marker)
     prepare_campaign(campaign, output)
+
+
+def test_cyclic_session_source_writes_incomplete_evidence(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    cycle = tmp_path / "cycle"
+    cycle.symlink_to(cycle)
+    data = json.loads(campaign.read_text())
+    data["sessions"][0]["path"] = str(cycle)
+    campaign.write_text(json.dumps(data))
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "prepared.json").write_text("stale complete result")
+    with pytest.raises(PreparationError, match="session source"):
+        prepare_campaign(campaign, output)
+    assert not (output / "prepared.json").exists()
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_overlap_guard_and_loader_share_campaign_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    original = campaign.read_bytes()
+    original_assignments = anticipation._assignments
+
+    def replace_after_guard(snapshot):
+        assignments = original_assignments(snapshot)
+        campaign.write_text(json.dumps({"min_examples_per_session": 1, "sessions": []}))
+        return assignments
+
+    monkeypatch.setattr(anticipation, "_assignments", replace_after_guard)
+    prepared = prepare_campaign(campaign, tmp_path / "out")
+    assert (
+        prepared["provenance"]["campaign_sha256"]
+        == __import__("hashlib").sha256(original).hexdigest()
+    )
+    manifest = json.loads((tmp_path / "out" / "manifest.json").read_text())
+    assert manifest["assignments"][0]["session_id"] == "session-01"

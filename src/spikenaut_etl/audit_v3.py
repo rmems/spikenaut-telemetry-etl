@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import errno
 import hashlib
-import json
 import math
 import re
 import subprocess
@@ -15,6 +14,8 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from .artifacts import write_json
 
 AUDIT_VERSION = "1.0.0"
 VIEW_ID = "v3-forecast-eligible-v1"
@@ -198,15 +199,26 @@ def _source_root(source_dir: Path) -> tuple[Path, Path, bool]:
     raise AuditError(f"cannot find v3 state_telemetry under {source_dir}")
 
 
-def _load_split(v3_root: Path, split: str) -> tuple[Path, Path, pa.Table, pa.Table]:
+def _read_source_table(
+    path: Path, expected_hashes: dict[Path, str], *, columns: list[str] | None = None
+) -> pa.Table:
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected_hashes.get(path):
+        raise AuditError(f"source changed before parsing: {path}")
+    return pq.read_table(pa.BufferReader(data), columns=columns)
+
+
+def _load_split(
+    v3_root: Path, split: str, expected_hashes: dict[Path, str]
+) -> tuple[Path, Path, pa.Table, pa.Table]:
     state_path = v3_root / "state_telemetry" / f"{split}-00000.parquet"
     outcome_path = v3_root / "outcomes" / f"{split}-00000.parquet"
     for path in (state_path, outcome_path):
         if not path.is_file():
             raise AuditError(f"missing source shard {path}")
     try:
-        state = pq.read_table(state_path)
-        outcomes = pq.read_table(outcome_path)
+        state = _read_source_table(state_path, expected_hashes)
+        outcomes = _read_source_table(outcome_path, expected_hashes)
     except (OSError, pa.ArrowException) as exc:
         raise AuditError(f"cannot read {split} source shards: {exc}") from exc
     _require_columns(
@@ -243,14 +255,18 @@ def _numeric_sensor_columns(state: pa.Table) -> tuple[str, ...]:
 
 
 def _action_label_counts(
-    v3_root: Path, split: str, state_keys: list[tuple[str, int]]
+    v3_root: Path,
+    split: str,
+    state_keys: list[tuple[str, int]],
+    expected_hashes: dict[Path, str],
 ) -> tuple[int, int]:
     path = v3_root / "action_proposals" / f"{split}-00000.parquet"
     if not path.is_file():
         raise AuditError(f"missing source shard {path}")
     try:
-        table = pq.read_table(
+        table = _read_source_table(
             path,
+            expected_hashes,
             columns=[
                 "episode_id",
                 "step_idx",
@@ -395,8 +411,11 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
     episode_split: dict[str, str] = {}
     episodes_by_split: dict[str, set[str]] = {}
     source_hashes = _available_source_hashes(dataset_root, v3_root)
+    expected_hashes = {
+        dataset_root / name: digest for name, digest in source_hashes.items()
+    }
     for split in SPLITS:
-        loaded[split] = _load_split(v3_root, split)
+        loaded[split] = _load_split(v3_root, split, expected_hashes)
         _, _, state, outcomes = loaded[split]
         state_keys = _key_columns(state, f"state_telemetry/{split}")
         outcome_keys = _key_columns(outcomes, f"outcomes/{split}")
@@ -521,7 +540,7 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
                 "timestamp_missing_count": state.column("ts_utc").null_count,
                 "reward_missing_count": outcomes.column("reward").null_count,
                 "action_label_missing_count": _action_label_counts(
-                    v3_root, split, state_keys
+                    v3_root, split, state_keys, expected_hashes
                 )[0],
             },
             **{name: _distribution(state.column(name)) for name in SENSOR_COLUMNS},
@@ -581,12 +600,8 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
         }
         | {"exclusions.parquet": _sha256(output_root / "exclusions.parquet")},
     }
-    (output_root / "audit-report.json").write_text(
-        json.dumps(report.to_dict(), indent=2, sort_keys=True) + "\n"
-    )
-    (output_root / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-    )
+    write_json(output_root / "audit-report.json", report.to_dict())
+    write_json(output_root / "manifest.json", manifest)
     return report
 
 
@@ -620,12 +635,8 @@ def _write_incomplete_evidence(
         ),
         "outputs": {},
     }
-    (output_root / "audit-report.json").write_text(
-        json.dumps(incomplete_report, indent=2, sort_keys=True) + "\n"
-    )
-    (output_root / "manifest.json").write_text(
-        json.dumps(incomplete_manifest, indent=2, sort_keys=True) + "\n"
-    )
+    write_json(output_root / "audit-report.json", incomplete_report)
+    write_json(output_root / "manifest.json", incomplete_manifest)
 
 
 def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
@@ -657,7 +668,11 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
                 f"output directory would overlap supplied source path: {output_root}"
             ) from exc
         output_root.mkdir(parents=True, exist_ok=True)
-        _clean_owned_outputs(output_root)
+        try:
+            _clean_owned_outputs(output_root)
+        except AuditError:
+            # A view symlink must not prevent publishing safe root-level evidence.
+            pass
         _write_incomplete_evidence(output_root, exc, None, None)
         raise
 

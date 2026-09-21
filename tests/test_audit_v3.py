@@ -934,3 +934,78 @@ def test_string_reward_is_rejected(tmp_path: Path) -> None:
     pq.write_table(table, path)
     with pytest.raises(AuditError, match="reward"):
         audit_v3(source, tmp_path / "audit")
+
+
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+def test_audit_publication_does_not_follow_replacement_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_kind: str
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    sentinel = tmp_path / "source-sentinel.json"
+    sentinel.write_text("source sentinel")
+    original = audit_module._clean_owned_outputs
+
+    def replace_after_cleanup(root: Path) -> None:
+        original(root)
+        destination = root / "manifest.json"
+        if link_kind == "symlink":
+            destination.symlink_to(sentinel)
+        else:
+            destination.hardlink_to(sentinel)
+
+    monkeypatch.setattr(audit_module, "_clean_owned_outputs", replace_after_cleanup)
+    audit_v3(source, output)
+    assert sentinel.read_text() == "source sentinel"
+
+
+def test_audit_parses_the_same_bytes_it_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    target = source / "v3/state_telemetry/train-00000.parquet"
+    original_bytes = target.read_bytes()
+    read_table = pq.read_table
+    changed = read_table(target)
+    changed = changed.set_column(
+        changed.schema.get_field_index("mem_util_pct"),
+        "mem_util_pct",
+        pa.array([77.0] * changed.num_rows),
+    )
+
+    def replace_while_reading(path: object, *args: object, **kwargs: object) -> pa.Table:
+        if path == target:
+            pq.write_table(changed, target)
+            try:
+                return read_table(path, *args, **kwargs)
+            finally:
+                target.write_bytes(original_bytes)
+        return read_table(path, *args, **kwargs)
+
+    monkeypatch.setattr(pq, "read_table", replace_while_reading)
+    audit_v3(source, output)
+    view = read_table(output / "v3-forecast-eligible-v1/train-00000.parquet")
+    assert view.column("mem_util_pct").to_pylist() == [20.0, 21.0]
+
+
+def test_missing_source_with_view_symlink_writes_incomplete_evidence(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "audit"
+    output.mkdir()
+    target = tmp_path / "untouched"
+    target.mkdir()
+    sentinel = target / "manifest.json"
+    sentinel.write_text("preserve")
+    view = output / "v3-forecast-eligible-v1"
+    view.symlink_to(target, target_is_directory=True)
+    (output / "manifest.json").write_text('{"status": "complete"}')
+    with pytest.raises(AuditError, match="cannot find v3 state_telemetry"):
+        audit_v3(tmp_path / "missing-source", output)
+    assert view.is_symlink()
+    assert sentinel.read_text() == "preserve"
+    for name in ("manifest.json", "audit-report.json"):
+        assert json.loads((output / name).read_text())["status"] == "incomplete"
