@@ -14,18 +14,24 @@ from typing import IO, Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-_PINNED_ROOT: ContextVar[tuple[Path, tuple[int, int]] | None] = ContextVar(
-    "artifact_root", default=None
+_PINNED_ROOT: ContextVar[tuple[Path, tuple[int, int], dict[Path, int]] | None] = (
+    ContextVar("artifact_root", default=None)
 )
 
 
-def _check_pinned_root() -> None:
+def _check_pinned_root(path: Path) -> None:
     pinned = _PINNED_ROOT.get()
     if pinned is not None:
-        root, expected = pinned
+        root, expected, children = pinned
         actual = root.stat(follow_symlinks=False)
         if (actual.st_dev, actual.st_ino) != expected:
             raise OSError("publication directory changed during audit")
+        for child, descriptor in children.items():
+            if path.is_relative_to(child):
+                opened = os.fstat(descriptor)
+                current = child.stat(follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise OSError("artifact directory changed during publication")
 
 
 @contextmanager
@@ -42,18 +48,32 @@ def pinned_publication(
         opened = os.fstat(descriptor)
         if expected is not None and (opened.st_dev, opened.st_ino) != expected:
             raise OSError("publication directory changed before pinning")
-        token = _PINNED_ROOT.set((path, (opened.st_dev, opened.st_ino)))
+        children: dict[Path, int] = {}
+        token = _PINNED_ROOT.set((path, (opened.st_dev, opened.st_ino), children))
         try:
             yield
         finally:
             _PINNED_ROOT.reset(token)
+            for child_descriptor in children.values():
+                os.close(child_descriptor)
     finally:
         # Closing the retained descriptor also releases the publication lock.
         os.close(descriptor)
 
 
+def pin_directory(path: Path) -> None:
+    """Retain a child identity until the enclosing publication context exits."""
+    pinned = _PINNED_ROOT.get()
+    if pinned is None or not path.is_relative_to(pinned[0]):
+        raise OSError("child directory requires an enclosing publication root")
+    children = pinned[2]
+    if path not in children:
+        children[path] = _open_directory(path)
+    _check_pinned_root(path)
+
+
 def directory_identity(path: Path) -> tuple[int, int]:
-    _check_pinned_root()
+    _check_pinned_root(path)
     metadata = path.stat(follow_symlinks=False)
     if not stat.S_ISDIR(metadata.st_mode):
         raise OSError(f"publication path is not a directory: {path}")
@@ -61,7 +81,7 @@ def directory_identity(path: Path) -> tuple[int, int]:
 
 
 def _check_directory(path: Path, descriptor: int) -> None:
-    _check_pinned_root()
+    _check_pinned_root(path)
     opened = os.fstat(descriptor)
     current = path.stat(follow_symlinks=False)
     if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
@@ -70,7 +90,7 @@ def _check_directory(path: Path, descriptor: int) -> None:
 
 def _open_directory(path: Path) -> int:
     """Walk from the filesystem root without following any symlink component."""
-    _check_pinned_root()
+    _check_pinned_root(path)
     absolute = path.absolute()
     descriptor = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -88,7 +108,7 @@ def _open_directory(path: Path) -> int:
             )
             os.close(descriptor)
             descriptor = child
-        _check_pinned_root()
+        _check_pinned_root(path)
         return descriptor
     except BaseException:
         os.close(descriptor)

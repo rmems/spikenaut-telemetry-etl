@@ -1723,3 +1723,29 @@ def test_symlinked_sources_do_not_claim_git_owned_bytes(tmp_path, monkeypatch, l
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["status"] == "complete"
     assert manifest["source_git_commit"] is None
+
+
+def test_replaced_view_cannot_overwrite_or_clean_source_shards(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    output = tmp_path / "out"
+    view = output / audit_module.VIEW_ID
+    source_config = source / "v3/state_telemetry"
+    before = {path.name: path.read_bytes() for path in source_config.glob("*.parquet")}
+    original = audit_module.write_parquet
+    moved = False
+
+    def replace_before_first_write(path, table):
+        nonlocal moved
+        if not moved and path.parent == view:
+            moved = True
+            view.rename(tmp_path / "detached-view")
+            source_config.rename(view)
+            source_config.symlink_to(view, target_is_directory=True)
+        original(path, table)
+
+    monkeypatch.setattr(audit_module, "write_parquet", replace_before_first_write)
+    with pytest.raises((AuditError, OSError), match="directory changed"):
+        audit_v3(source, output)
+    assert {path.name: path.read_bytes() for path in view.glob("*.parquet")} == before
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"

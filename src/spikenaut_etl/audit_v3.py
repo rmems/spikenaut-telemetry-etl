@@ -20,6 +20,7 @@ from .artifacts import (
     clean_artifacts,
     directory_identity,
     ensure_directory,
+    pin_directory,
     pinned_publication,
     write_json,
     write_parquet,
@@ -847,6 +848,25 @@ def _guard_supplied_source(source_path: Path, output_root: Path) -> None:
         _guard_source_members(root, output_root)
 
 
+def _pin_audit_view(
+    output_root: Path, dataset_root: Path, v3_root: Path, source_git_commit: str | None
+) -> None:
+    try:
+        view_root = output_root / VIEW_ID
+        if view_root.is_symlink():
+            raise OSError(f"audit view directory must not be a symlink: {view_root}")
+        pin_directory(view_root)
+    except OSError as exc:
+        error = AuditError(f"cannot safely pin audit view: {exc}")
+        clean_artifacts(
+            output_root, ("manifest.json", "audit-report.json", "exclusions.parquet")
+        )
+        _write_incomplete_evidence(
+            output_root, error, dataset_root, v3_root, source_git_commit
+        )
+        raise error from exc
+
+
 def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
     """Audit historical v3 and write a provenance-bound additive eligible view.
 
@@ -881,6 +901,10 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
     _guard_output_path(dataset_root, v3_root, output_root, source_is_dataset_root)
     source_git_commit = _git_head(dataset_root, output_root)
     with pinned_publication(output_root, initial_identity):
+        _guard_output_path(
+            dataset_root.resolve(), v3_root.resolve(), output_root, source_is_dataset_root
+        )
+        _pin_audit_view(output_root, dataset_root, v3_root, source_git_commit)
         _guard_output_path(
             dataset_root.resolve(), v3_root.resolve(), output_root, source_is_dataset_root
         )
