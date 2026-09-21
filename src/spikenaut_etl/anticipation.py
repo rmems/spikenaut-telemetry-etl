@@ -21,7 +21,12 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .artifacts import clean_artifacts, directory_identity, ensure_directory
+from .artifacts import (
+    clean_artifacts,
+    directory_identity,
+    ensure_directory,
+    pinned_publication,
+)
 from .artifacts import write_json as _write_json
 
 SCHEMA_VERSION = "anticipation-prepared-v1"
@@ -723,8 +728,42 @@ def _remove_owned_preparation_outputs(output_dir: Path) -> None:
     )
 
 
+def _guard_assigned_sources(
+    campaign_path: Path, output_dir: Path, campaign_bytes: bytes
+) -> PreparationError | None:
+    resolution_error: PreparationError | None = None
+    for item in _assignments(campaign_bytes):
+        raw_path = item.get("path")
+        if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+            continue
+        session_path = Path(raw_path)
+        if not session_path.is_absolute():
+            session_path = campaign_path.parent / session_path
+        if output_dir.is_relative_to(session_path) or session_path.is_relative_to(
+            output_dir
+        ):
+            raise PreparationError(
+                f"output directory overlaps session source: {session_path}"
+            )
+        try:
+            session_path = session_path.resolve(strict=True)
+        except (OSError, RuntimeError, UnicodeError) as exc:
+            if resolution_error is None:
+                resolution_error = PreparationError(
+                    f"cannot resolve session source {session_path!r}: {exc}"
+                )
+            continue
+        if output_dir.is_relative_to(session_path) or session_path.is_relative_to(
+            output_dir
+        ):
+            raise PreparationError(
+                f"output directory overlaps session source: {session_path}"
+            )
+    return resolution_error
+
+
 def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[str, Any]:
-    """Prepare a campaign and always publish a versioned completion report."""
+    """Prepare a campaign; publish failure evidence only into the retained output root."""
 
     supplied_campaign_path = Path(campaign_path)
     campaign_resolution_error: PreparationError | None = None
@@ -738,6 +777,7 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             f"campaign path has a symlink loop: {campaign_path}"
         )
     output_dir = Path(output_dir).resolve()
+    initial_identity = directory_identity(output_dir) if output_dir.is_dir() else None
     output_paths = [
         output_dir / name
         for name in (
@@ -769,101 +809,85 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
         campaign_read_error = PreparationError(
             f"cannot read campaign {campaign_path}: {exc}"
         )
-    # Guard source directories before the error handler can clean or publish outputs.
-    for item in _assignments(campaign_bytes):
-        raw_path = item.get("path")
-        if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
-            continue
-        session_path = Path(raw_path)
-        if not session_path.is_absolute():
-            session_path = campaign_path.parent / session_path
-        if output_dir.is_relative_to(session_path) or session_path.is_relative_to(
-            output_dir
-        ):
-            raise PreparationError(
-                f"output directory overlaps session source: {session_path}"
-            )
+    source_error = _guard_assigned_sources(campaign_path, output_dir, campaign_bytes)
+    resolution_error = resolution_error or source_error
+    ensure_directory(output_dir)
+    with pinned_publication(output_dir, initial_identity):
+        # Repeat resolved overlap checks after pinning and before any cleanup.
+        source_error = _guard_assigned_sources(campaign_path, output_dir, campaign_bytes)
+        resolution_error = resolution_error or source_error
+        assignments: list[dict[str, Any]] = []
         try:
-            session_path = session_path.resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            if resolution_error is None:
-                resolution_error = PreparationError(
-                    f"cannot resolve session source {session_path}: {exc}"
+            if resolution_error is not None:
+                raise resolution_error
+            if campaign_resolution_error is not None:
+                raise campaign_resolution_error
+            if campaign_read_error is not None:
+                raise campaign_read_error
+            staging_symlinks = [path for path in output_paths if path.is_symlink()]
+            if staging_symlinks:
+                raise PreparationError(
+                    f"output staging path is a symlink: {staging_symlinks[0]}"
                 )
-            continue
-        if output_dir.is_relative_to(session_path) or session_path.is_relative_to(
-            output_dir
-        ):
-            raise PreparationError(
-                f"output directory overlaps session source: {session_path}"
+            hardlinked_staging = [
+                path
+                for path in output_paths
+                if path.is_file() and not path.is_symlink() and path.stat().st_nlink > 1
+            ]
+            if hardlinked_staging:
+                raise PreparationError(
+                    f"output staging path is multiply linked: {hardlinked_staging[0]}"
+                )
+            campaign, minimum, campaign_sha256 = _load_campaign(
+                campaign_path, campaign_bytes
             )
-    assignments: list[dict[str, Any]] = []
-    try:
-        if resolution_error is not None:
-            raise resolution_error
-        if campaign_resolution_error is not None:
-            raise campaign_resolution_error
-        if campaign_read_error is not None:
-            raise campaign_read_error
-        staging_symlinks = [path for path in output_paths if path.is_symlink()]
-        if staging_symlinks:
-            raise PreparationError(
-                f"output staging path is a symlink: {staging_symlinks[0]}"
+            assignments = _campaign_assignments(campaign)
+            ensure_directory(output_dir)
+            publication_identity = directory_identity(output_dir)
+            clean_artifacts(output_dir, ("manifest.json",))
+            prepared, source_memberships, source_snapshots = _prepare_campaign(
+                campaign_path,
+                output_dir,
+                campaign,
+                minimum,
+                campaign_sha256,
             )
-        hardlinked_staging = [
-            path
-            for path in output_paths
-            if path.is_file() and not path.is_symlink() and path.stat().st_nlink > 1
-        ]
-        if hardlinked_staging:
-            raise PreparationError(
-                f"output staging path is multiply linked: {hardlinked_staging[0]}"
-            )
-        campaign, minimum, campaign_sha256 = _load_campaign(campaign_path, campaign_bytes)
-        assignments = _campaign_assignments(campaign)
-        ensure_directory(output_dir)
-        publication_identity = directory_identity(output_dir)
-        clean_artifacts(output_dir, ("manifest.json",))
-        prepared, source_memberships, source_snapshots = _prepare_campaign(
-            campaign_path,
-            output_dir,
-            campaign,
-            minimum,
-            campaign_sha256,
-        )
-        manifest = {
-            "schema_version": SCHEMA_VERSION,
-            "status": "complete",
-            "assignments": assignments,
-            "prepared_sha256": _sha256(output_dir / "prepared.json"),
-            "session_counts": prepared["quality"]["session_summaries"],
-            "sources": prepared["provenance"]["sources"],
-        }
-        _write_json(output_dir / "quality-report.json", prepared["quality"])
-        if directory_identity(output_dir) != publication_identity:
-            raise PreparationError("publication directory changed during preparation")
-        if _sha256(output_dir / "prepared.json") != manifest["prepared_sha256"]:
-            raise PreparationError("prepared artifact changed during publication")
-        _check_preparation_sources(source_memberships, source_snapshots)
-        if _sha256(output_dir / "prepared.json") != manifest["prepared_sha256"]:
-            raise PreparationError("prepared artifact changed during publication")
-        if directory_identity(output_dir) != publication_identity:
-            raise PreparationError("publication directory changed during preparation")
-        _write_json(output_dir / "manifest.json", manifest)
-        if directory_identity(output_dir) != publication_identity:
-            raise PreparationError("publication directory changed during preparation")
-    except (OSError, PreparationError) as exc:
-        if not assignments:
-            assignments = _assignments(campaign_bytes)
-        incomplete = {
-            "schema_version": SCHEMA_VERSION,
-            "status": "incomplete",
-            "assignments": assignments,
-            "failure_reasons": [str(exc)],
-            **getattr(exc, "details", {}),
-        }
-        _remove_owned_preparation_outputs(output_dir)
-        _write_json(output_dir / "quality-report.json", incomplete)
-        _write_json(output_dir / "manifest.json", incomplete)
-        raise
-    return prepared
+            manifest = {
+                "schema_version": SCHEMA_VERSION,
+                "status": "complete",
+                "assignments": assignments,
+                "prepared_sha256": _sha256(output_dir / "prepared.json"),
+                "session_counts": prepared["quality"]["session_summaries"],
+                "sources": prepared["provenance"]["sources"],
+            }
+            _write_json(output_dir / "quality-report.json", prepared["quality"])
+            if directory_identity(output_dir) != publication_identity:
+                raise PreparationError("publication directory changed during preparation")
+            if _sha256(output_dir / "prepared.json") != manifest["prepared_sha256"]:
+                raise PreparationError("prepared artifact changed during publication")
+            _check_preparation_sources(source_memberships, source_snapshots)
+            if _sha256(output_dir / "prepared.json") != manifest["prepared_sha256"]:
+                raise PreparationError("prepared artifact changed during publication")
+            if directory_identity(output_dir) != publication_identity:
+                raise PreparationError("publication directory changed during preparation")
+            _write_json(output_dir / "manifest.json", manifest)
+            if directory_identity(output_dir) != publication_identity:
+                raise PreparationError("publication directory changed during preparation")
+        except (OSError, PreparationError) as exc:
+            if not assignments:
+                assignments = _assignments(campaign_bytes)
+            incomplete = {
+                "schema_version": SCHEMA_VERSION,
+                "status": "incomplete",
+                "assignments": assignments,
+                "failure_reasons": [str(exc)],
+                **getattr(exc, "details", {}),
+            }
+            try:
+                _remove_owned_preparation_outputs(output_dir)
+                _write_json(output_dir / "quality-report.json", incomplete)
+                _write_json(output_dir / "manifest.json", incomplete)
+            except OSError as publication_error:
+                raise PreparationError(str(exc)) from publication_error
+            raise
+        return prepared

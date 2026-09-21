@@ -28,10 +28,15 @@ def _check_pinned_root() -> None:
 
 
 @contextmanager
-def pinned_publication(path: Path) -> Iterator[None]:
+def pinned_publication(
+    path: Path, expected: tuple[int, int] | None = None
+) -> Iterator[None]:
     ensure_directory(path)
     descriptor = _open_directory(path)
     opened = os.fstat(descriptor)
+    if expected is not None and (opened.st_dev, opened.st_ino) != expected:
+        os.close(descriptor)
+        raise OSError("publication directory changed before pinning")
     token = _PINNED_ROOT.set((path, (opened.st_dev, opened.st_ino)))
     try:
         yield
@@ -125,6 +130,11 @@ def write_parquet(path: Path, table: pa.Table) -> None:
 
 def clean_artifacts(path: Path, names: tuple[str, ...] | None = None) -> None:
     """Delete owned files relative to a pinned directory, never through symlinks."""
+    if names is not None and any(
+        not name or name in {".", ".."} or Path(name).name != name or "\x00" in name
+        for name in names
+    ):
+        raise OSError("artifact cleanup names must be a single path component")
     directory = _open_directory(path)
     try:
         _check_directory(path, directory)

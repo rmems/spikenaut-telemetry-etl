@@ -1389,3 +1389,34 @@ def test_git_provenance_rejects_ancestor_repository(tmp_path: Path) -> None:
     dataset.mkdir()
     assert audit_module._git_head(dataset) is None
     assert audit_module._git_head(tmp_path) is not None
+
+
+def test_invalid_source_keeps_original_output_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "out"
+    output.mkdir()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "manifest.json").write_text("sentinel")
+    original = audit_module.ensure_directory
+    moved = False
+
+    def replace_before_ensure(path: Path) -> None:
+        nonlocal moved
+        if not moved:
+            moved = True
+            output.rename(tmp_path / "detached")
+            replacement.rename(output)
+        original(path)
+
+    monkeypatch.setattr(audit_module, "ensure_directory", replace_before_ensure)
+    with pytest.raises((AuditError, OSError)):
+        audit_v3(tmp_path / "missing-source", output)
+    assert (output / "manifest.json").read_text() == "sentinel"
+
+
+def test_git_provenance_marks_untracked_content_unknown(tmp_path: Path) -> None:
+    test_git_provenance_rejects_ancestor_repository(tmp_path)
+    (tmp_path / "untracked.parquet").write_text("untracked")
+    assert audit_module._git_head(tmp_path) is None

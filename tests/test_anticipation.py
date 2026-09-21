@@ -1103,7 +1103,7 @@ def test_preparation_output_generation_cannot_change_between_artifacts(
     monkeypatch.setattr(anticipation, "_write_json", swap_after_quality)
     with pytest.raises(PreparationError, match="publication directory changed"):
         prepare_campaign(campaign, output)
-    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+    assert not (output / "manifest.json").exists()
 
 
 def test_preparation_output_generation_cannot_change_at_manifest_publication(
@@ -1122,7 +1122,7 @@ def test_preparation_output_generation_cannot_change_at_manifest_publication(
     monkeypatch.setattr(anticipation, "_write_json", swap_before_manifest)
     with pytest.raises(PreparationError, match="publication directory changed"):
         prepare_campaign(campaign, output)
-    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+    assert not (output / "manifest.json").exists()
 
 
 def test_prepared_hash_rechecked_after_final_source_pass(
@@ -1153,3 +1153,40 @@ def test_completion_marker_must_cover_last_row(tmp_path: Path) -> None:
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(PreparationError, match="completion.*last.*timestamp"):
         prepare_campaign(campaign, tmp_path / "out")
+
+
+def test_preparation_rechecks_source_overlap_after_output_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    session = Path(json.loads(campaign.read_text())["sessions"][0]["path"])
+    output = tmp_path / "out"
+    original = anticipation.ensure_directory
+    moved = False
+
+    def move_before_ensure(path: Path) -> None:
+        nonlocal moved
+        if not moved:
+            moved = True
+            session.rename(output)
+            session.symlink_to(output, target_is_directory=True)
+        original(path)
+
+    monkeypatch.setattr(anticipation, "ensure_directory", move_before_ensure)
+    with pytest.raises((PreparationError, OSError)):
+        prepare_campaign(campaign, output)
+    assert not (output / "prepared.json").exists()
+    assert not (output / "manifest.json").exists()
+
+
+def test_unencodable_session_path_writes_incomplete_evidence(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    value = json.loads(campaign.read_text())
+    value["sessions"][0]["path"] = "\ud800"
+    campaign.write_text(json.dumps(value))
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "manifest.json").write_text('{"status":"complete"}')
+    with pytest.raises(PreparationError, match="cannot resolve session source"):
+        prepare_campaign(campaign, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"

@@ -36,3 +36,16 @@ def test_cleanup_keeps_pinned_directory_when_path_is_replaced(tmp_path, monkeypa
         artifacts.clean_artifacts(output, ("manifest.json",))
     assert (source / "manifest.json").read_text() == "source sentinel"
     assert not (tmp_path / "detached/manifest.json").exists()
+
+
+@pytest.mark.parametrize("name", ["../outside", "absolute", ".", "..", ""])
+def test_cleanup_names_must_be_single_components(tmp_path, name):
+    from spikenaut_etl.artifacts import clean_artifacts
+
+    outside = tmp_path / "outside"
+    outside.write_text("sentinel")
+    output = tmp_path / "output"
+    output.mkdir()
+    with pytest.raises(OSError, match="single path component"):
+        clean_artifacts(output, (str(outside) if name == "absolute" else name,))
+    assert outside.read_text() == "sentinel"

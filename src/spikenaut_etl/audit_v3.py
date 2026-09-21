@@ -81,7 +81,24 @@ def _git_head(path: Path) -> str | None:
     lines = result.stdout.strip().splitlines()
     if len(lines) != 2 or Path(lines[0]).resolve() != path.resolve():
         return None
-    return lines[1] or None
+    try:
+        status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(path),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except OSError, subprocess.CalledProcessError:
+        return None
+    return None if status.stdout.strip() else lines[1] or None
 
 
 def _key_columns(table: pa.Table, label: str) -> list[tuple[str, int]]:
@@ -740,6 +757,19 @@ def _write_incomplete_evidence(
     write_json(output_root / "manifest.json", incomplete_manifest)
 
 
+def _guard_supplied_source(source_path: Path, output_root: Path) -> None:
+    try:
+        provisional_source = source_path.resolve()
+    except OSError, RuntimeError, UnicodeError:
+        provisional_source = source_path.absolute()
+    if output_root.is_relative_to(
+        provisional_source
+    ) or provisional_source.is_relative_to(output_root):
+        raise AuditError(
+            f"output directory would overlap supplied source path: {output_root}"
+        )
+
+
 def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
     """Audit historical v3 and write a provenance-bound additive eligible view.
 
@@ -754,32 +784,25 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
         output_root = Path(output_dir).resolve()
     except RuntimeError as exc:
         raise AuditError(f"output path has a symlink loop: {output_dir}") from exc
+    initial_identity = directory_identity(output_root) if output_root.is_dir() else None
     try:
         dataset_root, v3_root, source_is_dataset_root = _source_root(source_path)
     except AuditError as exc:
-        try:
-            provisional_source = source_path.resolve()
-        except RuntimeError:
-            provisional_source = source_path.absolute()
-        if (
-            output_root == provisional_source
-            or output_root.is_relative_to(provisional_source)
-            or provisional_source.is_relative_to(output_root)
-        ):
-            raise AuditError(
-                f"output directory would overlap supplied source path: {output_root}"
-            ) from exc
+        _guard_supplied_source(source_path, output_root)
         ensure_directory(output_root)
-        try:
-            _clean_owned_outputs(output_root)
-        except AuditError:
-            # A view symlink must not prevent publishing safe root-level evidence.
-            pass
-        _write_incomplete_evidence(output_root, exc, None, None)
+        with pinned_publication(output_root, initial_identity):
+            _guard_supplied_source(source_path, output_root)
+            try:
+                _clean_owned_outputs(output_root)
+            except AuditError:
+                # A view symlink must not prevent publishing safe root-level evidence.
+                pass
+            _write_incomplete_evidence(output_root, exc, None, None)
+
         raise
 
     _guard_output_path(dataset_root, v3_root, output_root, source_is_dataset_root)
-    with pinned_publication(output_root):
+    with pinned_publication(output_root, initial_identity):
         _guard_output_path(
             dataset_root.resolve(), v3_root.resolve(), output_root, source_is_dataset_root
         )
