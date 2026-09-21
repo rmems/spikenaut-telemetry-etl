@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import subprocess
 from collections import Counter
 from dataclasses import dataclass
@@ -115,11 +116,18 @@ def _episode_number(episode_id: object) -> int:
     if not isinstance(episode_id, str) or not episode_id:
         raise AuditError("episode_id must be a non-empty string")
     prefix, separator, value = episode_id.rpartition("-")
-    if not separator or prefix != "gpu" or not value.isdigit():
+    if not separator or prefix != "gpu" or re.fullmatch(r"[0-9]+", value) is None:
         raise AuditError(
             f"cannot recover source row_index from episode_id {episode_id!r}"
         )
-    episode_number = int(value)
+    if len(value) != 6:
+        raise AuditError(f"noncanonical episode_id {episode_id!r}")
+    try:
+        episode_number = int(value)
+    except ValueError as exc:
+        raise AuditError(
+            f"cannot recover source row_index from episode_id {episode_id!r}"
+        ) from exc
     if episode_id != f"gpu-{episode_number:06d}":
         raise AuditError(f"noncanonical episode_id {episode_id!r}")
     return episode_number
@@ -153,6 +161,9 @@ def _distribution(column: pa.ChunkedArray) -> dict[str, int | float | None]:
         for value in values
         if value is not None and math.isfinite(float(value))
     ]
+    mean = math.fsum(value / len(finite) for value in finite) if finite else None
+    if mean is not None and not math.isfinite(mean):
+        raise AuditError("numeric distribution mean is non-finite")
     return {
         "count": len(values),
         "null_count": sum(value is None for value in values),
@@ -165,7 +176,7 @@ def _distribution(column: pa.ChunkedArray) -> dict[str, int | float | None]:
         ),
         "min": min(finite) if finite else None,
         "max": max(finite) if finite else None,
-        "mean": sum(finite) / len(finite) if finite else None,
+        "mean": mean,
     }
 
 
@@ -291,19 +302,27 @@ def _clean_owned_outputs(output_root: Path) -> None:
         if path.is_file():
             path.unlink()
     view_root = output_root / VIEW_ID
+    if view_root.is_symlink():
+        raise AuditError(f"audit view directory must not be a symlink: {view_root}")
     if view_root.is_dir():
         for path in view_root.rglob("*.parquet"):
             if path.is_file():
                 path.unlink()
 
 
-def _available_source_hashes(dataset_root: Path, v3_root: Path) -> dict[str, str]:
+def _available_source_hashes(
+    dataset_root: Path, v3_root: Path, *, tolerate_unreadable: bool = False
+) -> dict[str, str]:
     hashes: dict[str, str] = {}
     for config in ("state_telemetry", "outcomes", "action_proposals"):
         for split in SPLITS:
             path = v3_root / config / f"{split}-00000.parquet"
             if path.is_file():
-                hashes[path.relative_to(dataset_root).as_posix()] = _sha256(path)
+                try:
+                    hashes[path.relative_to(dataset_root).as_posix()] = _sha256(path)
+                except OSError:
+                    if not tolerate_unreadable:
+                        raise
     return dict(sorted(hashes.items()))
 
 
@@ -498,6 +517,9 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
         splits=split_reports,
         integrity=integrity,
     )
+    final_source_hashes = _available_source_hashes(dataset_root, v3_root)
+    if final_source_hashes != source_hashes:
+        raise AuditError("source shards changed during audit")
     output_root.mkdir(parents=True, exist_ok=True)
     view_root = output_root / VIEW_ID
     view_root.mkdir(parents=True, exist_ok=True)
@@ -564,7 +586,7 @@ def _write_incomplete_evidence(
         "failure": failure,
         "source_git_commit": _git_head(dataset_root) if dataset_root else None,
         "source_files": (
-            _available_source_hashes(dataset_root, v3_root)
+            _available_source_hashes(dataset_root, v3_root, tolerate_unreadable=True)
             if dataset_root is not None and v3_root is not None
             else {}
         ),
@@ -596,9 +618,9 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
         raise
 
     _guard_output_path(dataset_root, v3_root, output_root, source_is_dataset_root)
-    output_root.mkdir(parents=True, exist_ok=True)
-    _clean_owned_outputs(output_root)
     try:
+        output_root.mkdir(parents=True, exist_ok=True)
+        _clean_owned_outputs(output_root)
         return _audit_v3_impl(dataset_root, v3_root, output_root)
     except (AuditError, OSError, pa.ArrowException) as raw_error:
         audit_error = (
@@ -606,7 +628,12 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
             if isinstance(raw_error, AuditError)
             else AuditError(f"cannot write audit outputs: {raw_error}")
         )
-        _clean_owned_outputs(output_root)
+        try:
+            _clean_owned_outputs(output_root)
+        except AuditError:
+            # Preserve an unsafe view symlink without following it; the JSON
+            # evidence files live directly under the already-guarded root.
+            pass
         _write_incomplete_evidence(output_root, audit_error, dataset_root, v3_root)
         if audit_error is raw_error:
             raise

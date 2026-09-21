@@ -8,6 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import spikenaut_etl.audit_v3 as audit_module
 from spikenaut_etl.audit_v3 import AuditError, audit_v3
 from spikenaut_etl.v3_build import OUTCOMES_SCHEMA, STATE_SCHEMA
 
@@ -342,6 +343,90 @@ def test_rebuild_removes_every_stale_owned_view_shard(tmp_path: Path) -> None:
     assert not stale.exists()
 
 
+def test_symlinked_view_directory_is_rejected_without_touching_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    target = source / "v3" / "state_telemetry"
+    before = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in target.glob("*.parquet")
+    }
+    output.mkdir()
+    (output / "v3-forecast-eligible-v1").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(AuditError, match="must not be a symlink"):
+        audit_v3(source, output)
+
+    after = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in target.glob("*.parquet")
+    }
+    assert after == before
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+
+
+def test_incomplete_evidence_tolerates_unreadable_source_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original_sha256 = audit_module._sha256
+
+    def fail_train_hash(path: Path) -> str:
+        if path.name == "train-00000.parquet":
+            raise OSError("source disappeared")
+        return original_sha256(path)
+
+    monkeypatch.setattr(audit_module, "_sha256", fail_train_hash)
+
+    with pytest.raises(AuditError, match="cannot write audit outputs"):
+        audit_v3(source, output)
+
+    report = json.loads((output / "audit-report.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert report["status"] == "incomplete"
+    assert manifest["status"] == "incomplete"
+    assert not any(
+        name.endswith("train-00000.parquet") for name in manifest["source_files"]
+    )
+
+
+def test_source_hash_change_during_audit_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original_hashes = audit_module._available_source_hashes
+    calls = 0
+
+    def changed_hashes(
+        dataset_root: Path, v3_root: Path, *, tolerate_unreadable: bool = False
+    ) -> dict[str, str]:
+        nonlocal calls
+        hashes = original_hashes(
+            dataset_root, v3_root, tolerate_unreadable=tolerate_unreadable
+        )
+        calls += 1
+        if calls == 2:
+            first = next(iter(hashes))
+            hashes[first] = "0" * 64
+        return hashes
+
+    monkeypatch.setattr(audit_module, "_available_source_hashes", changed_hashes)
+
+    with pytest.raises(AuditError, match="source shards changed during audit"):
+        audit_v3(source, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
 def test_episode_cannot_belong_to_two_splits(tmp_path: Path) -> None:
     source = tmp_path / "source"
     _write_corpus(source)
@@ -380,6 +465,34 @@ def test_noncanonical_episode_identifier_fails_closed(tmp_path: Path) -> None:
     manifest = json.loads((output / "manifest.json").read_text())
     assert report["status"] == "incomplete"
     assert manifest["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    ("episode_id", "match"),
+    [
+        ("gpu-²", "cannot recover source row_index"),
+        ("gpu-" + "9" * 5_000, "noncanonical"),
+    ],
+)
+def test_unparseable_digit_episode_identifier_fails_closed(
+    tmp_path: Path, episode_id: str, match: str
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "validation-00000.parquet"
+        table = pq.read_table(path)
+        values = pa.array([episode_id] * table.num_rows, type=pa.string())
+        table = table.set_column(
+            table.schema.get_field_index("episode_id"), "episode_id", values
+        )
+        pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match=match):
+        audit_v3(source, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
 def test_null_episode_identifier_fails_closed_with_evidence(tmp_path: Path) -> None:
@@ -523,6 +636,25 @@ def test_non_finite_sensor_is_excluded(tmp_path: Path) -> None:
         == 2
     )
     assert report.splits["train"]["exclusion_reasons"]["non_finite_gpu_temp_c"] == 1
+
+
+def test_distribution_mean_is_overflow_resistant(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    for split in SPLITS:
+        path = source / "v3" / "state_telemetry" / f"{split}-00000.parquet"
+        table = pq.read_table(path)
+        values = pa.array([1e308] * table.num_rows, type=pa.float64())
+        table = table.set_column(
+            table.schema.get_field_index("mem_util_pct"), "mem_util_pct", values
+        )
+        pq.write_table(table, path)
+
+    report = audit_v3(source, output)
+
+    mean = report.splits["train"]["numeric_sensor_columns"]["mem_util_pct"]["mean"]
+    assert mean == 1e308
 
 
 @pytest.mark.parametrize(

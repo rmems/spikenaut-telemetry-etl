@@ -72,9 +72,10 @@ def _require_mapping(value: Any, context: str) -> dict[str, Any]:
     return value
 
 
-def _load_campaign(campaign_path: Path) -> tuple[dict[str, Any], int]:
+def _load_campaign(campaign_path: Path) -> tuple[dict[str, Any], int, str]:
     try:
-        campaign = _require_mapping(json.loads(campaign_path.read_text()), "campaign")
+        campaign_bytes = campaign_path.read_bytes()
+        campaign = _require_mapping(json.loads(campaign_bytes.decode()), "campaign")
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PreparationError(f"cannot read campaign {campaign_path}: {exc}") from exc
     minimum = campaign.get("min_examples_per_session")
@@ -93,7 +94,7 @@ def _load_campaign(campaign_path: Path) -> tuple[dict[str, Any], int]:
         if missing:
             raise PreparationError(f"sessions[{position}] missing {', '.join(missing)}")
         session_id = item["session_id"]
-        if not isinstance(session_id, str) or not session_id:
+        if not isinstance(session_id, str) or not session_id.strip():
             raise PreparationError(f"sessions[{position}].session_id must be non-empty")
         if session_id in seen:
             raise PreparationError(f"duplicate session_id {session_id}")
@@ -108,9 +109,11 @@ def _load_campaign(campaign_path: Path) -> tuple[dict[str, Any], int]:
             raise PreparationError(
                 f"session {session_id} path must be a non-empty string"
             )
+        if "\x00" in item["path"]:
+            raise PreparationError(f"session {session_id} path contains a null byte")
     if not any(item["split"] == "train" for item in sessions):
         raise PreparationError("campaign needs at least one training session")
-    return campaign, minimum
+    return campaign, minimum, hashlib.sha256(campaign_bytes).hexdigest()
 
 
 def _load_manifest(session_path: Path, expected_id: str) -> tuple[dict[str, Any], Path]:
@@ -401,17 +404,19 @@ def _statistics(rows: list[list[float]], width: int, name: str) -> dict[str, lis
     for column in range(width):
         values = [row[column] for row in rows]
         try:
-            mean = math.fsum(value / count for value in values)
-            deviations = [value - mean for value in values]
-            scale = max(abs(value) for value in deviations)
-            std = (
-                0.0
-                if scale == 0.0
-                else scale
-                * math.sqrt(
-                    math.fsum((value / scale) ** 2 for value in deviations) / count
+            if not all(math.isfinite(value) for value in values):
+                raise OverflowError
+            scale = max(abs(value) for value in values)
+            if scale == 0.0:
+                mean = 0.0
+                std = 0.0
+            else:
+                scaled = [value / scale for value in values]
+                scaled_mean = math.fsum(scaled) / count
+                mean = scale * scaled_mean
+                std = scale * math.sqrt(
+                    math.fsum((value - scaled_mean) ** 2 for value in scaled) / count
                 )
-            )
         except OverflowError as exc:
             raise PreparationError(
                 f"training split produced non-finite {name} normalization statistics"
@@ -455,7 +460,13 @@ def _out_of_training_range(
     return result
 
 
-def _prepare_campaign(campaign_path: Path, output_dir: Path) -> dict[str, Any]:
+def _prepare_campaign(
+    campaign_path: Path,
+    output_dir: Path,
+    campaign: dict[str, Any],
+    minimum: int,
+    campaign_sha256: str,
+) -> dict[str, Any]:
     """Validate and prepare one immutable anticipation campaign.
 
     ``campaign_path`` contains the preassigned sessions and the predeclared
@@ -463,7 +474,6 @@ def _prepare_campaign(campaign_path: Path, output_dir: Path) -> dict[str, Any]:
     only after every assigned session satisfies the same contract.
     """
 
-    campaign, minimum = _load_campaign(campaign_path)
     prepared_sessions: list[dict[str, Any]] = []
     provenance_sources: list[dict[str, Any]] = []
     total_rejections: Counter[str] = Counter()
@@ -586,7 +596,7 @@ def _prepare_campaign(campaign_path: Path, output_dir: Path) -> dict[str, Any]:
             "out_of_training_range": _out_of_training_range(prepared_sessions, train_x),
         },
         "provenance": {
-            "campaign_sha256": _sha256(campaign_path),
+            "campaign_sha256": campaign_sha256,
             "sources": provenance_sources,
         },
     }
@@ -615,24 +625,79 @@ def _assignments(campaign_path: Path) -> list[dict[str, Any]]:
     ]
 
 
+def _campaign_assignments(campaign: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {key: item.get(key) for key in ("session_id", "split", "seed", "path")}
+        for item in campaign.get("sessions", [])
+        if isinstance(item, dict)
+    ]
+
+
+def _remove_owned_preparation_outputs(output_dir: Path) -> None:
+    for name in (
+        "prepared.json",
+        "quality-report.json",
+        "manifest.json",
+        "prepared.json.tmp",
+        "quality-report.json.tmp",
+        "manifest.json.tmp",
+    ):
+        path = output_dir / name
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.is_dir() and name.endswith(".tmp"):
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+
+
 def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[str, Any]:
     """Prepare a campaign and always publish a versioned completion report."""
 
     campaign_path = Path(campaign_path).resolve()
     output_dir = Path(output_dir).resolve()
-    output_artifacts = {
-        (output_dir / name).resolve()
-        for name in ("prepared.json", "quality-report.json", "manifest.json")
-    }
-    output_artifacts.update(
-        artifact.with_name(artifact.name + ".tmp") for artifact in tuple(output_artifacts)
-    )
+    output_paths = [
+        output_dir / name
+        for name in (
+            "prepared.json",
+            "quality-report.json",
+            "manifest.json",
+            "prepared.json.tmp",
+            "quality-report.json.tmp",
+            "manifest.json.tmp",
+        )
+    ]
+    output_artifacts = {path.resolve() for path in output_paths}
     if campaign_path in output_artifacts:
         raise PreparationError(f"campaign {campaign_path} collides with output artifact")
-    assignments = _assignments(campaign_path)
+    staging_symlinks = [path for path in output_paths if path.is_symlink()]
+    if staging_symlinks:
+        raise PreparationError(f"output staging path is a symlink: {staging_symlinks[0]}")
+    assignments: list[dict[str, Any]] = []
     try:
-        prepared = _prepare_campaign(campaign_path, output_dir)
+        campaign, minimum, campaign_sha256 = _load_campaign(campaign_path)
+        assignments = _campaign_assignments(campaign)
+        prepared = _prepare_campaign(
+            campaign_path,
+            output_dir,
+            campaign,
+            minimum,
+            campaign_sha256,
+        )
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "complete",
+            "assignments": assignments,
+            "prepared_sha256": _sha256(output_dir / "prepared.json"),
+            "session_counts": prepared["quality"]["session_summaries"],
+            "sources": prepared["provenance"]["sources"],
+        }
+        _write_json(output_dir / "quality-report.json", prepared["quality"])
+        _write_json(output_dir / "manifest.json", manifest)
     except (OSError, PreparationError) as exc:
+        if not assignments:
+            assignments = _assignments(campaign_path)
         incomplete = {
             "schema_version": SCHEMA_VERSION,
             "status": "incomplete",
@@ -640,18 +705,8 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             "failure_reasons": [str(exc)],
             **getattr(exc, "details", {}),
         }
-        (output_dir / "prepared.json").unlink(missing_ok=True)
+        _remove_owned_preparation_outputs(output_dir)
         _write_json(output_dir / "quality-report.json", incomplete)
         _write_json(output_dir / "manifest.json", incomplete)
         raise
-    manifest = {
-        "schema_version": SCHEMA_VERSION,
-        "status": "complete",
-        "assignments": assignments,
-        "prepared_sha256": _sha256(output_dir / "prepared.json"),
-        "session_counts": prepared["quality"]["session_summaries"],
-        "sources": prepared["provenance"]["sources"],
-    }
-    _write_json(output_dir / "quality-report.json", prepared["quality"])
-    _write_json(output_dir / "manifest.json", manifest)
     return prepared

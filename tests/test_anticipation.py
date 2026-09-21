@@ -8,6 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import spikenaut_etl.anticipation as anticipation
 from spikenaut_etl.anticipation import PreparationError, _statistics, prepare_campaign
 from spikenaut_etl.cli import main
 
@@ -286,7 +287,7 @@ def test_normalization_uses_training_only_and_records_constants(tmp_path: Path) 
 
 
 def test_normalization_statistics_are_overflow_resistant_and_finite() -> None:
-    statistics = _statistics([[1.7e308], [-1.7e308]], 1, "x")
+    statistics = _statistics([[1.7e308], [-1.7e308], [1.7e308]], 1, "x")
 
     assert all(math.isfinite(value) for value in statistics["x_mean"])
     assert all(math.isfinite(value) for value in statistics["x_std"])
@@ -391,6 +392,69 @@ def test_campaign_cannot_collide_with_output_artifacts(
     assert colliding_campaign.read_text() == original
 
 
+def test_symlinked_staging_path_cannot_overwrite_campaign(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    original = campaign.read_bytes()
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "manifest.json.tmp").symlink_to(campaign)
+
+    with pytest.raises(PreparationError, match="collides with output artifact"):
+        prepare_campaign(campaign, output)
+
+    assert campaign.read_bytes() == original
+
+
+def test_final_report_write_failure_removes_complete_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    original_write = anticipation._write_json
+    failed = False
+
+    def fail_first_manifest(path: Path, value: object) -> None:
+        nonlocal failed
+        if path.name == "manifest.json" and not failed:
+            failed = True
+            raise OSError("blocked final manifest")
+        original_write(path, value)
+
+    monkeypatch.setattr(anticipation, "_write_json", fail_first_manifest)
+
+    with pytest.raises(OSError, match="blocked final manifest"):
+        prepare_campaign(campaign, output)
+
+    assert not (output / "prepared.json").exists()
+    assert (
+        json.loads((output / "quality-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_campaign_hash_and_assignments_use_loaded_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    original = campaign.read_bytes()
+    original_read_rows = anticipation._read_rows
+
+    def replace_campaign_after_load(session_path: Path, session_id: str):
+        campaign.write_text(json.dumps({"min_examples_per_session": 1, "sessions": []}))
+        return original_read_rows(session_path, session_id)
+
+    monkeypatch.setattr(anticipation, "_read_rows", replace_campaign_after_load)
+
+    prepared = prepare_campaign(campaign, tmp_path / "out")
+    manifest = json.loads((tmp_path / "out" / "manifest.json").read_text())
+
+    assert (
+        prepared["provenance"]["campaign_sha256"]
+        == __import__("hashlib").sha256(original).hexdigest()
+    )
+    assert manifest["assignments"][0]["session_id"] == "session-01"
+
+
 def test_invalid_utf8_campaign_writes_incomplete_reports(tmp_path: Path) -> None:
     campaign = tmp_path / "campaign.json"
     campaign.write_bytes(b"\xff\xfe")
@@ -478,6 +542,30 @@ def test_malformed_path_still_writes_incomplete_reports(tmp_path: Path) -> None:
 
     with pytest.raises(PreparationError, match="path"):
         prepare_campaign(campaign, tmp_path / "out")
+    assert (
+        json.loads((tmp_path / "out" / "manifest.json").read_text())["status"]
+        == "incomplete"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("session_id", "   ", "session_id must be non-empty"),
+        ("path", "bad\x00path", "path contains a null byte"),
+    ],
+)
+def test_invalid_session_identity_or_path_writes_incomplete_reports(
+    tmp_path: Path, field: str, value: str, match: str
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    body = json.loads(campaign.read_text())
+    body["sessions"][0][field] = value
+    campaign.write_text(json.dumps(body))
+
+    with pytest.raises(PreparationError, match=match):
+        prepare_campaign(campaign, tmp_path / "out")
+
     assert (
         json.loads((tmp_path / "out" / "manifest.json").read_text())["status"]
         == "incomplete"
