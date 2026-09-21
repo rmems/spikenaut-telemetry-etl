@@ -98,7 +98,10 @@ def _episode_number(episode_id: str) -> int:
         raise AuditError(
             f"cannot recover source row_index from episode_id {episode_id!r}"
         )
-    return int(value)
+    episode_number = int(value)
+    if episode_id != f"gpu-{episode_number:06d}":
+        raise AuditError(f"noncanonical episode_id {episode_id!r}")
+    return episode_number
 
 
 def _source_index(key: tuple[str, int]) -> int:
@@ -168,7 +171,7 @@ def _load_split(v3_root: Path, split: str) -> tuple[Path, Path, pa.Table, pa.Tab
         raise AuditError(f"cannot read {split} source shards: {exc}") from exc
     _require_columns(
         state,
-        ("episode_id", "step_idx", *SENSOR_COLUMNS),
+        ("episode_id", "step_idx", "ts_utc", *SENSOR_COLUMNS),
         f"state_telemetry/{split}",
     )
     _require_columns(
@@ -226,8 +229,7 @@ def _clean_owned_outputs(output_root: Path) -> None:
             path.unlink()
     view_root = output_root / VIEW_ID
     if view_root.is_dir():
-        for split in SPLITS:
-            path = view_root / f"{split}-00000.parquet"
+        for path in view_root.rglob("*.parquet"):
             if path.is_file():
                 path.unlink()
 
@@ -481,12 +483,14 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
     manifest. Row-level defects are written with exact reasons. Source files
     are read only and the output is forbidden from overlapping their tree.
     """
-    dataset_root, v3_root = _source_root(Path(source_dir))
     output_root = Path(output_dir).resolve()
-    _guard_output_path(dataset_root, v3_root, output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     _clean_owned_outputs(output_root)
+    dataset_root: Path | None = None
+    v3_root: Path | None = None
     try:
+        dataset_root, v3_root = _source_root(Path(source_dir))
+        _guard_output_path(dataset_root, v3_root, output_root)
         return _audit_v3_impl(dataset_root, v3_root, output_root)
     except AuditError as exc:
         failure = {"category": "structural_integrity", "reason": str(exc)}
@@ -505,8 +509,12 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
             "horizon_samples": HORIZON_SAMPLES,
             "status": "incomplete",
             "failure": failure,
-            "source_git_commit": _git_head(dataset_root),
-            "source_files": _available_source_hashes(dataset_root, v3_root),
+            "source_git_commit": _git_head(dataset_root) if dataset_root else None,
+            "source_files": (
+                _available_source_hashes(dataset_root, v3_root)
+                if dataset_root is not None and v3_root is not None
+                else {}
+            ),
             "outputs": {},
         }
         (output_root / "audit-report.json").write_text(

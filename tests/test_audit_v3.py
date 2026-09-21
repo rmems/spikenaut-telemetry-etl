@@ -233,6 +233,49 @@ def test_state_outcome_join_mismatch_fails_closed(tmp_path: Path) -> None:
         audit_v3(source, tmp_path / "audit")
 
 
+def test_missing_source_root_writes_incomplete_evidence(tmp_path: Path) -> None:
+    output = tmp_path / "audit"
+
+    with pytest.raises(AuditError, match="cannot find v3 state_telemetry"):
+        audit_v3(tmp_path / "missing-source", output)
+
+    report = json.loads((output / "audit-report.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert report["status"] == "incomplete"
+    assert manifest["status"] == "incomplete"
+    assert manifest["source_files"] == {}
+
+
+def test_missing_timestamp_column_fails_closed_with_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    path = source / "v3" / "state_telemetry" / "train-00000.parquet"
+    table = pq.read_table(path).drop_columns(["ts_utc"])
+    pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="missing required columns: ts_utc"):
+        audit_v3(source, output)
+
+    report = json.loads((output / "audit-report.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert report["status"] == "incomplete"
+    assert manifest["status"] == "incomplete"
+
+
+def test_rebuild_removes_every_stale_owned_view_shard(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    stale = output / "v3-forecast-eligible-v1" / "train-00001.parquet"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"stale shard")
+
+    audit_v3(source, output)
+
+    assert not stale.exists()
+
+
 def test_episode_cannot_belong_to_two_splits(tmp_path: Path) -> None:
     source = tmp_path / "source"
     _write_corpus(source)
@@ -249,6 +292,28 @@ def test_episode_cannot_belong_to_two_splits(tmp_path: Path) -> None:
 
     with pytest.raises(AuditError, match="multiple splits"):
         audit_v3(source, tmp_path / "audit")
+
+
+def test_noncanonical_episode_identifier_fails_closed(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "validation-00000.parquet"
+        table = pq.read_table(path)
+        aliases = pa.array(["gpu-0"] * table.num_rows, type=pa.string())
+        table = table.set_column(
+            table.schema.get_field_index("episode_id"), "episode_id", aliases
+        )
+        pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="noncanonical episode_id"):
+        audit_v3(source, output)
+
+    report = json.loads((output / "audit-report.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert report["status"] == "incomplete"
+    assert manifest["status"] == "incomplete"
 
 
 def test_wrong_existing_64_sample_outcome_is_excluded_and_reported(
