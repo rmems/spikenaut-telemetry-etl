@@ -1056,3 +1056,79 @@ def test_parquet_publication_replaces_links(
     monkeypatch.setattr(audit_module, "_clean_owned_outputs", replace_after_cleanup)
     audit_v3(source, output)
     assert sentinel.read_bytes() == b"preserve source bytes"
+
+
+def test_publication_rejects_replaced_view_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    target = source / "v3/state_telemetry"
+    before = {p.name: p.read_bytes() for p in target.glob("*.parquet")}
+    original = audit_module._clean_owned_outputs
+    replaced = False
+
+    def swap_after_cleanup(root: Path) -> None:
+        nonlocal replaced
+        original(root)
+        if not replaced:
+            view = root / "v3-forecast-eligible-v1"
+            if view.exists():
+                view.rmdir()
+            view.symlink_to(target, target_is_directory=True)
+            replaced = True
+
+    monkeypatch.setattr(audit_module, "_clean_owned_outputs", swap_after_cleanup)
+    with pytest.raises(AuditError, match="cannot write audit outputs"):
+        audit_v3(source, output)
+    assert {p.name: p.read_bytes() for p in target.glob("*.parquet")} == before
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_source_change_during_publication_prevents_complete_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    target = source / "v3/state_telemetry/train-00000.parquet"
+    original = audit_module.write_parquet
+
+    def change_after_output(path: Path, table: pa.Table) -> None:
+        original(path, table)
+        target.write_bytes(target.read_bytes() + b"changed")
+
+    monkeypatch.setattr(audit_module, "write_parquet", change_after_output)
+    with pytest.raises(AuditError, match="source shards changed during publication"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_directory_swap_during_replace_keeps_source_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from spikenaut_etl import artifacts
+
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    target = source / "v3/state_telemetry"
+    before = {p.name: p.read_bytes() for p in target.glob("*.parquet")}
+    original = artifacts.os.replace
+    swapped = False
+
+    def swap_before_replace(src: str, dst: str, **kwargs: int) -> None:
+        nonlocal swapped
+        if dst.endswith(".parquet") and not swapped:
+            view = output / "v3-forecast-eligible-v1"
+            view.rename(output / "detached-view")
+            view.symlink_to(target, target_is_directory=True)
+            swapped = True
+        original(src, dst, **kwargs)
+
+    monkeypatch.setattr(artifacts.os, "replace", swap_before_replace)
+    with pytest.raises(AuditError, match="directory changed during publication"):
+        audit_v3(source, output)
+    assert {p.name: p.read_bytes() for p in target.glob("*.parquet")} == before
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"

@@ -609,6 +609,8 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
         | {"exclusions.parquet": _sha256(output_root / "exclusions.parquet")},
     }
     write_json(output_root / "audit-report.json", report.to_dict())
+    if _available_source_hashes(dataset_root, v3_root) != source_hashes:
+        raise AuditError("source shards changed during publication")
     write_json(output_root / "manifest.json", manifest)
     return report
 
