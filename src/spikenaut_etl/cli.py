@@ -119,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         try:
             prepared = prepare_campaign(args.input, args.output)
-        except PreparationError as exc:
+        except (PreparationError, OSError) as exc:
             print(f"prepare-anticipation failed: {exc}", file=sys.stderr)
             return 1
         examples = sum(len(session["examples"]) for session in prepared["sessions"])
@@ -140,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         try:
             audit = audit_v3(args.input, args.output)
-        except AuditError as exc:
+        except (AuditError, OSError) as exc:
             print(f"audit-v3 failed: {exc}", file=sys.stderr)
             return 1
         counts = ", ".join(

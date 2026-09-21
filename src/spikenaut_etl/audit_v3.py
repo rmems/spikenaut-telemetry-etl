@@ -193,21 +193,6 @@ def _source_root(source_dir: Path) -> tuple[Path, Path, bool]:
 def _load_split(v3_root: Path, split: str) -> tuple[Path, Path, pa.Table, pa.Table]:
     state_path = v3_root / "state_telemetry" / f"{split}-00000.parquet"
     outcome_path = v3_root / "outcomes" / f"{split}-00000.parquet"
-    expected_names = {f"{name}-00000.parquet" for name in SPLITS}
-    source_directories = [state_path.parent, outcome_path.parent]
-    action_directory = v3_root / "action_proposals"
-    if action_directory.is_dir():
-        source_directories.append(action_directory)
-    for directory in source_directories:
-        unexpected = sorted(
-            path.name
-            for path in directory.glob("*.parquet")
-            if path.name not in expected_names
-        )
-        if unexpected:
-            raise AuditError(
-                f"{directory.name} has unexpected source shards: {', '.join(unexpected)}"
-            )
     for path in (state_path, outcome_path):
         if not path.is_file():
             raise AuditError(f"missing source shard {path}")
@@ -314,15 +299,25 @@ def _available_source_hashes(
     dataset_root: Path, v3_root: Path, *, tolerate_unreadable: bool = False
 ) -> dict[str, str]:
     hashes: dict[str, str] = {}
+    expected_names = {f"{split}-00000.parquet" for split in SPLITS}
     for config in ("state_telemetry", "outcomes", "action_proposals"):
-        for split in SPLITS:
-            path = v3_root / config / f"{split}-00000.parquet"
-            if path.is_file():
-                try:
-                    hashes[path.relative_to(dataset_root).as_posix()] = _sha256(path)
-                except OSError:
-                    if not tolerate_unreadable:
-                        raise
+        directory = v3_root / config
+        if not directory.is_dir():
+            continue
+        paths = sorted(directory.glob("*.parquet"))
+        unexpected = [path.name for path in paths if path.name not in expected_names]
+        if unexpected and not tolerate_unreadable:
+            raise AuditError(
+                f"{directory.name} has unexpected source shards: {', '.join(unexpected)}"
+            )
+        for path in paths:
+            if path.name not in expected_names or not path.is_file():
+                continue
+            try:
+                hashes[path.relative_to(dataset_root).as_posix()] = _sha256(path)
+            except OSError:
+                if not tolerate_unreadable:
+                    raise
     return dict(sorted(hashes.items()))
 
 

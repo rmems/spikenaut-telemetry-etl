@@ -131,7 +131,12 @@ def _load_manifest(
         raise PreparationError(
             f"session {expected_id} manifest unavailable: {exc}"
         ) from exc
-    if manifest.get("schema_version") != 1:
+    schema_version = manifest.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != 1
+    ):
         raise PreparationError(f"session {expected_id} manifest schema_version must be 1")
     if not isinstance(manifest.get("session_id"), str) or not manifest["session_id"]:
         raise PreparationError(f"session {expected_id} manifest session_id is incomplete")
@@ -695,13 +700,16 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             "manifest.json.tmp",
         )
     ]
-    resolution_error: PreparationError | None
-    try:
-        output_artifacts = {path.resolve() for path in output_paths}
-        resolution_error = None
-    except RuntimeError as exc:
-        output_artifacts = set()
-        resolution_error = PreparationError(f"output artifact symlink loop: {exc}")
+    resolution_error: PreparationError | None = None
+    output_artifacts = set(output_paths)
+    for path in output_paths:
+        try:
+            output_artifacts.add(path.resolve())
+        except RuntimeError as exc:
+            if resolution_error is None:
+                resolution_error = PreparationError(
+                    f"output artifact symlink loop: {exc}"
+                )
     if campaign_path in output_artifacts:
         raise PreparationError(f"campaign {campaign_path} collides with output artifact")
     assignments: list[dict[str, Any]] = []

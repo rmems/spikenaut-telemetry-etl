@@ -10,9 +10,33 @@ import pytest
 
 import spikenaut_etl.audit_v3 as audit_module
 from spikenaut_etl.audit_v3 import AuditError, audit_v3
+from spikenaut_etl.cli import main
 from spikenaut_etl.v3_build import OUTCOMES_SCHEMA, STATE_SCHEMA
 
 SPLITS = ("train", "validation", "test")
+
+
+def test_cli_reports_audit_os_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fail_audit(*_args: object, **_kwargs: object) -> None:
+        raise OSError("source filesystem unavailable")
+
+    monkeypatch.setattr(audit_module, "audit_v3", fail_audit)
+
+    assert (
+        main(
+            [
+                "audit-v3",
+                "--input",
+                str(tmp_path / "v3"),
+                "--output",
+                str(tmp_path / "audit"),
+            ]
+        )
+        == 1
+    )
+    assert capsys.readouterr().err == "audit-v3 failed: source filesystem unavailable\n"
 
 
 def _state_table(
@@ -460,6 +484,37 @@ def test_source_hash_change_during_audit_fails_closed(
     monkeypatch.setattr(audit_module, "_available_source_hashes", changed_hashes)
 
     with pytest.raises(AuditError, match="source shards changed during audit"):
+        audit_v3(source, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_late_unexpected_source_shard_fails_final_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original_hashes = audit_module._available_source_hashes
+    calls = 0
+
+    def add_shard_before_final_snapshot(
+        dataset_root: Path, v3_root: Path, *, tolerate_unreadable: bool = False
+    ) -> dict[str, str]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            canonical = v3_root / "state_telemetry" / "train-00000.parquet"
+            (canonical.parent / "train-00001.parquet").write_bytes(canonical.read_bytes())
+        return original_hashes(
+            dataset_root, v3_root, tolerate_unreadable=tolerate_unreadable
+        )
+
+    monkeypatch.setattr(
+        audit_module, "_available_source_hashes", add_shard_before_final_snapshot
+    )
+
+    with pytest.raises(AuditError, match="unexpected source shards"):
         audit_v3(source, output)
 
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"

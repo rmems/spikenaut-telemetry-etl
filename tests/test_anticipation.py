@@ -484,6 +484,47 @@ def test_cyclic_output_symlink_routes_through_incomplete_cleanup(
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
+def test_collision_is_preserved_when_another_output_artifact_is_cyclic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    output.mkdir()
+    campaign = output / "manifest.json"
+    original = source_campaign.read_bytes()
+    campaign.write_bytes(original)
+    loop = output / "prepared.json"
+    loop.symlink_to(loop)
+    real_resolve = Path.resolve
+
+    def reject_loop(path: Path, *args: object, **kwargs: object) -> Path:
+        if path == loop:
+            raise RuntimeError("Symlink loop")
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", reject_loop)
+
+    with pytest.raises(PreparationError, match="collides with output artifact"):
+        prepare_campaign(campaign, output)
+
+    assert campaign.read_bytes() == original
+    assert loop.is_symlink()
+
+
+def test_boolean_collector_schema_version_fails_closed(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    manifest_path = tmp_path / "session-01" / "session_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["schema_version"] = True
+    manifest_path.write_text(json.dumps(manifest))
+    output = tmp_path / "out"
+
+    with pytest.raises(PreparationError, match="schema_version must be 1"):
+        prepare_campaign(campaign, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
 def test_final_report_write_failure_removes_complete_payload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -622,6 +663,32 @@ def test_cli_registers_prepare_anticipation(tmp_path: Path) -> None:
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["session_counts"][0]["source_rows"] == 111
     assert manifest["sources"][0]["manifest_sha256"]
+
+
+def test_cli_reports_prepare_os_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fail_prepare(*_args: object, **_kwargs: object) -> None:
+        raise OSError("output filesystem unavailable")
+
+    monkeypatch.setattr(anticipation, "prepare_campaign", fail_prepare)
+
+    assert (
+        main(
+            [
+                "prepare-anticipation",
+                "--input",
+                str(tmp_path / "campaign.json"),
+                "--output",
+                str(tmp_path / "prepared"),
+            ]
+        )
+        == 1
+    )
+    assert (
+        capsys.readouterr().err
+        == "prepare-anticipation failed: output filesystem unavailable\n"
+    )
 
 
 def test_malformed_path_still_writes_incomplete_reports(tmp_path: Path) -> None:
