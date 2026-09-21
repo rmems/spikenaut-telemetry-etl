@@ -183,7 +183,11 @@ def _load_split(v3_root: Path, split: str) -> tuple[Path, Path, pa.Table, pa.Tab
     state_path = v3_root / "state_telemetry" / f"{split}-00000.parquet"
     outcome_path = v3_root / "outcomes" / f"{split}-00000.parquet"
     expected_names = {f"{name}-00000.parquet" for name in SPLITS}
-    for directory in (state_path.parent, outcome_path.parent):
+    source_directories = [state_path.parent, outcome_path.parent]
+    action_directory = v3_root / "action_proposals"
+    if action_directory.is_dir():
+        source_directories.append(action_directory)
+    for directory in source_directories:
         unexpected = sorted(
             path.name
             for path in directory.glob("*.parquet")

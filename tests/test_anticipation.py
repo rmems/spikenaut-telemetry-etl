@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from spikenaut_etl.anticipation import PreparationError, prepare_campaign
+from spikenaut_etl.anticipation import PreparationError, _statistics, prepare_campaign
 from spikenaut_etl.cli import main
 
 
@@ -284,6 +285,17 @@ def test_normalization_uses_training_only_and_records_constants(tmp_path: Path) 
     assert prepared["quality"]["out_of_training_range"]["validation"][2] > 0
 
 
+def test_normalization_statistics_are_overflow_resistant_and_finite() -> None:
+    statistics = _statistics([[1.7e308], [-1.7e308]], 1, "x")
+
+    assert all(math.isfinite(value) for value in statistics["x_mean"])
+    assert all(math.isfinite(value) for value in statistics["x_std"])
+    assert all(math.isfinite(value) for value in statistics["x_raw_std"])
+
+    with pytest.raises(PreparationError, match="non-finite x normalization"):
+        _statistics([[math.inf]], 1, "x")
+
+
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
@@ -353,7 +365,15 @@ def test_preserves_assignments_and_rejects_duplicate_ids_or_bad_splits(
 
 
 @pytest.mark.parametrize(
-    "artifact_name", ["prepared.json", "quality-report.json", "manifest.json"]
+    "artifact_name",
+    [
+        "prepared.json",
+        "quality-report.json",
+        "manifest.json",
+        "prepared.json.tmp",
+        "quality-report.json.tmp",
+        "manifest.json.tmp",
+    ],
 )
 def test_campaign_cannot_collide_with_output_artifacts(
     tmp_path: Path, artifact_name: str
@@ -371,6 +391,34 @@ def test_campaign_cannot_collide_with_output_artifacts(
     assert colliding_campaign.read_text() == original
 
 
+def test_invalid_utf8_campaign_writes_incomplete_reports(tmp_path: Path) -> None:
+    campaign = tmp_path / "campaign.json"
+    campaign.write_bytes(b"\xff\xfe")
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "prepared.json").write_text("stale complete result")
+
+    with pytest.raises(PreparationError, match="cannot read campaign"):
+        prepare_campaign(campaign, output)
+
+    assert not (output / "prepared.json").exists()
+    assert (
+        json.loads((output / "quality-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_invalid_utf8_session_manifest_writes_incomplete_reports(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    (tmp_path / "session-01" / "session_manifest.json").write_bytes(b"\xff\xfe")
+    output = tmp_path / "out"
+
+    with pytest.raises(PreparationError, match="manifest unavailable"):
+        prepare_campaign(campaign, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
 def test_predeclared_minimum_keeps_deficient_session_visible_and_fails(
     tmp_path: Path,
 ) -> None:
@@ -385,6 +433,7 @@ def test_predeclared_minimum_keeps_deficient_session_visible_and_fails(
     quality = json.loads((tmp_path / "out" / "quality-report.json").read_text())
     assert failure_manifest["status"] == "incomplete"
     assert failure_manifest["assignments"][0]["session_id"] == "session-01"
+    assert failure_manifest["assignments"][0]["path"] == str(tmp_path / "session-01")
     assert "requires 500" in quality["failure_reasons"][0]
     assert quality["session_summaries"][0]["eligible_examples"] == 11
     assert quality["provenance"][0]["manifest_sha256"]

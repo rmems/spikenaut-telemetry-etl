@@ -301,6 +301,34 @@ def test_unexpected_source_shard_fails_closed(tmp_path: Path) -> None:
     )
 
 
+def test_unexpected_action_proposal_shard_fails_closed(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    proposal_dir = source / "v3" / "action_proposals"
+    proposal_dir.mkdir()
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "episode_id": "gpu-000000",
+                    "step_idx": 0,
+                    "proposed_action": "hold",
+                    "teacher_action": None,
+                }
+            ]
+        ),
+        proposal_dir / "train-00001.parquet",
+    )
+
+    with pytest.raises(AuditError, match="unexpected source shards"):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+
+
 def test_rebuild_removes_every_stale_owned_view_shard(tmp_path: Path) -> None:
     source = tmp_path / "source"
     output = tmp_path / "audit"

@@ -75,7 +75,7 @@ def _require_mapping(value: Any, context: str) -> dict[str, Any]:
 def _load_campaign(campaign_path: Path) -> tuple[dict[str, Any], int]:
     try:
         campaign = _require_mapping(json.loads(campaign_path.read_text()), "campaign")
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PreparationError(f"cannot read campaign {campaign_path}: {exc}") from exc
     minimum = campaign.get("min_examples_per_session")
     if not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 1:
@@ -119,7 +119,7 @@ def _load_manifest(session_path: Path, expected_id: str) -> tuple[dict[str, Any]
         manifest = _require_mapping(
             json.loads(manifest_path.read_text()), str(manifest_path)
         )
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PreparationError(
             f"session {expected_id} manifest unavailable: {exc}"
         ) from exc
@@ -395,11 +395,33 @@ def _examples(
 def _statistics(rows: list[list[float]], width: int, name: str) -> dict[str, list[Any]]:
     if not rows:
         raise PreparationError(f"training split has no values for {name} normalization")
-    means = [sum(row[column] for row in rows) / len(rows) for column in range(width)]
-    raw_std = [
-        math.sqrt(sum((row[column] - means[column]) ** 2 for row in rows) / len(rows))
-        for column in range(width)
-    ]
+    means: list[float] = []
+    raw_std: list[float] = []
+    count = len(rows)
+    for column in range(width):
+        values = [row[column] for row in rows]
+        try:
+            mean = math.fsum(value / count for value in values)
+            deviations = [value - mean for value in values]
+            scale = max(abs(value) for value in deviations)
+            std = (
+                0.0
+                if scale == 0.0
+                else scale
+                * math.sqrt(
+                    math.fsum((value / scale) ** 2 for value in deviations) / count
+                )
+            )
+        except OverflowError as exc:
+            raise PreparationError(
+                f"training split produced non-finite {name} normalization statistics"
+            ) from exc
+        if not math.isfinite(mean) or not math.isfinite(std):
+            raise PreparationError(
+                f"training split produced non-finite {name} normalization statistics"
+            )
+        means.append(mean)
+        raw_std.append(std)
     constant = [value == 0.0 for value in raw_std]
     return {
         f"{name}_mean": means,
@@ -582,12 +604,12 @@ def _write_json(path: Path, value: Any) -> None:
 def _assignments(campaign_path: Path) -> list[dict[str, Any]]:
     try:
         raw = json.loads(campaign_path.read_text()).get("sessions", [])
-    except OSError, json.JSONDecodeError, AttributeError:
+    except OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError:
         return []
     if not isinstance(raw, list):
         return []
     return [
-        {key: item.get(key) for key in ("session_id", "split", "seed")}
+        {key: item.get(key) for key in ("session_id", "split", "seed", "path")}
         for item in raw
         if isinstance(item, dict)
     ]
@@ -602,6 +624,9 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
         (output_dir / name).resolve()
         for name in ("prepared.json", "quality-report.json", "manifest.json")
     }
+    output_artifacts.update(
+        artifact.with_name(artifact.name + ".tmp") for artifact in tuple(output_artifacts)
+    )
     if campaign_path in output_artifacts:
         raise PreparationError(f"campaign {campaign_path} collides with output artifact")
     assignments = _assignments(campaign_path)
