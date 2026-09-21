@@ -15,6 +15,7 @@ import os
 import re
 from bisect import bisect_left, bisect_right
 from collections import Counter
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -23,11 +24,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .artifacts import (
+    RetainedArtifact,
     clean_artifacts,
     directory_identity,
     ensure_directory,
     no_replace_publication,
     pinned_publication,
+    retain_regular_artifact,
 )
 from .artifacts import write_json as _write_json
 
@@ -858,10 +861,19 @@ PREPARED_ARTIFACT_ERROR = "prepared artifact changed during publication"
 QUALITY_REPORT_ERROR = "quality report changed during publication"
 
 
+def _retained_digest(artifact: RetainedArtifact, error: str) -> str:
+    try:
+        return artifact.sha256()
+    except OSError as exc:
+        raise PreparationError(error) from exc
+
+
 def _verify_publication(
     output_dir: Path,
     identity: tuple[int, int],
+    prepared_artifact: RetainedArtifact,
     prepared_digest: str,
+    quality_report: RetainedArtifact,
     quality_report_digest: str,
     *,
     hash_first: bool = False,
@@ -871,11 +883,17 @@ def _verify_publication(
             raise PreparationError(PUBLICATION_DIRECTORY_ERROR)
 
     def check_artifact() -> None:
-        if _sha256(output_dir / "prepared.json") != prepared_digest:
+        if (
+            _retained_digest(prepared_artifact, PREPARED_ARTIFACT_ERROR)
+            != prepared_digest
+        ):
             raise PreparationError(PREPARED_ARTIFACT_ERROR)
 
     def check_quality_report() -> None:
-        if _sha256(output_dir / "quality-report.json") != quality_report_digest:
+        if (
+            _retained_digest(quality_report, QUALITY_REPORT_ERROR)
+            != quality_report_digest
+        ):
             raise PreparationError(QUALITY_REPORT_ERROR)
 
     checks = (
@@ -997,37 +1015,63 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
                     minimum,
                     campaign_sha256,
                 )
-                manifest = {
-                    "schema_version": SCHEMA_VERSION,
-                    "status": "complete",
-                    "assignments": assignments,
-                    "prepared_sha256": _sha256(output_dir / "prepared.json"),
-                    "session_counts": prepared["quality"]["session_summaries"],
-                    "sources": prepared["provenance"]["sources"],
-                }
                 _write_json(output_dir / "quality-report.json", prepared["quality"])
                 if directory_identity(output_dir) != publication_identity:
                     raise PreparationError(PUBLICATION_DIRECTORY_ERROR)
-                manifest["quality_report_sha256"] = _sha256(
-                    output_dir / "quality-report.json"
-                )
-                _verify_publication(
-                    output_dir,
-                    publication_identity,
-                    manifest["prepared_sha256"],
-                    manifest["quality_report_sha256"],
-                )
-                _check_preparation_sources(source_memberships, source_snapshots)
-                _verify_publication(
-                    output_dir,
-                    publication_identity,
-                    manifest["prepared_sha256"],
-                    manifest["quality_report_sha256"],
-                    hash_first=True,
-                )
-                _write_json(output_dir / "manifest.json", manifest)
-                if directory_identity(output_dir) != publication_identity:
-                    raise PreparationError(PUBLICATION_DIRECTORY_ERROR)
+                with ExitStack() as retained:
+                    try:
+                        prepared_artifact = retained.enter_context(
+                            retain_regular_artifact(output_dir / "prepared.json")
+                        )
+                    except OSError as exc:
+                        raise PreparationError(PREPARED_ARTIFACT_ERROR) from exc
+                    try:
+                        quality_report = retained.enter_context(
+                            retain_regular_artifact(output_dir / "quality-report.json")
+                        )
+                    except OSError as exc:
+                        raise PreparationError(QUALITY_REPORT_ERROR) from exc
+                    manifest = {
+                        "schema_version": SCHEMA_VERSION,
+                        "status": "complete",
+                        "assignments": assignments,
+                        "prepared_sha256": _retained_digest(
+                            prepared_artifact, PREPARED_ARTIFACT_ERROR
+                        ),
+                        "quality_report_sha256": _retained_digest(
+                            quality_report, QUALITY_REPORT_ERROR
+                        ),
+                        "session_counts": prepared["quality"]["session_summaries"],
+                        "sources": prepared["provenance"]["sources"],
+                    }
+                    _verify_publication(
+                        output_dir,
+                        publication_identity,
+                        prepared_artifact,
+                        manifest["prepared_sha256"],
+                        quality_report,
+                        manifest["quality_report_sha256"],
+                    )
+                    _check_preparation_sources(source_memberships, source_snapshots)
+                    _verify_publication(
+                        output_dir,
+                        publication_identity,
+                        prepared_artifact,
+                        manifest["prepared_sha256"],
+                        quality_report,
+                        manifest["quality_report_sha256"],
+                        hash_first=True,
+                    )
+                    _write_json(output_dir / "manifest.json", manifest)
+                    _verify_publication(
+                        output_dir,
+                        publication_identity,
+                        prepared_artifact,
+                        manifest["prepared_sha256"],
+                        quality_report,
+                        manifest["quality_report_sha256"],
+                        hash_first=True,
+                    )
         except (OSError, PreparationError) as exc:
             if not assignments:
                 assignments = _assignments(campaign_bytes)

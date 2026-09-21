@@ -1323,6 +1323,113 @@ def test_quality_report_hash_rechecked_after_final_source_pass(
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
+@pytest.mark.parametrize(
+    ("artifact_name", "error"),
+    [
+        ("prepared.json", "prepared artifact changed"),
+        ("quality-report.json", "quality report changed"),
+    ],
+)
+def test_publication_retention_refuses_existing_artifact_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_name: str,
+    error: str,
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    outside = tmp_path / f"outside-{artifact_name}"
+    original = anticipation._write_json
+    replaced = False
+
+    def replace_after_quality(path: Path, value: object) -> None:
+        nonlocal replaced
+        original(path, value)
+        if path.name == "quality-report.json" and not replaced:
+            replaced = True
+            artifact = output / artifact_name
+            outside.write_bytes(artifact.read_bytes())
+            artifact.unlink()
+            artifact.symlink_to(outside)
+
+    monkeypatch.setattr(anticipation, "_write_json", replace_after_quality)
+    with pytest.raises(PreparationError, match=error):
+        prepare_campaign(campaign, output)
+
+    assert outside.exists()
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "error"),
+    [
+        ("prepared.json", "prepared artifact changed"),
+        ("quality-report.json", "quality report changed"),
+    ],
+)
+def test_publication_hash_refuses_replaced_artifact_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_name: str,
+    error: str,
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    outside = tmp_path / f"outside-{artifact_name}"
+    original = anticipation._check_preparation_sources
+
+    def replace_after_sources(*args: object) -> None:
+        original(*args)
+        artifact = output / artifact_name
+        if not artifact.exists():
+            return
+        outside.write_bytes(artifact.read_bytes())
+        artifact.unlink()
+        artifact.symlink_to(outside)
+
+    monkeypatch.setattr(anticipation, "_check_preparation_sources", replace_after_sources)
+    with pytest.raises(PreparationError, match=error):
+        prepare_campaign(campaign, output)
+
+    assert outside.exists()
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "error"),
+    [
+        ("prepared.json", "prepared artifact changed"),
+        ("quality-report.json", "quality report changed"),
+    ],
+)
+def test_artifact_identity_rechecked_after_manifest_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_name: str,
+    error: str,
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    original = anticipation._write_json
+    replaced = False
+
+    def replace_after_manifest(path: Path, value: object) -> None:
+        nonlocal replaced
+        original(path, value)
+        if path.name == "manifest.json" and not replaced:
+            replaced = True
+            artifact = output / artifact_name
+            replacement = tmp_path / f"replacement-{artifact_name}"
+            replacement.write_bytes(artifact.read_bytes())
+            replacement.replace(artifact)
+
+    monkeypatch.setattr(anticipation, "_write_json", replace_after_manifest)
+    with pytest.raises(PreparationError, match=error):
+        prepare_campaign(campaign, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
 def test_completion_marker_must_cover_last_row(tmp_path: Path) -> None:
     campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
     manifest_path = (

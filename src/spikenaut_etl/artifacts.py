@@ -1,6 +1,7 @@
 """Exclusive artifact staging through pinned, non-symlink directory handles."""
 
 import fcntl
+import hashlib
 import json
 import os
 import secrets
@@ -92,6 +93,71 @@ def directory_identity(path: Path) -> tuple[int, int]:
     if not stat.S_ISDIR(metadata.st_mode):
         raise OSError(f"publication path is not a directory: {path}")
     return metadata.st_dev, metadata.st_ino
+
+
+class RetainedArtifact:
+    """A regular, single-link artifact held open through a publication boundary."""
+
+    def __init__(self, path: Path, directory: int, descriptor: int) -> None:
+        self._path = path
+        self._directory = directory
+        self._descriptor = descriptor
+
+    def verify(self) -> None:
+        """Require the path to still name this exact regular, single-link inode."""
+        _check_directory(self._path.parent, self._directory)
+        opened = os.fstat(self._descriptor)
+        current = os.stat(
+            self._path.name,
+            dir_fd=self._directory,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise OSError(f"artifact changed during publication: {self._path}")
+
+    def sha256(self) -> str:
+        """Hash the retained inode without resolving the artifact path again."""
+        self.verify()
+        digest = hashlib.sha256()
+        os.lseek(self._descriptor, 0, os.SEEK_SET)
+        while chunk := os.read(self._descriptor, 1024 * 1024):
+            digest.update(chunk)
+        self.verify()
+        return digest.hexdigest()
+
+
+@contextmanager
+def retain_regular_artifact(path: Path) -> Iterator[RetainedArtifact]:
+    """Open an artifact without following links and retain its exact identity."""
+    if (
+        not path.name
+        or path.name in {".", ".."}
+        or Path(path.name).name != path.name
+        or "\x00" in path.name
+    ):
+        raise OSError("artifact name must be a single path component")
+    directory = _open_directory(path.parent)
+    descriptor: int | None = None
+    try:
+        _check_directory(path.parent, directory)
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=directory,
+        )
+        retained = RetainedArtifact(path, directory, descriptor)
+        retained.verify()
+        yield retained
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory)
 
 
 def _check_directory(path: Path, descriptor: int) -> None:
