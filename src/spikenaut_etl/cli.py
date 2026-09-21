@@ -114,9 +114,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         try:
             from .anticipation import PreparationError, prepare_campaign
-
+        except ImportError as exc:
+            print(f"prepare-anticipation failed: {exc}", file=sys.stderr)
+            return 1
+        try:
             prepared = prepare_campaign(args.input, args.output)
-        except (ImportError, PreparationError) as exc:
+        except PreparationError as exc:
             print(f"prepare-anticipation failed: {exc}", file=sys.stderr)
             return 1
         examples = sum(len(session["examples"]) for session in prepared["sessions"])
@@ -132,9 +135,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         try:
             from .audit_v3 import AuditError, audit_v3
-
+        except ImportError as exc:
+            print(f"audit-v3 failed: {exc}", file=sys.stderr)
+            return 1
+        try:
             audit = audit_v3(args.input, args.output)
-        except (ImportError, AuditError) as exc:
+        except AuditError as exc:
             print(f"audit-v3 failed: {exc}", file=sys.stderr)
             return 1
         counts = ", ".join(

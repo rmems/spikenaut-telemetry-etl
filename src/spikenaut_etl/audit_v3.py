@@ -169,13 +169,13 @@ def _distribution(column: pa.ChunkedArray) -> dict[str, int | float | None]:
     }
 
 
-def _source_root(source_dir: Path) -> tuple[Path, Path]:
+def _source_root(source_dir: Path) -> tuple[Path, Path, bool]:
     source_dir = source_dir.resolve()
     v3 = source_dir / "v3"
     if (v3 / "state_telemetry").is_dir():
-        return source_dir, v3
+        return source_dir, v3, True
     if (source_dir / "state_telemetry").is_dir():
-        return source_dir.parent, source_dir
+        return source_dir.parent, source_dir, False
     raise AuditError(f"cannot find v3 state_telemetry under {source_dir}")
 
 
@@ -264,11 +264,17 @@ def _action_label_counts(
     return len(state_keys) - observed, observed
 
 
-def _guard_output_path(dataset_root: Path, v3_root: Path, output_root: Path) -> None:
+def _guard_output_path(
+    dataset_root: Path,
+    v3_root: Path,
+    output_root: Path,
+    source_is_dataset_root: bool,
+) -> None:
     overlaps = (
         output_root == dataset_root
         or output_root == v3_root
         or output_root.is_relative_to(v3_root)
+        or (source_is_dataset_root and output_root.is_relative_to(dataset_root))
         or dataset_root.is_relative_to(output_root)
     )
     if overlaps:
@@ -315,7 +321,9 @@ def _append_output_columns(
             continue
         selected = selected.append_column(name, chosen_outcomes.column(name))
     n = len(state_indices)
-    selected = selected.append_column("source_split", pa.array([split] * n))
+    selected = selected.append_column(
+        "source_split", pa.array([split] * n, type=pa.string())
+    )
     selected = selected.append_column(
         "source_row_index", pa.array(source_indices, type=pa.int64())
     )
@@ -576,18 +584,26 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
     """
     output_root = Path(output_dir).resolve()
     try:
-        dataset_root, v3_root = _source_root(Path(source_dir))
+        dataset_root, v3_root, source_is_dataset_root = _source_root(Path(source_dir))
     except AuditError as exc:
         output_root.mkdir(parents=True, exist_ok=True)
         _clean_owned_outputs(output_root)
         _write_incomplete_evidence(output_root, exc, None, None)
         raise
 
-    _guard_output_path(dataset_root, v3_root, output_root)
+    _guard_output_path(dataset_root, v3_root, output_root, source_is_dataset_root)
     output_root.mkdir(parents=True, exist_ok=True)
     _clean_owned_outputs(output_root)
     try:
         return _audit_v3_impl(dataset_root, v3_root, output_root)
-    except AuditError as exc:
-        _write_incomplete_evidence(output_root, exc, dataset_root, v3_root)
-        raise
+    except (AuditError, OSError, pa.ArrowException) as raw_error:
+        audit_error = (
+            raw_error
+            if isinstance(raw_error, AuditError)
+            else AuditError(f"cannot write audit outputs: {raw_error}")
+        )
+        _clean_owned_outputs(output_root)
+        _write_incomplete_evidence(output_root, audit_error, dataset_root, v3_root)
+        if audit_error is raw_error:
+            raise
+        raise audit_error from raw_error

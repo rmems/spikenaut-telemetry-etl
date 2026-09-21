@@ -12,7 +12,7 @@ import hashlib
 import json
 import math
 import re
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -364,9 +364,8 @@ def _examples(
             if candidate[1] is None or candidate[2]:
                 rejections["target_invalid"] += 1
                 break
-            if any(
-                frame["timestamp_ms"] < boundary <= candidate[0]
-                for boundary in boundary_timestamps
+            if bisect_right(boundary_timestamps, candidate[0]) > bisect_right(
+                boundary_timestamps, frame["timestamp_ms"]
             ):
                 rejections["target_gap"] += 1
                 break
@@ -608,13 +607,13 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
     assignments = _assignments(campaign_path)
     try:
         prepared = _prepare_campaign(campaign_path, output_dir)
-    except PreparationError as exc:
+    except (OSError, PreparationError) as exc:
         incomplete = {
             "schema_version": SCHEMA_VERSION,
             "status": "incomplete",
             "assignments": assignments,
             "failure_reasons": [str(exc)],
-            **exc.details,
+            **getattr(exc, "details", {}),
         }
         (output_dir / "prepared.json").unlink(missing_ok=True)
         _write_json(output_dir / "quality-report.json", incomplete)

@@ -161,6 +161,7 @@ def test_suspicious_reading_excludes_every_64_sample_window_that_contains_it(
 
     eligible = pq.read_table(output / "v3-forecast-eligible-v1" / "train-00000.parquet")
     assert eligible.num_rows == 0
+    assert eligible.schema.field("source_split").type == pa.string()
     exclusions = pq.read_table(output / "exclusions.parquet").to_pylist()
     row_zero = next(
         row
@@ -496,7 +497,9 @@ def test_non_finite_sensor_is_excluded(tmp_path: Path) -> None:
     assert report.splits["train"]["exclusion_reasons"]["non_finite_gpu_temp_c"] == 1
 
 
-@pytest.mark.parametrize("relative_output", [".", "v3", "v3/state_telemetry/audit"])
+@pytest.mark.parametrize(
+    "relative_output", [".", "v3", "v3/state_telemetry/audit", "full_data/audit"]
+)
 def test_output_cannot_overlap_source_tree(tmp_path: Path, relative_output: str) -> None:
     source = tmp_path / "source"
     _write_corpus(source)
