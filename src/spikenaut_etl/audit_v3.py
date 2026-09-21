@@ -35,6 +35,10 @@ SPLITS = ("train", "validation", "test")
 SHARD_GLOB = "*.parquet"
 SENSOR_COLUMNS = ("gpu_temp_c", "power_w", "sm_clock_mhz", "mem_clock_mhz")
 ZERO_SUSPECT_COLUMNS = SENSOR_COLUMNS
+MANIFEST_NAME = "manifest.json"
+AUDIT_REPORT_NAME = "audit-report.json"
+EXCLUSIONS_NAME = "exclusions.parquet"
+ROOT_ARTIFACT_NAMES = (MANIFEST_NAME, AUDIT_REPORT_NAME, EXCLUSIONS_NAME)
 
 
 class AuditError(RuntimeError):
@@ -408,6 +412,23 @@ def _guard_output_path(
     _guard_source_members(v3_root, output_root, source_identities)
 
 
+def _resolve_source_member(
+    source: Path, source_identities: set[tuple[int, int]] | None
+) -> Path:
+    try:
+        resolved = source.resolve()
+    except (OSError, RuntimeError, UnicodeError) as exc:
+        raise AuditError(f"cannot resolve source member {source!r}") from exc
+    if source_identities is None:
+        return resolved
+    try:
+        metadata = resolved.stat()
+    except OSError:
+        return resolved
+    source_identities.add((metadata.st_dev, metadata.st_ino))
+    return resolved
+
+
 def _guard_source_members(
     v3_root: Path,
     output_root: Path,
@@ -416,22 +437,13 @@ def _guard_source_members(
     for config in ("state_telemetry", "outcomes", "action_proposals"):
         directory = v3_root / config
         for source in (directory, *directory.glob(SHARD_GLOB)):
-            try:
-                resolved = source.resolve()
-            except (OSError, RuntimeError, UnicodeError) as exc:
-                raise AuditError(f"cannot resolve source member {source!r}") from exc
+            resolved = _resolve_source_member(source, source_identities)
             if resolved.is_relative_to(output_root) or output_root.is_relative_to(
                 resolved
             ):
                 raise AuditError(
                     f"output directory would overlap source member: {source}"
                 )
-            if source_identities is not None:
-                try:
-                    metadata = resolved.stat()
-                except OSError:
-                    continue
-                source_identities.add((metadata.st_dev, metadata.st_ino))
 
 
 def _matches_source_identity(path: Path, source_identities: set[tuple[int, int]]) -> bool:
@@ -445,12 +457,11 @@ def _matches_source_identity(path: Path, source_identities: set[tuple[int, int]]
 def _clean_root_evidence(
     output_root: Path, source_identities: set[tuple[int, int]]
 ) -> None:
-    names = ("manifest.json", "audit-report.json", "exclusions.parquet")
     clean_artifacts(
         output_root,
         tuple(
             name
-            for name in names
+            for name in ROOT_ARTIFACT_NAMES
             if not _matches_source_identity(output_root / name, source_identities)
         ),
     )
@@ -462,9 +473,9 @@ def _clean_owned_outputs(
     retained = source_identities or set()
     try:
         root_outputs = (
-            output_root / "manifest.json",
-            output_root / "audit-report.json",
-            output_root / "exclusions.parquet",
+            output_root / MANIFEST_NAME,
+            output_root / AUDIT_REPORT_NAME,
+            output_root / EXCLUSIONS_NAME,
         )
         protected = next(
             (path for path in root_outputs if _matches_source_identity(path, retained)),
@@ -494,9 +505,7 @@ def _clean_owned_outputs(
                 raise AuditError(
                     f"audit output contains retained source identity: {protected}"
                 )
-        clean_artifacts(
-            output_root, ("manifest.json", "audit-report.json", "exclusions.parquet")
-        )
+        clean_artifacts(output_root, ROOT_ARTIFACT_NAMES)
         if view_root.exists():
             clean_artifacts(view_root)
     except OSError as exc:
@@ -866,7 +875,7 @@ def _publish_audit(
         ]
     )
     write_parquet(
-        output_root / "exclusions.parquet",
+        output_root / EXCLUSIONS_NAME,
         pa.Table.from_pylist(exclusion_rows, schema=exclusion_schema),
     )
     manifest: dict[str, Any] = {
@@ -882,11 +891,11 @@ def _publish_audit(
             )
             for split in SPLITS
         }
-        | {"exclusions.parquet": _sha256(output_root / "exclusions.parquet")},
+        | {EXCLUSIONS_NAME: _sha256(output_root / EXCLUSIONS_NAME)},
     }
-    write_json(output_root / "audit-report.json", report.to_dict())
+    write_json(output_root / AUDIT_REPORT_NAME, report.to_dict())
     _verify_audit_directory(output_root, publication_identity)
-    manifest["outputs"]["audit-report.json"] = _sha256(output_root / "audit-report.json")
+    manifest["outputs"][AUDIT_REPORT_NAME] = _sha256(output_root / AUDIT_REPORT_NAME)
     manifest["source_git_commit"] = _retained_revision(
         dataset_root, v3_root, output_root, source_git_commit
     )
@@ -896,7 +905,7 @@ def _publish_audit(
         raise AuditError("source shards changed during publication")
     _verify_audit_directory(output_root, publication_identity)
     _check_output_snapshot(output_root, view_root, manifest["outputs"])
-    write_json(output_root / "manifest.json", manifest)
+    write_json(output_root / MANIFEST_NAME, manifest)
     _verify_audit_directory(output_root, publication_identity)
     _verify_audit_directory(view_root, view_identity)
 
@@ -1000,8 +1009,8 @@ def _write_incomplete_evidence(
             dataset_root, v3_root, output_root, source_git_commit
         )
     retained = source_identities or set()
-    report_path = output_root / "audit-report.json"
-    manifest_path = output_root / "manifest.json"
+    report_path = output_root / AUDIT_REPORT_NAME
+    manifest_path = output_root / MANIFEST_NAME
     if not _matches_source_identity(report_path, retained):
         write_json(report_path, incomplete_report)
     if not _matches_source_identity(manifest_path, retained):
