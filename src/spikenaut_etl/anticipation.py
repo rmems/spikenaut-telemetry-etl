@@ -843,9 +843,13 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
         if _sha256(output_dir / "prepared.json") != manifest["prepared_sha256"]:
             raise PreparationError("prepared artifact changed during publication")
         _check_preparation_sources(source_memberships, source_snapshots)
+        if _sha256(output_dir / "prepared.json") != manifest["prepared_sha256"]:
+            raise PreparationError("prepared artifact changed during publication")
         if directory_identity(output_dir) != publication_identity:
             raise PreparationError("publication directory changed during preparation")
         _write_json(output_dir / "manifest.json", manifest)
+        if directory_identity(output_dir) != publication_identity:
+            raise PreparationError("publication directory changed during preparation")
     except (OSError, PreparationError) as exc:
         if not assignments:
             assignments = _assignments(campaign_bytes)

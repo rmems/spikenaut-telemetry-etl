@@ -16,6 +16,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .artifacts import directory_identity, write_json, write_parquet
+from .v3_build import PROPOSALS_SCHEMA
 
 AUDIT_VERSION = "1.0.0"
 VIEW_ID = "v3-forecast-eligible-v1"
@@ -265,6 +266,12 @@ def _load_actions(
         raise AuditError(f"missing source shard {path}")
     try:
         table = _read_source_table(path, expected_hashes)
+        for field in PROPOSALS_SCHEMA:
+            if (
+                field.name not in table.column_names
+                or table.schema.field(field.name).type != field.type
+            ):
+                raise AuditError(f"action proposal field type mismatch: {field.name}")
         _require_columns(
             table,
             (
@@ -388,6 +395,16 @@ def _append_output_columns(
     source_indices: list[int],
     target_steps: list[int],
 ) -> pa.Table:
+    reserved = {
+        "source_split",
+        "source_row_index",
+        "target_step_idx",
+        "forecast_horizon_samples",
+        "d_gpu_temp_c_64",
+    }
+    collisions = reserved.intersection(state.column_names + outcomes.column_names)
+    if collisions:
+        raise AuditError(f"generated view column name collision: {sorted(collisions)}")
     selected = state.take(pa.array(state_indices, type=pa.int64()))
     chosen_outcomes = outcomes.take(pa.array(outcome_indices, type=pa.int64()))
     for name in outcomes.column_names:
@@ -621,7 +638,7 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
         output_root / "exclusions.parquet",
         pa.Table.from_pylist(exclusion_rows, schema=exclusion_schema),
     )
-    manifest = {
+    manifest: dict[str, Any] = {
         "status": "complete",
         "audit_version": AUDIT_VERSION,
         "view_id": VIEW_ID,
@@ -645,8 +662,25 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
         raise AuditError("source shards changed during publication")
     if directory_identity(output_root) != publication_identity:
         raise AuditError("publication directory changed during audit")
+    _check_output_snapshot(output_root, view_root, manifest["outputs"])
     write_json(output_root / "manifest.json", manifest)
+    if directory_identity(output_root) != publication_identity:
+        raise AuditError("publication directory changed during audit")
+    if directory_identity(view_root) != view_identity:
+        raise AuditError("publication directory changed during audit")
     return report
+
+
+def _check_output_snapshot(
+    output_root: Path, view_root: Path, expected: dict[str, str]
+) -> None:
+    names = {f"{split}-00000.parquet" for split in SPLITS}
+    if {path.name for path in view_root.glob("*.parquet")} != names:
+        raise AuditError("output shard membership changed during publication")
+    if any(_sha256(output_root / name) != digest for name, digest in expected.items()):
+        raise AuditError("output artifacts changed during publication")
+    if {path.name for path in view_root.glob("*.parquet")} != names:
+        raise AuditError("output shard membership changed during publication")
 
 
 def _write_incomplete_evidence(

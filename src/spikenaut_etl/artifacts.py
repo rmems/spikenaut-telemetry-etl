@@ -27,10 +27,34 @@ def _check_directory(path: Path, descriptor: int) -> None:
         raise OSError(f"artifact directory changed during publication: {path}")
 
 
+def _open_directory(path: Path) -> int:
+    """Walk from the filesystem root without following any symlink component."""
+    absolute = path.absolute()
+    descriptor = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in absolute.parts[1:]:
+            if component == "..":
+                raise OSError("parent traversal is not allowed for artifact paths")
+            try:
+                os.mkdir(component, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            child = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 @contextmanager
 def _staged_output(path: Path, mode: str) -> Iterator[IO[Any]]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    directory = _open_directory(path.parent)
     temporary = ".artifact-" + secrets.token_hex(16)
     created = False
     try:

@@ -1104,3 +1104,39 @@ def test_preparation_output_generation_cannot_change_between_artifacts(
     with pytest.raises(PreparationError, match="publication directory changed"):
         prepare_campaign(campaign, output)
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_preparation_output_generation_cannot_change_at_manifest_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    original = anticipation._write_json
+
+    def swap_before_manifest(path: Path, value: object) -> None:
+        if path.name == "manifest.json" and not (tmp_path / "detached").exists():
+            output.rename(tmp_path / "detached")
+            output.mkdir()
+        original(path, value)
+
+    monkeypatch.setattr(anticipation, "_write_json", swap_before_manifest)
+    with pytest.raises(PreparationError, match="publication directory changed"):
+        prepare_campaign(campaign, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_prepared_hash_rechecked_after_final_source_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    original = anticipation._check_preparation_sources
+
+    def mutate_after_sources(*args: object) -> None:
+        original(*args)
+        if (output / "quality-report.json").exists():
+            (output / "prepared.json").write_text("{}")
+
+    monkeypatch.setattr(anticipation, "_check_preparation_sources", mutate_after_sources)
+    with pytest.raises(PreparationError, match="prepared artifact changed"):
+        prepare_campaign(campaign, output)

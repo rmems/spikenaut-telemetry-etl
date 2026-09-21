@@ -743,7 +743,10 @@ def test_action_proposal_keys_must_be_unique_and_match_state(
             "teacher_action": None,
         }
     )
-    pq.write_table(pa.Table.from_pylist(rows), proposal_dir / "train-00000.parquet")
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=PROPOSALS_SCHEMA),
+        proposal_dir / "train-00000.parquet",
+    )
 
     expected = "duplicate" if proposal_defect == "duplicate" else "orphan"
     with pytest.raises(AuditError, match=expected):
@@ -908,8 +911,9 @@ def test_unsupported_source_schema_is_incomplete(
                     "proposed_action": None,
                     "teacher_action": None,
                 }
-            ]
-        )
+            ],
+            schema=PROPOSALS_SCHEMA,
+        ).drop(["schema_version"])
     if version != "missing":
         table = table.append_column(
             "schema_version", pa.array([version] * table.num_rows, type=pa.string())
@@ -1191,3 +1195,82 @@ def test_audit_output_generation_cannot_change_between_artifacts(
     with pytest.raises(AuditError, match="publication directory changed"):
         audit_v3(source, output)
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_audit_output_generation_cannot_change_at_manifest_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original = audit_module.write_json
+
+    def swap_before_manifest(path: Path, value: object) -> None:
+        if path.name == "manifest.json" and not (tmp_path / "detached").exists():
+            output.rename(tmp_path / "detached")
+            output.mkdir()
+        original(path, value)
+
+    monkeypatch.setattr(audit_module, "write_json", swap_before_manifest)
+    with pytest.raises(AuditError, match="publication directory changed"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    "name", ["proposed_action", "teacher_action", "label_confidence"]
+)
+def test_action_proposal_types_match_published_schema(tmp_path: Path, name: str) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/action_proposals/train-00000.parquet"
+    table = pq.read_table(path)
+    index = table.schema.get_field_index(name)
+    table = table.set_column(index, name, pa.array([], type=pa.int64()))
+    pq.write_table(table, path)
+    with pytest.raises(AuditError, match="proposal.*type"):
+        audit_v3(source, tmp_path / "audit")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "source_split",
+        "source_row_index",
+        "target_step_idx",
+        "forecast_horizon_samples",
+        "d_gpu_temp_c_64",
+    ],
+)
+def test_generated_column_names_are_reserved(tmp_path: Path, name: str) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/state_telemetry/train-00000.parquet"
+    table = pq.read_table(path)
+    pq.write_table(table.append_column(name, pa.array([1] * table.num_rows)), path)
+    with pytest.raises(AuditError, match="generated.*collision"):
+        audit_v3(source, tmp_path / "audit")
+
+
+@pytest.mark.parametrize("mutation", ["replace", "extra"])
+def test_output_snapshot_rechecked_after_source_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original = audit_module._available_source_hashes
+
+    def mutate_after_hash(*args: object, **kwargs: object) -> dict[str, str]:
+        result = original(*args, **kwargs)
+        if (output / "audit-report.json").exists():
+            view = output / audit_module.VIEW_ID
+            target = view / (
+                "train-00000.parquet" if mutation == "replace" else "extra.parquet"
+            )
+            target.write_bytes(b"changed")
+        return result
+
+    monkeypatch.setattr(audit_module, "_available_source_hashes", mutate_after_hash)
+    with pytest.raises(AuditError, match="output.*changed"):
+        audit_v3(source, output)
