@@ -299,7 +299,7 @@ def _guard_output_path(
 def _clean_owned_outputs(output_root: Path) -> None:
     for name in ("manifest.json", "audit-report.json", "exclusions.parquet"):
         path = output_root / name
-        if path.is_file():
+        if path.is_symlink() or path.is_file():
             path.unlink()
     view_root = output_root / VIEW_ID
     if view_root.is_symlink():
@@ -429,7 +429,7 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
                     window_key = (episode_id, step_idx + offset)
                     if window_key not in state_index:
                         reasons.append("window_has_index_gap")
-                        break
+                        continue
                     if offset == 0:
                         continue
                     for reason in base_reasons[window_key]:

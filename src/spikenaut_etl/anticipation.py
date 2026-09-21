@@ -18,12 +18,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 SCHEMA_VERSION = "anticipation-prepared-v1"
 FRAME_INTERVAL_MS = 100
 MAX_SOURCE_AGE_MS = 200
 MAX_TARGET_LATENESS_MS = 100
+MAX_FRAME_COUNT = 100_000
 HISTORY_OFFSETS_MS = (500, 1_000, 2_000, 5_000)
 TARGET_OFFSETS_MS = (1_000, 5_000)
 VALID_SPLITS = {"train", "validation", "test"}
@@ -116,11 +118,14 @@ def _load_campaign(campaign_path: Path) -> tuple[dict[str, Any], int, str]:
     return campaign, minimum, hashlib.sha256(campaign_bytes).hexdigest()
 
 
-def _load_manifest(session_path: Path, expected_id: str) -> tuple[dict[str, Any], Path]:
+def _load_manifest(
+    session_path: Path, expected_id: str
+) -> tuple[dict[str, Any], Path, str]:
     manifest_path = session_path / "session_manifest.json"
     try:
+        manifest_bytes = manifest_path.read_bytes()
         manifest = _require_mapping(
-            json.loads(manifest_path.read_text()), str(manifest_path)
+            json.loads(manifest_bytes.decode()), str(manifest_path)
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PreparationError(
@@ -176,7 +181,7 @@ def _load_manifest(session_path: Path, expected_id: str) -> tuple[dict[str, Any]
         raise PreparationError(f"session {expected_id} timing sample_count is incomplete")
     if not isinstance(workload, dict) or workload.get("class") != "ai-compute":
         raise PreparationError(f"session {expected_id} workload class must be ai-compute")
-    return manifest, manifest_path
+    return manifest, manifest_path, hashlib.sha256(manifest_bytes).hexdigest()
 
 
 def _number(value: Any) -> float | None:
@@ -199,7 +204,7 @@ def _row_features(row: dict[str, Any]) -> list[float] | None:
 
 def _read_rows(
     session_path: Path, session_id: str
-) -> tuple[list[dict[str, Any]], list[Path]]:
+) -> tuple[list[dict[str, Any]], list[tuple[Path, str]]]:
     numbered_paths: list[tuple[int, Path]] = []
     for path in session_path.glob("*.parquet"):
         match = _BATCH_PATTERN.fullmatch(path.name)
@@ -213,13 +218,16 @@ def _read_rows(
     if not parquet_paths:
         raise PreparationError(f"session {session_id} has no Parquet batches")
     rows: list[dict[str, Any]] = []
+    snapshots: list[tuple[Path, str]] = []
     ordinal = 0
     previous_timestamp: int | None = None
     for parquet_path in parquet_paths:
         try:
-            table = pq.read_table(parquet_path, columns=PARQUET_COLUMNS)
+            parquet_bytes = parquet_path.read_bytes()
+            table = pq.read_table(pa.BufferReader(parquet_bytes), columns=PARQUET_COLUMNS)
         except Exception as exc:  # pyarrow has several format/schema exception classes
             raise PreparationError(f"cannot read {parquet_path}: {exc}") from exc
+        snapshots.append((parquet_path, hashlib.sha256(parquet_bytes).hexdigest()))
         for raw in table.to_pylist():
             if raw.get("session_label") != session_id:
                 raise PreparationError(
@@ -244,7 +252,7 @@ def _read_rows(
             rows.append(row)
     if any(row["_clock_reversal"] for row in rows):
         raise PreparationError(f"session {session_id} contains a clock reversal")
-    return rows, parquet_paths
+    return rows, snapshots
 
 
 def _frames(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -252,6 +260,13 @@ def _frames(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     timestamps = [row["timestamp_ms"] for row in ordered]
     start = timestamps[0]
     end = timestamps[-1]
+    grid_end = start + math.ceil((end - start) / FRAME_INTERVAL_MS) * FRAME_INTERVAL_MS
+    frame_count = (grid_end - start) // FRAME_INTERVAL_MS + 1
+    if frame_count > MAX_FRAME_COUNT:
+        raise PreparationError(
+            f"session frame span requires {frame_count} frames; "
+            f"maximum is {MAX_FRAME_COUNT}"
+        )
     forced_rejections: dict[int, set[str]] = {}
     previous_timestamp: int | None = None
     for row in rows:
@@ -270,7 +285,7 @@ def _frames(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     frames: list[dict[str, Any]] = []
     segment_id = 0
     after_invalid = False
-    for frame_timestamp in range(start, end + 1, FRAME_INTERVAL_MS):
+    for frame_timestamp in range(start, grid_end + 1, FRAME_INTERVAL_MS):
         source_position = bisect_left(timestamps, frame_timestamp + 1) - 1
         source = ordered[source_position] if source_position >= 0 else None
         reasons: list[str] = []
@@ -479,6 +494,7 @@ def _prepare_campaign(
     total_rejections: Counter[str] = Counter()
     summaries: list[dict[str, Any]] = []
     deficiencies: list[str] = []
+    source_snapshots: list[tuple[Path, str]] = []
     for item in campaign["sessions"]:
         session_id = item["session_id"]
         raw_path = Path(item["path"])
@@ -486,8 +502,10 @@ def _prepare_campaign(
             raw_path if raw_path.is_absolute() else campaign_path.parent / raw_path
         )
         try:
-            collector_manifest, manifest_path = _load_manifest(session_path, session_id)
-            rows, parquet_paths = _read_rows(session_path, session_id)
+            collector_manifest, manifest_path, manifest_sha256 = _load_manifest(
+                session_path, session_id
+            )
+            rows, parquet_snapshots = _read_rows(session_path, session_id)
             if collector_manifest["timing"]["sample_count"] != len(rows):
                 raise PreparationError(
                     f"session {session_id} timing sample_count does not equal "
@@ -496,10 +514,12 @@ def _prepare_campaign(
             session_rejections: Counter[str] = Counter()
             frames = _frames(rows)
             examples = _examples(frames, rows, session_rejections)
-            manifest_sha256 = _sha256(manifest_path)
             parquet_provenance = [
-                {"path": path.name, "sha256": _sha256(path)} for path in parquet_paths
+                {"path": path.name, "sha256": sha256}
+                for path, sha256 in parquet_snapshots
             ]
+            source_snapshots.append((manifest_path, manifest_sha256))
+            source_snapshots.extend(parquet_snapshots)
         except (PreparationError, OSError) as exc:
             details = {
                 "session_summaries": summaries,
@@ -600,6 +620,13 @@ def _prepare_campaign(
             "sources": provenance_sources,
         },
     }
+    for path, expected_sha256 in source_snapshots:
+        try:
+            current_sha256 = _sha256(path)
+        except OSError as exc:
+            raise PreparationError(f"source changed during preparation: {path}") from exc
+        if current_sha256 != expected_sha256:
+            raise PreparationError(f"source changed during preparation: {path}")
     _write_json(output_dir / "prepared.json", prepared)
     return prepared
 
@@ -671,11 +698,13 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
     output_artifacts = {path.resolve() for path in output_paths}
     if campaign_path in output_artifacts:
         raise PreparationError(f"campaign {campaign_path} collides with output artifact")
-    staging_symlinks = [path for path in output_paths if path.is_symlink()]
-    if staging_symlinks:
-        raise PreparationError(f"output staging path is a symlink: {staging_symlinks[0]}")
     assignments: list[dict[str, Any]] = []
     try:
+        staging_symlinks = [path for path in output_paths if path.is_symlink()]
+        if staging_symlinks:
+            raise PreparationError(
+                f"output staging path is a symlink: {staging_symlinks[0]}"
+            )
         campaign, minimum, campaign_sha256 = _load_campaign(campaign_path)
         assignments = _campaign_assignments(campaign)
         prepared = _prepare_campaign(

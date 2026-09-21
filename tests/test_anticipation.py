@@ -182,6 +182,37 @@ def test_invalid_raw_read_between_ticks_cannot_disappear(tmp_path: Path) -> None
     assert "invalid_sensor" in frame["rejection_reasons"]
 
 
+def test_trailing_off_grid_invalid_read_is_retained(tmp_path: Path) -> None:
+    rows = _rows(count=180)
+    invalid = dict(rows[-1])
+    invalid["timestamp_ms"] += 50
+    invalid["temperature_c"] = 0
+    rows.append(invalid)
+
+    prepared = prepare_campaign(
+        _campaign(tmp_path, [("session-01", "train", rows)]), tmp_path / "out"
+    )
+
+    frame = prepared["sessions"][0]["frames"][-1]
+    assert frame["timestamp_ms"] == invalid["timestamp_ms"] + 50
+    assert frame["valid"] is False
+    assert "invalid_sensor" in frame["rejection_reasons"]
+
+
+def test_extreme_timestamp_gap_fails_before_frame_expansion(tmp_path: Path) -> None:
+    rows = _rows(count=111)
+    rows[-1]["timestamp_ms"] = rows[0]["timestamp_ms"] + 100_000 * 100
+    campaign = _campaign(tmp_path, [("session-01", "train", rows)])
+
+    with pytest.raises(PreparationError, match="maximum is 100000"):
+        prepare_campaign(campaign, tmp_path / "out")
+
+    assert (
+        json.loads((tmp_path / "out" / "manifest.json").read_text())["status"]
+        == "incomplete"
+    )
+
+
 def test_raw_gap_over_200ms_breaks_segment_even_when_next_row_hits_grid(
     tmp_path: Path,
 ) -> None:
@@ -405,6 +436,27 @@ def test_symlinked_staging_path_cannot_overwrite_campaign(tmp_path: Path) -> Non
     assert campaign.read_bytes() == original
 
 
+def test_noncampaign_output_symlink_routes_through_incomplete_cleanup(
+    tmp_path: Path,
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "prepared.json").write_text("stale complete result")
+    outside = tmp_path / "outside.json"
+    (output / "quality-report.json.tmp").symlink_to(outside)
+
+    with pytest.raises(PreparationError, match="staging path is a symlink"):
+        prepare_campaign(campaign, output)
+
+    assert not outside.exists()
+    assert not (output / "prepared.json").exists()
+    assert (
+        json.loads((output / "quality-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
 def test_final_report_write_failure_removes_complete_payload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -453,6 +505,29 @@ def test_campaign_hash_and_assignments_use_loaded_snapshot(
         == __import__("hashlib").sha256(original).hexdigest()
     )
     assert manifest["assignments"][0]["session_id"] == "session-01"
+
+
+def test_session_sources_must_match_bytes_used_for_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    original_read_rows = anticipation._read_rows
+
+    def replace_parquet_after_read(session_path: Path, session_id: str):
+        rows, snapshots = original_read_rows(session_path, session_id)
+        snapshots[0][0].write_bytes(snapshots[0][0].read_bytes() + b"changed")
+        return rows, snapshots
+
+    monkeypatch.setattr(anticipation, "_read_rows", replace_parquet_after_read)
+
+    with pytest.raises(PreparationError, match="source changed during preparation"):
+        prepare_campaign(campaign, tmp_path / "out")
+
+    assert not (tmp_path / "out" / "prepared.json").exists()
+    assert (
+        json.loads((tmp_path / "out" / "manifest.json").read_text())["status"]
+        == "incomplete"
+    )
 
 
 def test_invalid_utf8_campaign_writes_incomplete_reports(tmp_path: Path) -> None:

@@ -370,6 +370,26 @@ def test_symlinked_view_directory_is_rejected_without_touching_source(
     )
 
 
+@pytest.mark.parametrize(
+    "artifact_name", ["manifest.json", "audit-report.json", "exclusions.parquet"]
+)
+def test_dangling_root_artifact_symlink_is_removed_without_following(
+    tmp_path: Path, artifact_name: str
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    outside = tmp_path / "outside" / artifact_name
+    _write_corpus(source)
+    output.mkdir()
+    (output / artifact_name).symlink_to(outside)
+
+    audit_v3(source, output)
+
+    assert not outside.exists()
+    assert not (output / artifact_name).is_symlink()
+    assert (output / artifact_name).is_file()
+
+
 def test_incomplete_evidence_tolerates_unreadable_source_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -610,6 +630,19 @@ def test_wrong_existing_64_sample_outcome_is_excluded_and_reported(
     eligible = pq.read_table(output / "v3-forecast-eligible-v1" / "train-00000.parquet")
     assert eligible.column("step_idx").to_pylist() == [1]
     assert report.splits["train"]["exclusion_reasons"]["outcome_delta_mismatch"] == 1
+
+
+def test_window_gap_does_not_hide_later_sensor_rejection(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    steps = [0, *range(2, 66)]
+    _write_corpus(source, steps=steps, zero_at=2)
+
+    report = audit_v3(source, output)
+
+    reasons = report.splits["train"]["exclusion_reasons"]
+    assert reasons["window_has_index_gap"] >= 1
+    assert reasons["window_contains_zero_power_w"] >= 1
 
 
 def test_non_finite_sensor_is_excluded(tmp_path: Path) -> None:
