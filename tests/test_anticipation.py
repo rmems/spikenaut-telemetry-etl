@@ -334,6 +334,34 @@ def test_preserves_assignments_and_rejects_duplicate_ids_or_bad_splits(
     with pytest.raises(PreparationError, match="split"):
         prepare_campaign(campaign, tmp_path / "out")
 
+    body["sessions"] = [body["sessions"][0] | {"split": []}]
+    campaign.write_text(json.dumps(body))
+    output = tmp_path / "out"
+    (output / "prepared.json").write_text("stale complete result")
+    with pytest.raises(PreparationError, match="split"):
+        prepare_campaign(campaign, output)
+    assert not (output / "prepared.json").exists()
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    "artifact_name", ["prepared.json", "quality-report.json", "manifest.json"]
+)
+def test_campaign_cannot_collide_with_output_artifacts(
+    tmp_path: Path, artifact_name: str
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    output.mkdir()
+    colliding_campaign = output / artifact_name
+    original = campaign.read_text()
+    colliding_campaign.write_text(original)
+
+    with pytest.raises(PreparationError, match="collides with output artifact"):
+        prepare_campaign(colliding_campaign, output)
+
+    assert colliding_campaign.read_text() == original
+
 
 def test_predeclared_minimum_keeps_deficient_session_visible_and_fails(
     tmp_path: Path,

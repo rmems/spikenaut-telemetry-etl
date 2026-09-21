@@ -70,14 +70,26 @@ def _git_head(path: Path) -> str | None:
     return result.stdout.strip() or None
 
 
-def _key_columns(table: pa.Table) -> list[tuple[str, int]]:
-    return list(
+def _key_columns(table: pa.Table, label: str) -> list[tuple[str, int]]:
+    raw_keys = list(
         zip(
             table.column("episode_id").to_pylist(),
             table.column("step_idx").to_pylist(),
             strict=True,
         )
     )
+    keys: list[tuple[str, int]] = []
+    for episode_id, step_idx in raw_keys:
+        _episode_number(episode_id)
+        if not isinstance(step_idx, int) or isinstance(step_idx, bool):
+            raise AuditError(f"{label} step_idx must be an integer")
+        if step_idx < 0 or step_idx >= EPISODE_LEN:
+            raise AuditError(
+                f"{label} step_idx outside 0..{EPISODE_LEN - 1}: "
+                f"{(episode_id, step_idx)!r}"
+            )
+        keys.append((episode_id, step_idx))
+    return keys
 
 
 def _require_columns(table: pa.Table, names: tuple[str, ...], label: str) -> None:
@@ -196,23 +208,40 @@ def _numeric_sensor_columns(state: pa.Table) -> tuple[str, ...]:
     )
 
 
-def _action_label_counts(v3_root: Path, split: str, state_rows: int) -> tuple[int, int]:
+def _action_label_counts(
+    v3_root: Path, split: str, state_keys: list[tuple[str, int]]
+) -> tuple[int, int]:
     path = v3_root / "action_proposals" / f"{split}-00000.parquet"
     if not path.is_file():
-        return state_rows, 0
+        return len(state_keys), 0
     try:
-        table = pq.read_table(path, columns=["proposed_action", "teacher_action"])
+        table = pq.read_table(
+            path,
+            columns=["episode_id", "step_idx", "proposed_action", "teacher_action"],
+        )
     except (OSError, pa.ArrowException) as exc:
         raise AuditError(f"cannot read {split} action-proposal shard: {exc}") from exc
-    observed = sum(
-        proposed is not None or teacher is not None
-        for proposed, teacher in zip(
+    proposal_keys = _key_columns(table, f"action_proposals/{split}")
+    _assert_unique(proposal_keys, f"action_proposals/{split}")
+    state_key_set = set(state_keys)
+    orphan_keys = set(proposal_keys) - state_key_set
+    if orphan_keys:
+        first_orphan = next(iter(orphan_keys))
+        raise AuditError(
+            f"action_proposals/{split} has orphan join keys; first={first_orphan!r}"
+        )
+    observed_keys = {
+        key
+        for key, proposed, teacher in zip(
+            proposal_keys,
             table.column("proposed_action").to_pylist(),
             table.column("teacher_action").to_pylist(),
             strict=True,
         )
-    )
-    return max(0, state_rows - observed), observed
+        if proposed is not None or teacher is not None
+    }
+    observed = len(observed_keys)
+    return len(state_keys) - observed, observed
 
 
 def _guard_output_path(dataset_root: Path, v3_root: Path, output_root: Path) -> None:
@@ -290,8 +319,8 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
     for split in SPLITS:
         loaded[split] = _load_split(v3_root, split)
         _, _, state, outcomes = loaded[split]
-        state_keys = _key_columns(state)
-        outcome_keys = _key_columns(outcomes)
+        state_keys = _key_columns(state, f"state_telemetry/{split}")
+        outcome_keys = _key_columns(outcomes, f"outcomes/{split}")
         _assert_unique(state_keys, f"state_telemetry/{split}")
         _assert_unique(outcome_keys, f"outcomes/{split}")
         if set(state_keys) != set(outcome_keys):
@@ -315,8 +344,8 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
 
     for split in SPLITS:
         _, _, state, outcomes = loaded[split]
-        state_keys = _key_columns(state)
-        outcome_keys = _key_columns(outcomes)
+        state_keys = _key_columns(state, f"state_telemetry/{split}")
+        outcome_keys = _key_columns(outcomes, f"outcomes/{split}")
         state_index = {key: index for index, key in enumerate(state_keys)}
         outcome_index = {key: index for index, key in enumerate(outcome_keys)}
         sensor_values = {name: state.column(name).to_pylist() for name in SENSOR_COLUMNS}
@@ -413,7 +442,7 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
                 "timestamp_missing_count": state.column("ts_utc").null_count,
                 "reward_missing_count": outcomes.column("reward").null_count,
                 "action_label_missing_count": _action_label_counts(
-                    v3_root, split, state.num_rows
+                    v3_root, split, state_keys
                 )[0],
             },
             **{name: _distribution(state.column(name)) for name in SENSOR_COLUMNS},

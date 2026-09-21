@@ -97,7 +97,7 @@ def _load_campaign(campaign_path: Path) -> tuple[dict[str, Any], int]:
         if session_id in seen:
             raise PreparationError(f"duplicate session_id {session_id}")
         seen.add(session_id)
-        if item["split"] not in VALID_SPLITS:
+        if not isinstance(item["split"], str) or item["split"] not in VALID_SPLITS:
             raise PreparationError(
                 f"session {session_id} split must be train, validation, or test"
             )
@@ -581,8 +581,14 @@ def _assignments(campaign_path: Path) -> list[dict[str, Any]]:
 def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[str, Any]:
     """Prepare a campaign and always publish a versioned completion report."""
 
-    campaign_path = Path(campaign_path)
-    output_dir = Path(output_dir)
+    campaign_path = Path(campaign_path).resolve()
+    output_dir = Path(output_dir).resolve()
+    output_artifacts = {
+        (output_dir / name).resolve()
+        for name in ("prepared.json", "quality-report.json", "manifest.json")
+    }
+    if campaign_path in output_artifacts:
+        raise PreparationError(f"campaign {campaign_path} collides with output artifact")
     assignments = _assignments(campaign_path)
     try:
         prepared = _prepare_campaign(campaign_path, output_dir)

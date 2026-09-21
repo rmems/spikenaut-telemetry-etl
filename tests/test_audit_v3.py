@@ -338,6 +338,70 @@ def test_null_episode_identifier_fails_closed_with_evidence(tmp_path: Path) -> N
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
+def test_null_step_index_fails_closed_with_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "validation-00000.parquet"
+        table = pq.read_table(path)
+        values = table.column("step_idx").to_pylist()
+        values[0] = None
+        table = table.set_column(
+            table.schema.get_field_index("step_idx"),
+            "step_idx",
+            pa.array(values, type=pa.int32()),
+        )
+        pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="step_idx must be an integer"):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("proposal_defect", ["duplicate", "orphan"])
+def test_action_proposal_keys_must_be_unique_and_match_state(
+    tmp_path: Path, proposal_defect: str
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    proposal_dir = source / "v3" / "action_proposals"
+    proposal_dir.mkdir()
+    rows = [
+        {
+            "episode_id": "gpu-000000",
+            "step_idx": 0,
+            "proposed_action": "hold",
+            "teacher_action": None,
+        }
+    ]
+    rows.append(
+        dict(rows[0])
+        if proposal_defect == "duplicate"
+        else {
+            "episode_id": "gpu-999999",
+            "step_idx": 0,
+            "proposed_action": "hold",
+            "teacher_action": None,
+        }
+    )
+    pq.write_table(pa.Table.from_pylist(rows), proposal_dir / "train-00000.parquet")
+
+    expected = "duplicate" if proposal_defect == "duplicate" else "orphan"
+    with pytest.raises(AuditError, match=expected):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
 def test_empty_required_split_fails_closed_with_evidence(tmp_path: Path) -> None:
     source = tmp_path / "source"
     output = tmp_path / "audit"
