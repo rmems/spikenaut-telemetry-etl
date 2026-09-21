@@ -1,0 +1,26 @@
+tests/test_audit_v3.py
+  s_176a15af4e07cc::t_a089084f19a675 266-302
+tests/test_anticipation.py
+  s_176a15af4e07cc::t_a089084f19a675 292-298,438-443
+src/spikenaut_etl/anticipation.py
+  s_176a15af4e07cc::t_258126da66d144 143
+  s_176a15af4e07cc::t_5c432f7a8b7ea7 17,140-141,145-153,230-232
+src/spikenaut_etl/audit_v3.py
+  s_176a15af4e07cc::t_5c432f7a8b7ea7 101-107,185-195,214-215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "26cb412ab2fa3dedad0e91c80615b94044433c93",
+  "prompts": {},
+  "sessions": {
+    "s_176a15af4e07cc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c10b-f3fe-7eb1-83a0-3423737857f2",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
