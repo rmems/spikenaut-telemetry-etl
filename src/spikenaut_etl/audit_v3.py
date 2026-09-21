@@ -15,7 +15,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .artifacts import write_json
+from .artifacts import write_json, write_parquet
 
 AUDIT_VERSION = "1.0.0"
 VIEW_ID = "v3-forecast-eligible-v1"
@@ -341,12 +341,14 @@ def _available_source_hashes(
     dataset_root: Path, v3_root: Path, *, tolerate_unreadable: bool = False
 ) -> dict[str, str]:
     hashes: dict[str, str] = {}
+    memberships: dict[Path, list[Path]] = {}
     expected_names = {f"{split}-00000.parquet" for split in SPLITS}
     for config in ("state_telemetry", "outcomes", "action_proposals"):
         directory = v3_root / config
+        paths = sorted(directory.glob("*.parquet"))
+        memberships[directory] = paths
         if not directory.is_dir():
             continue
-        paths = sorted(directory.glob("*.parquet"))
         unexpected = [path.name for path in paths if path.name not in expected_names]
         if unexpected and not tolerate_unreadable:
             raise AuditError(
@@ -367,6 +369,12 @@ def _available_source_hashes(
             raise AuditError(
                 f"{directory.name} source shard membership changed during hashing"
             )
+    if not tolerate_unreadable:
+        for directory, paths in memberships.items():
+            if sorted(directory.glob("*.parquet")) != paths:
+                raise AuditError(
+                    f"{directory.name} source shard membership changed during hashing"
+                )
     return dict(sorted(hashes.items()))
 
 
@@ -571,7 +579,7 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
     view_root = output_root / VIEW_ID
     view_root.mkdir(parents=True, exist_ok=True)
     for split, table in eligible_tables.items():
-        pq.write_table(table, view_root / f"{split}-00000.parquet")
+        write_parquet(view_root / f"{split}-00000.parquet", table)
     exclusion_schema = pa.schema(
         [
             pa.field("source_split", pa.string()),
@@ -581,9 +589,9 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
             pa.field("reasons", pa.list_(pa.string())),
         ]
     )
-    pq.write_table(
-        pa.Table.from_pylist(exclusion_rows, schema=exclusion_schema),
+    write_parquet(
         output_root / "exclusions.parquet",
+        pa.Table.from_pylist(exclusion_rows, schema=exclusion_schema),
     )
     manifest = {
         "status": "complete",

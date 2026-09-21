@@ -1009,3 +1009,50 @@ def test_missing_source_with_view_symlink_writes_incomplete_evidence(
     assert sentinel.read_text() == "preserve"
     for name in ("manifest.json", "audit-report.json"):
         assert json.loads((output / name).read_text())["status"] == "incomplete"
+
+
+def test_hash_pass_rechecks_earlier_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    original = audit_module._sha256
+    added = source / "v3/state_telemetry/train-00001.parquet"
+
+    def add_while_hashing_later_directory(path: Path) -> str:
+        digest = original(path)
+        if path.parent.name == "outcomes" and not added.exists():
+            added.write_bytes(b"new shard")
+        return digest
+
+    monkeypatch.setattr(audit_module, "_sha256", add_while_hashing_later_directory)
+    with pytest.raises(AuditError, match="membership changed"):
+        audit_module._available_source_hashes(source, source / "v3")
+
+
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+@pytest.mark.parametrize(
+    "artifact", ["v3-forecast-eligible-v1/train-00000.parquet", "exclusions.parquet"]
+)
+def test_parquet_publication_replaces_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_kind: str, artifact: str
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    sentinel = tmp_path / "source-sentinel.parquet"
+    sentinel.write_bytes(b"preserve source bytes")
+    original = audit_module._clean_owned_outputs
+
+    def replace_after_cleanup(root: Path) -> None:
+        original(root)
+        destination = root / artifact
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if link_kind == "symlink":
+            destination.symlink_to(sentinel)
+        else:
+            destination.hardlink_to(sentinel)
+
+    monkeypatch.setattr(audit_module, "_clean_owned_outputs", replace_after_cleanup)
+    audit_v3(source, output)
+    assert sentinel.read_bytes() == b"preserve source bytes"
