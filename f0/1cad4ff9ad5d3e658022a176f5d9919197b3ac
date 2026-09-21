@@ -1,0 +1,21 @@
+src/spikenaut_etl/audit_v3.py
+  s_176a15af4e07cc::t_b824f071bc86e7 108-115,531,748-750,802-805
+src/spikenaut_etl/anticipation.py
+  s_176a15af4e07cc::t_b824f071bc86e7 207-210
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "f01cad4ff9ad5d3e658022a176f5d9919197b3ac",
+  "prompts": {},
+  "sessions": {
+    "s_176a15af4e07cc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c10b-f3fe-7eb1-83a0-3423737857f2",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
