@@ -500,7 +500,7 @@ def test_cyclic_campaign_path_routes_through_incomplete_cleanup(tmp_path: Path) 
     output.mkdir()
     (output / "prepared.json").write_text("stale complete result")
 
-    with pytest.raises(PreparationError, match="campaign path has a symlink loop"):
+    with pytest.raises(PreparationError, match="cannot resolve campaign path"):
         prepare_campaign(campaign, output)
 
     assert not (output / "prepared.json").exists()
@@ -1150,6 +1150,24 @@ def test_prepared_hash_rechecked_after_final_source_pass(
         prepare_campaign(campaign, output)
 
 
+def test_quality_report_hash_rechecked_after_final_source_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    original = anticipation._check_preparation_sources
+
+    def mutate_after_sources(*args: object) -> None:
+        original(*args)
+        if (output / "quality-report.json").exists():
+            (output / "quality-report.json").write_text("{}")
+
+    monkeypatch.setattr(anticipation, "_check_preparation_sources", mutate_after_sources)
+    with pytest.raises(PreparationError, match="quality report changed"):
+        prepare_campaign(campaign, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
 def test_completion_marker_must_cover_last_row(tmp_path: Path) -> None:
     campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
     manifest_path = (
@@ -1185,6 +1203,31 @@ def test_preparation_rechecks_source_overlap_after_output_pin(
         prepare_campaign(campaign, output)
     assert not (output / "prepared.json").exists()
     assert not (output / "manifest.json").exists()
+
+
+def test_post_pin_source_guard_invalidates_prior_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    prepare_campaign(campaign, output)
+    substituted_source = tmp_path / "substituted-source"
+    substituted_source.write_text("do not clean a source owned by the caller")
+    original = anticipation._guard_assigned_sources
+    calls = 0
+
+    def fail_after_pin(*args: object) -> PreparationError | None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise PreparationError("post-pin source verification failed")
+        return original(*args)
+
+    monkeypatch.setattr(anticipation, "_guard_assigned_sources", fail_after_pin)
+    with pytest.raises(PreparationError, match="post-pin source verification failed"):
+        prepare_campaign(campaign, output)
+    assert substituted_source.read_text() == "do not clean a source owned by the caller"
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
 def test_unencodable_session_path_writes_incomplete_evidence(tmp_path: Path) -> None:
@@ -1337,3 +1380,8 @@ def test_rows_must_fit_declared_session_start(tmp_path, start):
 def test_unencodable_output_has_scoped_preparation_error(tmp_path):
     with pytest.raises(PreparationError, match="output path"):
         prepare_campaign(tmp_path / "campaign.json", tmp_path / "\ud800")
+
+
+def test_unencodable_campaign_path_has_scoped_preparation_error(tmp_path: Path) -> None:
+    with pytest.raises(PreparationError, match="campaign path"):
+        prepare_campaign(tmp_path / "\ud800", tmp_path / "out")

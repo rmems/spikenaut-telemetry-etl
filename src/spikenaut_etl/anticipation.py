@@ -792,23 +792,33 @@ def _guard_assigned_sources(
 
 PUBLICATION_DIRECTORY_ERROR = "publication directory changed during preparation"
 PREPARED_ARTIFACT_ERROR = "prepared artifact changed during publication"
+QUALITY_REPORT_ERROR = "quality report changed during publication"
 
 
 def _verify_publication(
-    output_dir: Path, identity: tuple[int, int], digest: str, *, hash_first: bool = False
+    output_dir: Path,
+    identity: tuple[int, int],
+    prepared_digest: str,
+    quality_report_digest: str,
+    *,
+    hash_first: bool = False,
 ) -> None:
     def check_directory() -> None:
         if directory_identity(output_dir) != identity:
             raise PreparationError(PUBLICATION_DIRECTORY_ERROR)
 
     def check_artifact() -> None:
-        if _sha256(output_dir / "prepared.json") != digest:
+        if _sha256(output_dir / "prepared.json") != prepared_digest:
             raise PreparationError(PREPARED_ARTIFACT_ERROR)
 
+    def check_quality_report() -> None:
+        if _sha256(output_dir / "quality-report.json") != quality_report_digest:
+            raise PreparationError(QUALITY_REPORT_ERROR)
+
     checks = (
-        (check_artifact, check_directory)
+        (check_artifact, check_quality_report, check_directory)
         if hash_first
-        else (check_directory, check_artifact)
+        else (check_directory, check_artifact, check_quality_report)
     )
     for check in checks:
         check()
@@ -823,10 +833,10 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
         campaign_path = supplied_campaign_path.resolve(strict=True)
     except FileNotFoundError:
         campaign_path = supplied_campaign_path.resolve()
-    except OSError, RuntimeError:
+    except (OSError, RuntimeError, UnicodeError) as exc:
         campaign_path = supplied_campaign_path.absolute()
         campaign_resolution_error = PreparationError(
-            f"campaign path has a symlink loop: {campaign_path}"
+            f"cannot resolve campaign path {campaign_path!r}: {exc}"
         )
     try:
         output_dir = Path(output_dir).resolve()
@@ -859,7 +869,7 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
     campaign_read_error: PreparationError | None = None
     try:
         campaign_bytes = campaign_path.read_bytes()
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         campaign_bytes = b""
         campaign_read_error = PreparationError(
             f"cannot read campaign {campaign_path}: {exc}"
@@ -868,11 +878,13 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
     resolution_error = resolution_error or source_error
     ensure_directory(output_dir)
     with pinned_publication(output_dir, initial_identity):
-        # Repeat resolved overlap checks after pinning and before any cleanup.
-        source_error = _guard_assigned_sources(campaign_path, output_dir, campaign_bytes)
-        resolution_error = resolution_error or source_error
         assignments: list[dict[str, Any]] = []
         try:
+            # Repeat resolved overlap checks after pinning and before any cleanup.
+            source_error = _guard_assigned_sources(
+                campaign_path, output_dir, campaign_bytes
+            )
+            resolution_error = resolution_error or source_error
             if resolution_error is not None:
                 raise resolution_error
             if campaign_resolution_error is not None:
@@ -916,20 +928,34 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
                 "sources": prepared["provenance"]["sources"],
             }
             _write_json(output_dir / "quality-report.json", prepared["quality"])
+            if directory_identity(output_dir) != publication_identity:
+                raise PreparationError(PUBLICATION_DIRECTORY_ERROR)
+            manifest["quality_report_sha256"] = _sha256(
+                output_dir / "quality-report.json"
+            )
             _verify_publication(
-                output_dir, publication_identity, manifest["prepared_sha256"]
+                output_dir,
+                publication_identity,
+                manifest["prepared_sha256"],
+                manifest["quality_report_sha256"],
             )
             _check_preparation_sources(source_memberships, source_snapshots)
             _verify_publication(
                 output_dir,
                 publication_identity,
                 manifest["prepared_sha256"],
+                manifest["quality_report_sha256"],
                 hash_first=True,
             )
             _write_json(output_dir / "manifest.json", manifest)
             if directory_identity(output_dir) != publication_identity:
                 raise PreparationError(PUBLICATION_DIRECTORY_ERROR)
         except (OSError, PreparationError) as exc:
+            if (
+                isinstance(exc, PreparationError)
+                and str(exc).startswith("output directory overlaps session source")
+            ):
+                raise
             if not assignments:
                 assignments = _assignments(campaign_bytes)
             incomplete = {
