@@ -1,0 +1,19 @@
+src/spikenaut_etl/audit_v3.py
+  s_176a15af4e07cc::t_c6a169a56eceda 38-41,415-431,440,464,476-478,508,878,894,896,898,908,1012-1013
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d530fa891ba3385265afe563640db113853727cd",
+  "prompts": {},
+  "sessions": {
+    "s_176a15af4e07cc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c10b-f3fe-7eb1-83a0-3423737857f2",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
