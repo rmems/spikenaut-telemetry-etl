@@ -342,6 +342,9 @@ def _load_actions(
                 or table.schema.field(field.name).type != field.type
             ):
                 raise AuditError(f"action proposal field type mismatch: {field.name}")
+        canonical_schema = table.schema.equals(
+            PROPOSALS_SCHEMA, check_metadata=False
+        )
         _require_columns(
             table,
             (
@@ -357,6 +360,10 @@ def _load_actions(
         raise AuditError(f"cannot read {split} action-proposal shard: {exc}") from exc
     if any(version != "3.0.0" for version in table.column("schema_version").to_pylist()):
         raise AuditError(f"action_proposals/{split} schema_version must be 3.0.0")
+    if not canonical_schema:
+        raise AuditError(
+            "action proposals must use the canonical schema order and nullability"
+        )
     proposal_keys = _key_columns(table, f"action_proposals/{split}")
     _assert_unique(proposal_keys, f"action_proposals/{split}")
     state_key_set = set(state_keys)

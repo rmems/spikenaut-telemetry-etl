@@ -1238,6 +1238,26 @@ def test_action_proposal_types_match_published_schema(tmp_path: Path, name: str)
         audit_v3(source, tmp_path / "audit")
 
 
+@pytest.mark.parametrize("mutation", ["order", "nullability"])
+def test_action_proposals_require_canonical_schema(
+    tmp_path: Path, mutation: str
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/action_proposals/train-00000.parquet"
+    table = pq.read_table(path)
+    if mutation == "order":
+        table = table.select(list(reversed(table.column_names)))
+    else:
+        fields = list(table.schema)
+        fields[0] = fields[0].with_nullable(False)
+        table = pa.Table.from_arrays(table.columns, schema=pa.schema(fields))
+    pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="canonical.*schema"):
+        audit_v3(source, tmp_path / "audit")
+
+
 @pytest.mark.parametrize(
     "name",
     [
