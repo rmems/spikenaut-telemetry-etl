@@ -760,6 +760,22 @@ def test_invalid_utf8_session_manifest_writes_incomplete_reports(tmp_path: Path)
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
+def test_oversized_manifest_integer_writes_incomplete_reports(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    manifest_path = tmp_path / "session-01" / "session_manifest.json"
+    original = manifest_path.read_text().rstrip()
+    manifest_path.write_text(original[:-1] + ',"oversized":' + "9" * 5000 + "}")
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "prepared.json").write_text("stale complete result")
+
+    with pytest.raises(PreparationError, match="manifest unavailable"):
+        prepare_campaign(campaign, output)
+
+    assert not (output / "prepared.json").exists()
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
 def test_predeclared_minimum_keeps_deficient_session_visible_and_fails(
     tmp_path: Path,
 ) -> None:

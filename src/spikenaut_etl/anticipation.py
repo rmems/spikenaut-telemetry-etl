@@ -127,13 +127,12 @@ def _load_manifest(
     manifest_path = session_path / "session_manifest.json"
     try:
         manifest_bytes = manifest_path.read_bytes()
-        manifest = _require_mapping(
-            json.loads(manifest_bytes.decode()), str(manifest_path)
-        )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        manifest_raw = json.loads(manifest_bytes.decode())
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise PreparationError(
             f"session {expected_id} manifest unavailable: {exc}"
         ) from exc
+    manifest = _require_mapping(manifest_raw, str(manifest_path))
     schema_version = manifest.get("schema_version")
     if (
         not isinstance(schema_version, int)
