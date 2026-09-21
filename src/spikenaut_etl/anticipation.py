@@ -759,6 +759,20 @@ def _guard_assigned_sources(
             raise PreparationError(
                 f"output directory overlaps session source: {session_path}"
             )
+        for source in (
+            session_path / "session_manifest.json",
+            *session_path.glob("*.parquet"),
+        ):
+            try:
+                resolved = source.resolve()
+            except (OSError, RuntimeError, UnicodeError) as exc:
+                raise PreparationError(
+                    f"cannot resolve session source file {source!r}"
+                ) from exc
+            if resolved.is_relative_to(output_dir) or output_dir.is_relative_to(resolved):
+                raise PreparationError(
+                    f"output directory overlaps session source file: {source}"
+                )
     return resolution_error
 
 

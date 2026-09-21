@@ -1420,3 +1420,45 @@ def test_git_provenance_marks_untracked_content_unknown(tmp_path: Path) -> None:
     test_git_provenance_rejects_ancestor_repository(tmp_path)
     (tmp_path / "untracked.parquet").write_text("untracked")
     assert audit_module._git_head(tmp_path) is None
+
+
+@pytest.mark.parametrize("config", ["state_telemetry", "outcomes", "action_proposals"])
+@pytest.mark.parametrize("link_kind", ["directory", "file"])
+def test_source_links_into_output_are_preserved(
+    tmp_path: Path, config: str, link_kind: str
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    output = tmp_path / "audit"
+    view = output / audit_module.VIEW_ID
+    view.mkdir(parents=True)
+    config_path = source / "v3" / config
+    if link_kind == "directory":
+        target = view / config
+        config_path.rename(target)
+        config_path.symlink_to(target, target_is_directory=True)
+    else:
+        shard = config_path / "train-00000.parquet"
+        target = view / "source.parquet"
+        shard.rename(target)
+        shard.symlink_to(target)
+    before = {path: path.read_bytes() for path in view.rglob("*.parquet")}
+    with pytest.raises(AuditError, match="overlap"):
+        audit_v3(source, output)
+    assert {path: path.read_bytes() for path in before} == before
+    assert not (output / "manifest.json").exists()
+
+
+def test_invalid_corpus_preserves_linked_source_in_output(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    config = source / "v3" / "outcomes"
+    config.parent.mkdir(parents=True)
+    output = tmp_path / "audit"
+    target = output / audit_module.VIEW_ID
+    target.mkdir(parents=True)
+    sentinel = target / "train-00000.parquet"
+    sentinel.write_bytes(b"source sentinel")
+    config.symlink_to(target, target_is_directory=True)
+    with pytest.raises(AuditError, match="overlap"):
+        audit_v3(source, output)
+    assert sentinel.read_bytes() == b"source sentinel"

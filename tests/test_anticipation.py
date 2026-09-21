@@ -1190,3 +1190,46 @@ def test_unencodable_session_path_writes_incomplete_evidence(tmp_path: Path) -> 
     with pytest.raises(PreparationError, match="cannot resolve session source"):
         prepare_campaign(campaign, output)
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_cyclic_preparation_output_has_scoped_error(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "cycle"
+    output.symlink_to(output, target_is_directory=True)
+    with pytest.raises((PreparationError, OSError)):
+        prepare_campaign(campaign, output)
+
+
+def test_cli_handles_cyclic_preparation_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from spikenaut_etl.cli import main
+
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "cycle"
+    output.symlink_to(output, target_is_directory=True)
+    assert (
+        main(["prepare-anticipation", "--input", str(campaign), "--output", str(output)])
+        == 1
+    )
+    assert "prepare-anticipation failed:" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "source_name", ["session_manifest.json", "gpu_telemetry_v2_batch_0.parquet"]
+)
+def test_session_file_link_into_output_is_preserved(
+    tmp_path: Path, source_name: str
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    session = Path(json.loads(campaign.read_text())["sessions"][0]["path"])
+    output = tmp_path / "out"
+    output.mkdir()
+    target = output / "manifest.json"
+    source = session / source_name
+    source.rename(target)
+    source.symlink_to(target)
+    before = target.read_bytes()
+    with pytest.raises(PreparationError, match="overlap"):
+        prepare_campaign(campaign, output)
+    assert target.read_bytes() == before

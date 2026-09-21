@@ -368,6 +368,23 @@ def _guard_output_path(
     )
     if overlaps:
         raise AuditError(f"output directory would overlap source corpus: {output_root}")
+    _guard_source_members(v3_root, output_root)
+
+
+def _guard_source_members(v3_root: Path, output_root: Path) -> None:
+    for config in ("state_telemetry", "outcomes", "action_proposals"):
+        directory = v3_root / config
+        for source in (directory, *directory.glob("*.parquet")):
+            try:
+                resolved = source.resolve()
+            except (OSError, RuntimeError, UnicodeError) as exc:
+                raise AuditError(f"cannot resolve source member {source!r}") from exc
+            if resolved.is_relative_to(output_root) or output_root.is_relative_to(
+                resolved
+            ):
+                raise AuditError(
+                    f"output directory would overlap source member: {source}"
+                )
 
 
 def _clean_owned_outputs(output_root: Path) -> None:
@@ -768,6 +785,8 @@ def _guard_supplied_source(source_path: Path, output_root: Path) -> None:
         raise AuditError(
             f"output directory would overlap supplied source path: {output_root}"
         )
+    for root in (provisional_source, provisional_source / "v3"):
+        _guard_source_members(root, output_root)
 
 
 def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
