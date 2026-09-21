@@ -1125,17 +1125,31 @@ def test_directory_swap_during_replace_keeps_source_untouched(
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
+@pytest.mark.parametrize("timestamp", [None, 100])
 def test_eligible_view_preserves_action_labels_and_typed_missing_values(
     tmp_path: Path,
+    timestamp: int | None,
 ) -> None:
     source = tmp_path / "source"
     output = tmp_path / "audit"
     _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "train-00000.parquet"
+        table = pq.read_table(path)
+        pq.write_table(
+            table.set_column(
+                table.schema.get_field_index("ts_utc"),
+                "ts_utc",
+                pa.array([timestamp] * table.num_rows, type=pa.int64()),
+            ),
+            path,
+        )
     actions = pa.Table.from_pylist(
         [
             {
                 "episode_id": "gpu-000000",
                 "step_idx": 1,
+                "ts_utc": timestamp,
                 "schema_version": "3.0.0",
                 "proposed_action": "hold",
                 "teacher_action": "cool",
@@ -1632,6 +1646,78 @@ def test_git_provenance_drops_revision_when_source_state_changes(
 
     monkeypatch.setattr(audit_module, "_git_head", change_before_snapshot)
     monkeypatch.setattr(audit_module, "write_json", change_before_manifest)
+    output = tmp_path / "out"
+    audit_v3(source, output)
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    assert manifest["source_git_commit"] is None
+
+
+@pytest.mark.parametrize("state_time,action_time", [(None, 100), (100, None), (100, 200)])
+def test_action_timestamp_must_match_joined_state(tmp_path, state_time, action_time):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "train-00000.parquet"
+        table = pq.read_table(path)
+        pq.write_table(
+            table.set_column(
+                table.schema.get_field_index("ts_utc"),
+                "ts_utc",
+                pa.array([state_time] * table.num_rows, type=pa.int64()),
+            ),
+            path,
+        )
+    actions = pa.Table.from_pylist(
+        [
+            {
+                "episode_id": "gpu-000000",
+                "step_idx": 1,
+                "schema_version": "3.0.0",
+                "ts_utc": action_time,
+                "teacher_action": "hold",
+            }
+        ],
+        schema=PROPOSALS_SCHEMA,
+    )
+    pq.write_table(actions, source / "v3/action_proposals/train-00000.parquet")
+    output = tmp_path / "out"
+    with pytest.raises(AuditError, match="action.*timestamps differ"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_final_git_scan_cannot_hide_output_replacement(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    output = tmp_path / "out"
+    original = audit_module._retained_revision
+
+    def replace_after_scan(*args):
+        revision = original(*args)
+        artifact = output / "exclusions.parquet"
+        if artifact.exists():
+            artifact.write_bytes(b"replaced during git scan")
+        return revision
+
+    monkeypatch.setattr(audit_module, "_retained_revision", replace_after_scan)
+    with pytest.raises(AuditError, match="output artifacts changed"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("link_kind", ["file", "directory"])
+def test_symlinked_sources_do_not_claim_git_owned_bytes(tmp_path, monkeypatch, link_kind):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/state_telemetry"
+    if link_kind == "file":
+        path /= "train-00000.parquet"
+    external = tmp_path / "external"
+    path.rename(external)
+    path.symlink_to(external, target_is_directory=link_kind == "directory")
+    # Even an apparently clean tracked link cannot attest its external target bytes.
+    monkeypatch.setattr(audit_module, "_git_head", lambda *_args: "clean-revision")
     output = tmp_path / "out"
     audit_v3(source, output)
     manifest = json.loads((output / "manifest.json").read_text())

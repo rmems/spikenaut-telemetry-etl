@@ -132,7 +132,7 @@ def _load_campaign(
 
 def _load_manifest(
     session_path: Path, expected_id: str
-) -> tuple[dict[str, Any], Path, str, int]:
+) -> tuple[dict[str, Any], Path, str, int, int]:
     manifest_path = session_path / "session_manifest.json"
     try:
         manifest_bytes = manifest_path.read_bytes()
@@ -161,21 +161,10 @@ def _load_manifest(
             f"session_id label mismatch: campaign has {expected_id}, "
             "manifest labels do not"
         )
-    ended_at = manifest.get("ended_at_utc")
-    if not isinstance(ended_at, str) or not ended_at:
-        raise PreparationError(
-            f"session {expected_id} ended_at_utc must be a valid UTC timestamp"
-        )
-    try:
-        ended_at_parsed = datetime.fromisoformat(ended_at)
-    except ValueError as exc:
-        raise PreparationError(
-            f"session {expected_id} ended_at_utc must be a valid UTC timestamp"
-        ) from exc
-    if ended_at_parsed.utcoffset() != timedelta(0):
-        raise PreparationError(
-            f"session {expected_id} ended_at_utc must be a valid UTC timestamp"
-        )
+    started_ms = _utc_marker_ms(manifest, "started_at_utc", expected_id)
+    ended_ms = _utc_marker_ms(manifest, "ended_at_utc", expected_id)
+    if started_ms > ended_ms:
+        raise PreparationError(f"session {expected_id} start follows completion")
     parquet_write_failures = manifest.get("parquet_write_failures")
     if (
         not isinstance(parquet_write_failures, int)
@@ -216,10 +205,27 @@ def _load_manifest(
         raise PreparationError(f"session {expected_id} timing sample_count is incomplete")
     if not isinstance(workload, dict) or workload.get("class") != "ai-compute":
         raise PreparationError(f"session {expected_id} workload class must be ai-compute")
-    ended_ms = (ended_at_parsed - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(
-        milliseconds=1
+    return (
+        manifest,
+        manifest_path,
+        hashlib.sha256(manifest_bytes).hexdigest(),
+        started_ms,
+        ended_ms,
     )
-    return manifest, manifest_path, hashlib.sha256(manifest_bytes).hexdigest(), ended_ms
+
+
+def _utc_marker_ms(manifest: dict[str, Any], field: str, expected_id: str) -> int:
+    value = manifest.get(field)
+    message = f"session {expected_id} {field} must be a valid UTC timestamp"
+    if not isinstance(value, str) or not value:
+        raise PreparationError(message)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise PreparationError(message) from exc
+    if parsed.utcoffset() != timedelta(0):
+        raise PreparationError(message)
+    return (parsed - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
 
 
 def _number(value: Any) -> float | None:
@@ -541,14 +547,18 @@ def _prepare_campaign(
             raw_path if raw_path.is_absolute() else campaign_path.parent / raw_path
         )
         try:
-            collector_manifest, manifest_path, manifest_sha256, ended_ms = _load_manifest(
-                session_path, session_id
+            collector_manifest, manifest_path, manifest_sha256, started_ms, ended_ms = (
+                _load_manifest(session_path, session_id)
             )
             rows, parquet_snapshots = _read_rows(session_path, session_id)
             if collector_manifest["timing"]["sample_count"] != len(rows):
                 raise PreparationError(
                     f"session {session_id} timing sample_count does not equal "
                     "persisted rows"
+                )
+            if started_ms > min(row["timestamp_ms"] for row in rows):
+                raise PreparationError(
+                    f"session {session_id} row timestamp precedes session start"
                 )
             if ended_ms < max(row["timestamp_ms"] for row in rows):
                 raise PreparationError(

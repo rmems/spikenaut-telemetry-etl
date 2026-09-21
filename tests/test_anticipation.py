@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
@@ -35,13 +36,20 @@ def _session(root: Path, session_id: str, rows: list[dict[str, int]]) -> Path:
     pq.write_table(
         pa.Table.from_pylist(labeled_rows), path / "gpu_telemetry_v2_batch_0.parquet"
     )
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    started_at = (
+        epoch + timedelta(milliseconds=min(row["timestamp_ms"] for row in rows))
+    ).isoformat()
+    ended_at = (
+        epoch + timedelta(milliseconds=max(row["timestamp_ms"] for row in rows) + 1)
+    ).isoformat()
     manifest = {
         "schema_version": 1,
         "session_id": session_id,
         "session_label": session_id,
-        "started_at_utc": "2026-09-20T00:00:00Z",
-        "run_started_at_utc": "2026-09-20T00:00:00Z",
-        "ended_at_utc": "2026-09-20T00:02:30Z",
+        "started_at_utc": started_at,
+        "run_started_at_utc": started_at,
+        "ended_at_utc": ended_at,
         "poll_interval_ms_requested": 100,
         "collector_version": "0.4.0",
         "git_commit": "a" * 40,
@@ -1149,7 +1157,7 @@ def test_completion_marker_must_cover_last_row(tmp_path: Path) -> None:
         / "session_manifest.json"
     )
     manifest = json.loads(manifest_path.read_text())
-    manifest["ended_at_utc"] = "1970-01-01T00:00:01Z"
+    manifest["ended_at_utc"] = "1970-01-01T00:16:50Z"
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(PreparationError, match="completion.*last.*timestamp"):
         prepare_campaign(campaign, tmp_path / "out")
@@ -1297,5 +1305,30 @@ def test_session_requires_utc_wall_clock_rows(tmp_path: Path, basis: str | None)
     sidecar.write_text(json.dumps(manifest))
     output = tmp_path / "out"
     with pytest.raises(PreparationError, match="row_timestamp_basis"):
+        prepare_campaign(campaign, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    "start",
+    [
+        None,
+        True,
+        "invalid",
+        "2026-09-20T00:00:00Z",
+        "1970-01-01T00:16:52Z",
+        "1970-01-01T00:00:00+01:00",
+    ],
+)
+def test_rows_must_fit_declared_session_start(tmp_path, start):
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    sidecar = tmp_path / "session-01/session_manifest.json"
+    manifest = json.loads(sidecar.read_text())
+    manifest["started_at_utc"] = start
+    if start == "2026-09-20T00:00:00Z":
+        manifest["ended_at_utc"] = "2026-09-20T00:02:30Z"
+    sidecar.write_text(json.dumps(manifest))
+    output = tmp_path / "out"
+    with pytest.raises(PreparationError, match="start"):
         prepare_campaign(campaign, output)
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"

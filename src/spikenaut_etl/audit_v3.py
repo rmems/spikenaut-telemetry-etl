@@ -106,9 +106,17 @@ def _git_head(path: Path, output_root: Path | None = None) -> str | None:
 
 
 def _retained_revision(
-    dataset_root: Path, output_root: Path, expected: str | None
+    dataset_root: Path, v3_root: Path, output_root: Path, expected: str | None
 ) -> str | None:
-    if expected is not None and _git_head(dataset_root, output_root) == expected:
+    if expected is None:
+        return None
+    for config in ("state_telemetry", "outcomes", "action_proposals"):
+        directory = v3_root / config
+        if any(
+            path.resolve() != path for path in (directory, *directory.glob("*.parquet"))
+        ):
+            return None
+    if _git_head(dataset_root, output_root) == expected:
         return expected
     return None
 
@@ -528,7 +536,9 @@ def _audit_v3_impl(
     episode_split: dict[str, str] = {}
     episodes_by_split: dict[str, set[str]] = {}
     source_hashes = _available_source_hashes(dataset_root, v3_root)
-    source_git_commit = _retained_revision(dataset_root, output_root, source_git_commit)
+    source_git_commit = _retained_revision(
+        dataset_root, v3_root, output_root, source_git_commit
+    )
     expected_hashes = {
         dataset_root / name: digest for name, digest in source_hashes.items()
     }
@@ -647,6 +657,16 @@ def _audit_v3_impl(
         actions, action_keys, missing_actions = _load_actions(
             v3_root, split, state_keys, expected_hashes
         )
+        state_times = dict(
+            zip(state_keys, state.column("ts_utc").to_pylist(), strict=True)
+        )
+        if any(
+            state_times[key] != timestamp
+            for key, timestamp in zip(
+                action_keys, actions.column("ts_utc").to_pylist(), strict=True
+            )
+        ):
+            raise AuditError(f"{split} state/action timestamps differ")
         eligible_tables[split] = _append_output_columns(
             state,
             outcomes,
@@ -736,6 +756,9 @@ def _audit_v3_impl(
         | {"exclusions.parquet": _sha256(output_root / "exclusions.parquet")},
     }
     write_json(output_root / "audit-report.json", report.to_dict())
+    manifest["source_git_commit"] = _retained_revision(
+        dataset_root, v3_root, output_root, source_git_commit
+    )
     if directory_identity(output_root) != publication_identity:
         raise AuditError("publication directory changed during audit")
     if directory_identity(view_root) != view_identity:
@@ -745,9 +768,6 @@ def _audit_v3_impl(
     if directory_identity(output_root) != publication_identity:
         raise AuditError("publication directory changed during audit")
     _check_output_snapshot(output_root, view_root, manifest["outputs"])
-    manifest["source_git_commit"] = _retained_revision(
-        dataset_root, output_root, source_git_commit
-    )
     write_json(output_root / "manifest.json", manifest)
     if directory_identity(output_root) != publication_identity:
         raise AuditError("publication directory changed during audit")
@@ -799,9 +819,9 @@ def _write_incomplete_evidence(
         ),
         "outputs": {},
     }
-    if dataset_root is not None:
+    if dataset_root is not None and v3_root is not None:
         incomplete_manifest["source_git_commit"] = _retained_revision(
-            dataset_root, output_root, source_git_commit
+            dataset_root, v3_root, output_root, source_git_commit
         )
     write_json(output_root / "audit-report.json", incomplete_report)
     write_json(output_root / "manifest.json", incomplete_manifest)
