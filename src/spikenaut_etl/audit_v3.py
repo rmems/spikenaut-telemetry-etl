@@ -32,6 +32,7 @@ VIEW_ID = "v3-forecast-eligible-v1"
 HORIZON_SAMPLES = 64
 EPISODE_LEN = 4096
 SPLITS = ("train", "validation", "test")
+SHARD_GLOB = "*.parquet"
 SENSOR_COLUMNS = ("gpu_temp_c", "power_w", "sm_clock_mhz", "mem_clock_mhz")
 ZERO_SUSPECT_COLUMNS = SENSOR_COLUMNS
 
@@ -114,7 +115,7 @@ def _retained_revision(
     for config in ("state_telemetry", "outcomes", "action_proposals"):
         directory = v3_root / config
         if any(
-            path.resolve() != path for path in (directory, *directory.glob("*.parquet"))
+            path.resolve() != path for path in (directory, *directory.glob(SHARD_GLOB))
         ):
             return None
     if _git_head(dataset_root, output_root) == expected:
@@ -291,6 +292,9 @@ def _load_split(
     _require_numeric_columns(state, SENSOR_COLUMNS, f"state_telemetry/{split}")
     _require_numeric_columns(outcomes, ("reward", "d_gpu_temp_c"), f"outcomes/{split}")
     for table, schema in ((state, STATE_SCHEMA), (outcomes, OUTCOMES_SCHEMA)):
+        unexpected = set(table.column_names) - set(schema.names)
+        if unexpected:
+            raise AuditError(f"unexpected source fields: {sorted(unexpected)}")
         for field in schema:
             if (
                 field.name not in table.column_names
@@ -397,7 +401,7 @@ def _guard_output_path(
 def _guard_source_members(v3_root: Path, output_root: Path) -> None:
     for config in ("state_telemetry", "outcomes", "action_proposals"):
         directory = v3_root / config
-        for source in (directory, *directory.glob("*.parquet")):
+        for source in (directory, *directory.glob(SHARD_GLOB)):
             try:
                 resolved = source.resolve()
             except (OSError, RuntimeError, UnicodeError) as exc:
@@ -432,7 +436,7 @@ def _available_source_hashes(
     expected_names = {f"{split}-00000.parquet" for split in SPLITS}
     for config in ("state_telemetry", "outcomes", "action_proposals"):
         directory = v3_root / config
-        paths = sorted(directory.glob("*.parquet"))
+        paths = sorted(directory.glob(SHARD_GLOB))
         memberships[directory] = paths
         if not directory.is_dir():
             continue
@@ -449,7 +453,7 @@ def _available_source_hashes(
             except OSError:
                 if not tolerate_unreadable:
                     raise
-        final_paths = sorted(directory.glob("*.parquet"))
+        final_paths = sorted(directory.glob(SHARD_GLOB))
         if not tolerate_unreadable and [path.name for path in final_paths] != [
             path.name for path in paths
         ]:
@@ -458,7 +462,7 @@ def _available_source_hashes(
             )
     if not tolerate_unreadable:
         for directory, paths in memberships.items():
-            if sorted(directory.glob("*.parquet")) != paths:
+            if sorted(directory.glob(SHARD_GLOB)) != paths:
                 raise AuditError(
                     f"{directory.name} source shard membership changed during hashing"
                 )
@@ -529,20 +533,16 @@ def _append_action_columns(
     return selected
 
 
-def _audit_v3_impl(
-    dataset_root: Path, v3_root: Path, output_root: Path, source_git_commit: str | None
-) -> AuditReport:
-    publication_identity = directory_identity(output_root)
-    loaded: dict[str, tuple[Path, Path, pa.Table, pa.Table]] = {}
+type LoadedSplit = tuple[Path, Path, pa.Table, pa.Table]
+type RowKey = tuple[str, int]
+
+
+def _load_validated_splits(
+    v3_root: Path, expected_hashes: dict[Path, str]
+) -> tuple[dict[str, LoadedSplit], dict[str, set[str]]]:
+    loaded: dict[str, LoadedSplit] = {}
     episode_split: dict[str, str] = {}
     episodes_by_split: dict[str, set[str]] = {}
-    source_hashes = _available_source_hashes(dataset_root, v3_root)
-    source_git_commit = _retained_revision(
-        dataset_root, v3_root, output_root, source_git_commit
-    )
-    expected_hashes = {
-        dataset_root / name: digest for name, digest in source_hashes.items()
-    }
     for split in SPLITS:
         loaded[split] = _load_split(v3_root, split, expected_hashes)
         _, _, state, outcomes = loaded[split]
@@ -573,151 +573,204 @@ def _audit_v3_impl(
                     f"episode {episode_id!r} belongs to multiple splits: "
                     f"{previous}, {split}"
                 )
-    split_reports: dict[str, dict[str, Any]] = {}
-    eligible_tables: dict[str, pa.Table] = {}
+    return loaded, episodes_by_split
+
+
+def _window_reasons(
+    episode_id: str,
+    step_idx: int,
+    state_index: dict[RowKey, int],
+    base_reasons: dict[RowKey, list[str]],
+) -> list[str]:
+    reasons: list[str] = []
+    for offset in range(HORIZON_SAMPLES + 1):
+        window_key = (episode_id, step_idx + offset)
+        if window_key not in state_index:
+            reasons.append("window_has_index_gap")
+            continue
+        if offset == 0:
+            continue
+        for reason in base_reasons[window_key]:
+            window_reason = f"window_contains_{reason}"
+            if window_reason not in reasons:
+                reasons.append(window_reason)
+    return reasons
+
+
+def _delta_reasons(current_temp: Any, target_temp: Any, recorded: Any) -> list[str]:
+    reasons: list[str] = []
+    if (
+        current_temp is not None
+        and target_temp is not None
+        and math.isfinite(float(current_temp))
+        and math.isfinite(float(target_temp))
+    ):
+        expected = float(target_temp) - float(current_temp)
+        if recorded is None or not math.isfinite(float(recorded)):
+            reasons.append("missing_or_non_finite_outcome_delta")
+        elif not math.isclose(float(recorded), expected, rel_tol=1e-6, abs_tol=1e-5):
+            reasons.append("outcome_delta_mismatch")
+
+    return reasons
+
+
+def _eligibility_reasons(
+    index: int,
+    key: RowKey,
+    state_index: dict[RowKey, int],
+    outcome_index: dict[RowKey, int],
+    temperatures: list[Any],
+    deltas: list[Any],
+    base_reasons: dict[RowKey, list[str]],
+) -> list[str]:
+    episode_id, step_idx = key
+    target_key = (episode_id, step_idx + HORIZON_SAMPLES)
+    reasons = list(base_reasons[key])
+    if target_key not in state_index:
+        reasons.append("missing_exact_64_sample_target")
+    else:
+        reasons.extend(_window_reasons(episode_id, step_idx, state_index, base_reasons))
+        current_temp = temperatures[index]
+        target_temp = temperatures[state_index[target_key]]
+        recorded = deltas[outcome_index[key]]
+        reasons.extend(_delta_reasons(current_temp, target_temp, recorded))
+    return sorted(set(reasons))
+
+
+def _evaluate_split(
+    v3_root: Path,
+    split: str,
+    state: pa.Table,
+    outcomes: pa.Table,
+    expected_hashes: dict[Path, str],
+) -> tuple[dict[str, Any], pa.Table, list[dict[str, object]]]:
     exclusion_rows: list[dict[str, object]] = []
+    state_keys = _key_columns(state, f"state_telemetry/{split}")
+    outcome_keys = _key_columns(outcomes, f"outcomes/{split}")
+    state_index = {key: index for index, key in enumerate(state_keys)}
+    outcome_index = {key: index for index, key in enumerate(outcome_keys)}
+    sensor_values = {name: state.column(name).to_pylist() for name in SENSOR_COLUMNS}
+    deltas = outcomes.column("d_gpu_temp_c").to_pylist()
 
-    for split in SPLITS:
-        _, _, state, outcomes = loaded[split]
-        state_keys = _key_columns(state, f"state_telemetry/{split}")
-        outcome_keys = _key_columns(outcomes, f"outcomes/{split}")
-        state_index = {key: index for index, key in enumerate(state_keys)}
-        outcome_index = {key: index for index, key in enumerate(outcome_keys)}
-        sensor_values = {name: state.column(name).to_pylist() for name in SENSOR_COLUMNS}
-        deltas = outcomes.column("d_gpu_temp_c").to_pylist()
+    base_reasons: dict[tuple[str, int], list[str]] = {}
+    for index, key in enumerate(state_keys):
+        reasons = [
+            reason
+            for name in SENSOR_COLUMNS
+            if (reason := _sensor_reason(name, sensor_values[name][index])) is not None
+        ]
+        base_reasons[key] = reasons
 
-        base_reasons: dict[tuple[str, int], list[str]] = {}
-        for index, key in enumerate(state_keys):
-            reasons = [
-                reason
-                for name in SENSOR_COLUMNS
-                if (reason := _sensor_reason(name, sensor_values[name][index]))
-                is not None
-            ]
-            base_reasons[key] = reasons
+    eligible_state_indices: list[int] = []
+    eligible_outcome_indices: list[int] = []
+    eligible_source_indices: list[int] = []
+    eligible_target_steps: list[int] = []
+    reason_counts: Counter[str] = Counter()
 
-        eligible_state_indices: list[int] = []
-        eligible_outcome_indices: list[int] = []
-        eligible_source_indices: list[int] = []
-        eligible_target_steps: list[int] = []
-        reason_counts: Counter[str] = Counter()
-
-        for index, key in enumerate(state_keys):
-            episode_id, step_idx = key
-            target_key = (episode_id, step_idx + HORIZON_SAMPLES)
-            reasons = list(base_reasons[key])
-            if target_key not in state_index:
-                reasons.append("missing_exact_64_sample_target")
-            else:
-                for offset in range(HORIZON_SAMPLES + 1):
-                    window_key = (episode_id, step_idx + offset)
-                    if window_key not in state_index:
-                        reasons.append("window_has_index_gap")
-                        continue
-                    if offset == 0:
-                        continue
-                    for reason in base_reasons[window_key]:
-                        window_reason = f"window_contains_{reason}"
-                        if window_reason not in reasons:
-                            reasons.append(window_reason)
-                current_temp = sensor_values["gpu_temp_c"][index]
-                target_temp = sensor_values["gpu_temp_c"][state_index[target_key]]
-                recorded = deltas[outcome_index[key]]
-                if (
-                    current_temp is not None
-                    and target_temp is not None
-                    and math.isfinite(float(current_temp))
-                    and math.isfinite(float(target_temp))
-                ):
-                    expected = float(target_temp) - float(current_temp)
-                    if recorded is None or not math.isfinite(float(recorded)):
-                        reasons.append("missing_or_non_finite_outcome_delta")
-                    elif not math.isclose(
-                        float(recorded), expected, rel_tol=1e-6, abs_tol=1e-5
-                    ):
-                        reasons.append("outcome_delta_mismatch")
-
-            reasons = sorted(set(reasons))
-            if reasons:
-                reason_counts.update(reasons)
-                exclusion_rows.append(
-                    {
-                        "source_split": split,
-                        "episode_id": episode_id,
-                        "step_idx": step_idx,
-                        "source_row_index": _source_index(key),
-                        "reasons": reasons,
-                    }
-                )
-                continue
-            eligible_state_indices.append(index)
-            eligible_outcome_indices.append(outcome_index[key])
-            eligible_source_indices.append(_source_index(key))
-            eligible_target_steps.append(step_idx + HORIZON_SAMPLES)
-
-        actions, action_keys, missing_actions = _load_actions(
-            v3_root, split, state_keys, expected_hashes
+    for index, key in enumerate(state_keys):
+        episode_id, step_idx = key
+        reasons = _eligibility_reasons(
+            index,
+            key,
+            state_index,
+            outcome_index,
+            sensor_values["gpu_temp_c"],
+            deltas,
+            base_reasons,
         )
-        state_times = dict(
-            zip(state_keys, state.column("ts_utc").to_pylist(), strict=True)
-        )
-        if any(
-            state_times[key] != timestamp
-            for key, timestamp in zip(
-                action_keys, actions.column("ts_utc").to_pylist(), strict=True
+        if reasons:
+            reason_counts.update(reasons)
+            exclusion_rows.append(
+                {
+                    "source_split": split,
+                    "episode_id": episode_id,
+                    "step_idx": step_idx,
+                    "source_row_index": _source_index(key),
+                    "reasons": reasons,
+                }
             )
-        ):
-            raise AuditError(f"{split} state/action timestamps differ")
-        eligible_tables[split] = _append_output_columns(
-            state,
-            outcomes,
-            eligible_state_indices,
-            eligible_outcome_indices,
-            split,
-            eligible_source_indices,
-            eligible_target_steps,
-        )
-        eligible_tables[split] = _append_action_columns(
-            eligible_tables[split],
-            actions,
-            action_keys,
-            [state_keys[index] for index in eligible_state_indices],
-        )
-        split_reports[split] = {
-            "source_rows": state.num_rows,
-            "eligible_rows": len(eligible_state_indices),
-            "excluded_rows": state.num_rows - len(eligible_state_indices),
-            "exclusion_reasons": dict(sorted(reason_counts.items())),
-            "numeric_sensor_columns": {
-                name: _distribution(state.column(name))
-                for name in _numeric_sensor_columns(state)
-            },
-            "missing_fields": {
-                "timestamp_missing_count": state.column("ts_utc").null_count,
-                "reward_missing_count": outcomes.column("reward").null_count,
-                "action_label_missing_count": missing_actions,
-            },
-            **{name: _distribution(state.column(name)) for name in SENSOR_COLUMNS},
-        }
+            continue
+        eligible_state_indices.append(index)
+        eligible_outcome_indices.append(outcome_index[key])
+        eligible_source_indices.append(_source_index(key))
+        eligible_target_steps.append(step_idx + HORIZON_SAMPLES)
 
-    integrity = {
-        "duplicate_keys": "passed",
-        "state_outcome_joins": "passed",
-        "episode_split_membership": "passed",
-        "episodes_by_split": dict(
-            sorted(
-                (split, len(episodes)) for split, episodes in episodes_by_split.items()
-            )
-        ),
-        "overlapping_episode_count": 0,
-    }
-    report = AuditReport(
-        audit_version=AUDIT_VERSION,
-        view_id=VIEW_ID,
-        horizon_samples=HORIZON_SAMPLES,
-        splits=split_reports,
-        integrity=integrity,
+    actions, action_keys, missing_actions = _load_actions(
+        v3_root, split, state_keys, expected_hashes
     )
+    state_times = dict(zip(state_keys, state.column("ts_utc").to_pylist(), strict=True))
+    if any(
+        state_times[key] != timestamp
+        for key, timestamp in zip(
+            action_keys, actions.column("ts_utc").to_pylist(), strict=True
+        )
+    ):
+        raise AuditError(f"{split} state/action timestamps differ")
+    eligible_table = _append_output_columns(
+        state,
+        outcomes,
+        eligible_state_indices,
+        eligible_outcome_indices,
+        split,
+        eligible_source_indices,
+        eligible_target_steps,
+    )
+    eligible_table = _append_action_columns(
+        eligible_table,
+        actions,
+        action_keys,
+        [state_keys[index] for index in eligible_state_indices],
+    )
+    distributions = {
+        name: _distribution(state.column(name)) for name in _numeric_sensor_columns(state)
+    }
+    split_report = {
+        "source_rows": state.num_rows,
+        "eligible_rows": len(eligible_state_indices),
+        "excluded_rows": state.num_rows - len(eligible_state_indices),
+        "exclusion_reasons": dict(sorted(reason_counts.items())),
+        "numeric_sensor_columns": distributions,
+        "missing_fields": {
+            "timestamp_missing_count": state.column("ts_utc").null_count,
+            "reward_missing_count": outcomes.column("reward").null_count,
+            "action_label_missing_count": missing_actions,
+        },
+        **{name: distributions[name] for name in SENSOR_COLUMNS},
+    }
+
+    return split_report, eligible_table, exclusion_rows
+
+
+@dataclass(frozen=True)
+class _AuditSources:
+    dataset_root: Path
+    v3_root: Path
+    hashes: dict[str, str]
+    git_commit: str | None
+
+
+@dataclass(frozen=True)
+class _AuditOutputs:
+    report: AuditReport
+    eligible_tables: dict[str, pa.Table]
+    exclusions: list[dict[str, object]]
+
+
+def _verify_audit_directory(path: Path, identity: tuple[int, int]) -> None:
+    if directory_identity(path) != identity:
+        raise AuditError("publication directory changed during audit")
+
+
+def _publish_audit(
+    sources: _AuditSources,
+    outputs: _AuditOutputs,
+    output_root: Path,
+    publication_identity: tuple[int, int],
+) -> None:
+    dataset_root, v3_root = sources.dataset_root, sources.v3_root
+    source_hashes, source_git_commit = sources.hashes, sources.git_commit
+    report, eligible_tables = outputs.report, outputs.eligible_tables
+    exclusion_rows = outputs.exclusions
     final_source_hashes = _available_source_hashes(dataset_root, v3_root)
     if final_source_hashes != source_hashes:
         raise AuditError("source shards changed during audit")
@@ -757,23 +810,69 @@ def _audit_v3_impl(
         | {"exclusions.parquet": _sha256(output_root / "exclusions.parquet")},
     }
     write_json(output_root / "audit-report.json", report.to_dict())
+    _verify_audit_directory(output_root, publication_identity)
+    manifest["outputs"]["audit-report.json"] = _sha256(output_root / "audit-report.json")
     manifest["source_git_commit"] = _retained_revision(
         dataset_root, v3_root, output_root, source_git_commit
     )
-    if directory_identity(output_root) != publication_identity:
-        raise AuditError("publication directory changed during audit")
-    if directory_identity(view_root) != view_identity:
-        raise AuditError("publication directory changed during audit")
+    _verify_audit_directory(output_root, publication_identity)
+    _verify_audit_directory(view_root, view_identity)
     if _available_source_hashes(dataset_root, v3_root) != source_hashes:
         raise AuditError("source shards changed during publication")
-    if directory_identity(output_root) != publication_identity:
-        raise AuditError("publication directory changed during audit")
+    _verify_audit_directory(output_root, publication_identity)
     _check_output_snapshot(output_root, view_root, manifest["outputs"])
     write_json(output_root / "manifest.json", manifest)
-    if directory_identity(output_root) != publication_identity:
-        raise AuditError("publication directory changed during audit")
-    if directory_identity(view_root) != view_identity:
-        raise AuditError("publication directory changed during audit")
+    _verify_audit_directory(output_root, publication_identity)
+    _verify_audit_directory(view_root, view_identity)
+
+
+def _audit_v3_impl(
+    dataset_root: Path, v3_root: Path, output_root: Path, source_git_commit: str | None
+) -> AuditReport:
+    publication_identity = directory_identity(output_root)
+    source_hashes = _available_source_hashes(dataset_root, v3_root)
+    source_git_commit = _retained_revision(
+        dataset_root, v3_root, output_root, source_git_commit
+    )
+    expected_hashes = {
+        dataset_root / name: digest for name, digest in source_hashes.items()
+    }
+    loaded, episodes_by_split = _load_validated_splits(v3_root, expected_hashes)
+    split_reports: dict[str, dict[str, Any]] = {}
+    eligible_tables: dict[str, pa.Table] = {}
+    exclusion_rows: list[dict[str, object]] = []
+    for split in SPLITS:
+        _, _, state, outcomes = loaded[split]
+        split_report, table, exclusions = _evaluate_split(
+            v3_root, split, state, outcomes, expected_hashes
+        )
+        split_reports[split] = split_report
+        eligible_tables[split] = table
+        exclusion_rows.extend(exclusions)
+    integrity = {
+        "duplicate_keys": "passed",
+        "state_outcome_joins": "passed",
+        "episode_split_membership": "passed",
+        "episodes_by_split": dict(
+            sorted(
+                (split, len(episodes)) for split, episodes in episodes_by_split.items()
+            )
+        ),
+        "overlapping_episode_count": 0,
+    }
+    report = AuditReport(
+        audit_version=AUDIT_VERSION,
+        view_id=VIEW_ID,
+        horizon_samples=HORIZON_SAMPLES,
+        splits=split_reports,
+        integrity=integrity,
+    )
+    _publish_audit(
+        _AuditSources(dataset_root, v3_root, source_hashes, source_git_commit),
+        _AuditOutputs(report, eligible_tables, exclusion_rows),
+        output_root,
+        publication_identity,
+    )
     return report
 
 
@@ -781,11 +880,11 @@ def _check_output_snapshot(
     output_root: Path, view_root: Path, expected: dict[str, str]
 ) -> None:
     names = {f"{split}-00000.parquet" for split in SPLITS}
-    if {path.name for path in view_root.glob("*.parquet")} != names:
+    if {path.name for path in view_root.glob(SHARD_GLOB)} != names:
         raise AuditError("output shard membership changed during publication")
     if any(_sha256(output_root / name) != digest for name, digest in expected.items()):
         raise AuditError("output artifacts changed during publication")
-    if {path.name for path in view_root.glob("*.parquet")} != names:
+    if {path.name for path in view_root.glob(SHARD_GLOB)} != names:
         raise AuditError("output shard membership changed during publication")
 
 
@@ -879,8 +978,8 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
     source_path = Path(source_dir)
     try:
         output_root = Path(output_dir).resolve()
-    except RuntimeError as exc:
-        raise AuditError(f"output path has a symlink loop: {output_dir}") from exc
+    except (RuntimeError, UnicodeError) as exc:
+        raise AuditError(f"cannot resolve output path: {output_dir!r}") from exc
     initial_identity = directory_identity(output_root) if output_root.is_dir() else None
     try:
         dataset_root, v3_root, source_is_dataset_root = _source_root(source_path)
@@ -905,9 +1004,22 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
             dataset_root.resolve(), v3_root.resolve(), output_root, source_is_dataset_root
         )
         _pin_audit_view(output_root, dataset_root, v3_root, source_git_commit)
-        _guard_output_path(
-            dataset_root.resolve(), v3_root.resolve(), output_root, source_is_dataset_root
-        )
+        try:
+            _guard_output_path(
+                dataset_root.resolve(),
+                v3_root.resolve(),
+                output_root,
+                source_is_dataset_root,
+            )
+        except AuditError as exc:
+            # A substituted view may now hold source shards. Only replace root evidence.
+            clean_artifacts(
+                output_root, ("manifest.json", "audit-report.json", "exclusions.parquet")
+            )
+            _write_incomplete_evidence(
+                output_root, exc, dataset_root, v3_root, source_git_commit
+            )
+            raise
         try:
             ensure_directory(output_root)
             _clean_owned_outputs(output_root)

@@ -790,6 +790,30 @@ def _guard_assigned_sources(
     return resolution_error
 
 
+PUBLICATION_DIRECTORY_ERROR = "publication directory changed during preparation"
+PREPARED_ARTIFACT_ERROR = "prepared artifact changed during publication"
+
+
+def _verify_publication(
+    output_dir: Path, identity: tuple[int, int], digest: str, *, hash_first: bool = False
+) -> None:
+    def check_directory() -> None:
+        if directory_identity(output_dir) != identity:
+            raise PreparationError(PUBLICATION_DIRECTORY_ERROR)
+
+    def check_artifact() -> None:
+        if _sha256(output_dir / "prepared.json") != digest:
+            raise PreparationError(PREPARED_ARTIFACT_ERROR)
+
+    checks = (
+        (check_artifact, check_directory)
+        if hash_first
+        else (check_directory, check_artifact)
+    )
+    for check in checks:
+        check()
+
+
 def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[str, Any]:
     """Prepare a campaign; publish failure evidence only into the retained output root."""
 
@@ -804,7 +828,10 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
         campaign_resolution_error = PreparationError(
             f"campaign path has a symlink loop: {campaign_path}"
         )
-    output_dir = Path(output_dir).resolve()
+    try:
+        output_dir = Path(output_dir).resolve()
+    except (RuntimeError, UnicodeError) as exc:
+        raise PreparationError(f"cannot resolve output path: {output_dir!r}") from exc
     initial_identity = directory_identity(output_dir) if output_dir.is_dir() else None
     output_paths = [
         output_dir / name
@@ -889,18 +916,19 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
                 "sources": prepared["provenance"]["sources"],
             }
             _write_json(output_dir / "quality-report.json", prepared["quality"])
-            if directory_identity(output_dir) != publication_identity:
-                raise PreparationError("publication directory changed during preparation")
-            if _sha256(output_dir / "prepared.json") != manifest["prepared_sha256"]:
-                raise PreparationError("prepared artifact changed during publication")
+            _verify_publication(
+                output_dir, publication_identity, manifest["prepared_sha256"]
+            )
             _check_preparation_sources(source_memberships, source_snapshots)
-            if _sha256(output_dir / "prepared.json") != manifest["prepared_sha256"]:
-                raise PreparationError("prepared artifact changed during publication")
-            if directory_identity(output_dir) != publication_identity:
-                raise PreparationError("publication directory changed during preparation")
+            _verify_publication(
+                output_dir,
+                publication_identity,
+                manifest["prepared_sha256"],
+                hash_first=True,
+            )
             _write_json(output_dir / "manifest.json", manifest)
             if directory_identity(output_dir) != publication_identity:
-                raise PreparationError("publication directory changed during preparation")
+                raise PreparationError(PUBLICATION_DIRECTORY_ERROR)
         except (OSError, PreparationError) as exc:
             if not assignments:
                 assignments = _assignments(campaign_bytes)

@@ -1332,3 +1332,8 @@ def test_rows_must_fit_declared_session_start(tmp_path, start):
     with pytest.raises(PreparationError, match="start"):
         prepare_campaign(campaign, output)
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_unencodable_output_has_scoped_preparation_error(tmp_path):
+    with pytest.raises(PreparationError, match="output path"):
+        prepare_campaign(tmp_path / "campaign.json", tmp_path / "\ud800")

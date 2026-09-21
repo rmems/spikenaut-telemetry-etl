@@ -1,5 +1,7 @@
 # spikenaut-telemetry-etl
 
+[![Maintainability](https://qlty.sh/gh/rmems/projects/spikenaut-telemetry-etl/maintainability.svg)](https://qlty.sh/gh/rmems/projects/spikenaut-telemetry-etl)
+
 Cleaning and validation pipeline for Spikenaut SNN telemetry, sitting between the
 Rust collectors that produce it and the Hugging Face dataset that publishes it.
 

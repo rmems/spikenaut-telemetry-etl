@@ -967,8 +967,12 @@ def test_audit_parses_the_same_bytes_it_hashes(
         pa.array([77.0] * changed.num_rows),
     )
 
+    changed_during_read = False
+
     def replace_while_reading(path: object, *args: object, **kwargs: object) -> pa.Table:
-        if path == target:
+        nonlocal changed_during_read
+        if not changed_during_read:
+            changed_during_read = True
             pq.write_table(changed, target)
             try:
                 return read_table(path, *args, **kwargs)
@@ -978,6 +982,7 @@ def test_audit_parses_the_same_bytes_it_hashes(
 
     monkeypatch.setattr(pq, "read_table", replace_while_reading)
     audit_v3(source, output)
+    assert changed_during_read
     view = read_table(output / "v3-forecast-eligible-v1/train-00000.parquet")
     assert view.column("mem_util_pct").to_pylist() == [20.0, 21.0]
 
@@ -1174,7 +1179,7 @@ def test_state_outcome_column_collision_is_rejected(tmp_path: Path) -> None:
     path = source / "v3/state_telemetry/train-00000.parquet"
     state = pq.read_table(path)
     pq.write_table(state.append_column("reward", pa.array([42.0] * state.num_rows)), path)
-    with pytest.raises(AuditError, match="column.*collision"):
+    with pytest.raises(AuditError, match="unexpected source fields"):
         audit_v3(source, tmp_path / "audit")
 
 
@@ -1249,7 +1254,7 @@ def test_generated_column_names_are_reserved(tmp_path: Path, name: str) -> None:
     path = source / "v3/state_telemetry/train-00000.parquet"
     table = pq.read_table(path)
     pq.write_table(table.append_column(name, pa.array([1] * table.num_rows)), path)
-    with pytest.raises(AuditError, match="generated.*collision"):
+    with pytest.raises(AuditError, match="unexpected source fields"):
         audit_v3(source, tmp_path / "audit")
 
 
@@ -1749,3 +1754,63 @@ def test_replaced_view_cannot_overwrite_or_clean_source_shards(tmp_path, monkeyp
         audit_v3(source, output)
     assert {path.name: path.read_bytes() for path in view.glob("*.parquet")} == before
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("config", ["state_telemetry", "outcomes"])
+def test_extra_source_fields_are_rejected(tmp_path, config):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    shard = source / "v3" / config / "train-00000.parquet"
+    table = pq.read_table(shard)
+    pq.write_table(
+        table.append_column("unexpected", pa.array([1] * table.num_rows)), shard
+    )
+    with pytest.raises(AuditError, match="unexpected source fields"):
+        audit_v3(source, tmp_path / "out")
+
+
+def test_report_replacement_prevents_complete_manifest(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    output = tmp_path / "out"
+    original = audit_module._retained_revision
+
+    def replace_report(*args):
+        result = original(*args)
+        report = output / "audit-report.json"
+        if report.exists():
+            report.write_text('{"status":"tampered"}')
+        return result
+
+    monkeypatch.setattr(audit_module, "_retained_revision", replace_report)
+    with pytest.raises(AuditError, match="output artifacts changed"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_source_substitution_before_view_pin_preserves_shards(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    output = tmp_path / "out"
+    audit_v3(source, output)
+    view = output / audit_module.VIEW_ID
+    config = source / "v3/state_telemetry"
+    before = {p.name: p.read_bytes() for p in config.glob("*.parquet")}
+    original = audit_module._pin_audit_view
+
+    def substitute(*args):
+        view.rename(tmp_path / "detached")
+        config.rename(view)
+        config.symlink_to(view, target_is_directory=True)
+        original(*args)
+
+    monkeypatch.setattr(audit_module, "_pin_audit_view", substitute)
+    with pytest.raises(AuditError, match="overlap"):
+        audit_v3(source, output)
+    assert {p.name: p.read_bytes() for p in view.glob("*.parquet")} == before
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_unencodable_output_has_scoped_audit_error(tmp_path):
+    with pytest.raises(AuditError, match="output path"):
+        audit_v3(tmp_path / "source", tmp_path / "\ud800")
