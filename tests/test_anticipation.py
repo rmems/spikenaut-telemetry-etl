@@ -289,6 +289,14 @@ def test_normalization_uses_training_only_and_records_constants(tmp_path: Path) 
     [
         (lambda manifest: manifest.pop("ended_at_utc"), "ended_at_utc"),
         (
+            lambda manifest: manifest.__setitem__("ended_at_utc", "not-a-timestamp"),
+            "valid UTC timestamp",
+        ),
+        (
+            lambda manifest: manifest.__setitem__("ended_at_utc", True),
+            "valid UTC timestamp",
+        ),
+        (
             lambda manifest: manifest.__setitem__("parquet_write_failures", 1),
             "write failures",
         ),
@@ -421,6 +429,18 @@ def test_malformed_path_still_writes_incomplete_reports(tmp_path: Path) -> None:
 
     with pytest.raises(PreparationError, match="path"):
         prepare_campaign(campaign, tmp_path / "out")
+    assert (
+        json.loads((tmp_path / "out" / "manifest.json").read_text())["status"]
+        == "incomplete"
+    )
+
+
+def test_nonpositive_source_timestamp_fails_closed(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows(start=0))])
+
+    with pytest.raises(PreparationError, match="positive timestamp_ms"):
+        prepare_campaign(campaign, tmp_path / "out")
+
     assert (
         json.loads((tmp_path / "out" / "manifest.json").read_text())["status"]
         == "incomplete"

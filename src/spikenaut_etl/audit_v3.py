@@ -98,6 +98,13 @@ def _require_columns(table: pa.Table, names: tuple[str, ...], label: str) -> Non
         raise AuditError(f"{label} missing required columns: {', '.join(missing)}")
 
 
+def _require_numeric_columns(table: pa.Table, names: tuple[str, ...], label: str) -> None:
+    for name in names:
+        field_type = table.schema.field(name).type
+        if not (pa.types.is_integer(field_type) or pa.types.is_floating(field_type)):
+            raise AuditError(f"{label} {name} must have a numeric Arrow type")
+
+
 def _assert_unique(keys: list[tuple[str, int]], label: str) -> None:
     duplicates = [key for key, count in Counter(keys).items() if count > 1]
     if duplicates:
@@ -175,6 +182,17 @@ def _source_root(source_dir: Path) -> tuple[Path, Path]:
 def _load_split(v3_root: Path, split: str) -> tuple[Path, Path, pa.Table, pa.Table]:
     state_path = v3_root / "state_telemetry" / f"{split}-00000.parquet"
     outcome_path = v3_root / "outcomes" / f"{split}-00000.parquet"
+    expected_names = {f"{name}-00000.parquet" for name in SPLITS}
+    for directory in (state_path.parent, outcome_path.parent):
+        unexpected = sorted(
+            path.name
+            for path in directory.glob("*.parquet")
+            if path.name not in expected_names
+        )
+        if unexpected:
+            raise AuditError(
+                f"{directory.name} has unexpected source shards: {', '.join(unexpected)}"
+            )
     for path in (state_path, outcome_path):
         if not path.is_file():
             raise AuditError(f"missing source shard {path}")
@@ -193,6 +211,8 @@ def _load_split(v3_root: Path, split: str) -> tuple[Path, Path, pa.Table, pa.Tab
         ("episode_id", "step_idx", "reward", "d_gpu_temp_c"),
         f"outcomes/{split}",
     )
+    _require_numeric_columns(state, SENSOR_COLUMNS, f"state_telemetry/{split}")
+    _require_numeric_columns(outcomes, ("d_gpu_temp_c",), f"outcomes/{split}")
     if state.num_rows == 0 or outcomes.num_rows == 0:
         raise AuditError(f"{split} source split is empty")
     return state_path, outcome_path, state, outcomes

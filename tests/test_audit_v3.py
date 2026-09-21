@@ -263,6 +263,43 @@ def test_missing_timestamp_column_fails_closed_with_evidence(tmp_path: Path) -> 
     assert manifest["status"] == "incomplete"
 
 
+def test_required_sensor_columns_must_have_numeric_arrow_types(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    path = source / "v3" / "state_telemetry" / "train-00000.parquet"
+    table = pq.read_table(path)
+    table = table.set_column(
+        table.schema.get_field_index("gpu_temp_c"),
+        "gpu_temp_c",
+        pa.array(["42.0"] * table.num_rows, type=pa.string()),
+    )
+    pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="gpu_temp_c must have a numeric Arrow type"):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+
+
+def test_unexpected_source_shard_fails_closed(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    source_shard = source / "v3" / "state_telemetry" / "train-00000.parquet"
+    extra_shard = source / "v3" / "state_telemetry" / "train-00001.parquet"
+    extra_shard.write_bytes(source_shard.read_bytes())
+
+    with pytest.raises(AuditError, match="unexpected source shards"):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+
+
 def test_rebuild_removes_every_stale_owned_view_shard(tmp_path: Path) -> None:
     source = tmp_path / "source"
     output = tmp_path / "audit"

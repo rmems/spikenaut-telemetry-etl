@@ -14,6 +14,7 @@ import math
 import re
 from bisect import bisect_left
 from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -136,9 +137,20 @@ def _load_manifest(session_path: Path, expected_id: str) -> tuple[dict[str, Any]
             f"session_id label mismatch: campaign has {expected_id}, "
             "manifest labels do not"
         )
-    if not manifest.get("ended_at_utc"):
+    ended_at = manifest.get("ended_at_utc")
+    if not isinstance(ended_at, str) or not ended_at:
         raise PreparationError(
-            f"session {expected_id} manifest ended_at_utc is incomplete"
+            f"session {expected_id} ended_at_utc must be a valid UTC timestamp"
+        )
+    try:
+        ended_at_parsed = datetime.fromisoformat(ended_at)
+    except ValueError as exc:
+        raise PreparationError(
+            f"session {expected_id} ended_at_utc must be a valid UTC timestamp"
+        ) from exc
+    if ended_at_parsed.utcoffset() != timedelta(0):
+        raise PreparationError(
+            f"session {expected_id} ended_at_utc must be a valid UTC timestamp"
         )
     if manifest.get("parquet_write_failures") != 0:
         raise PreparationError(f"session {expected_id} reports Parquet write failures")
@@ -214,6 +226,10 @@ def _read_rows(
             if not isinstance(timestamp, int) or isinstance(timestamp, bool):
                 raise PreparationError(
                     f"session {session_id} has a non-integer timestamp_ms"
+                )
+            if timestamp <= 0:
+                raise PreparationError(
+                    f"session {session_id} must have a positive timestamp_ms"
                 )
             row = dict(raw)
             row["_ordinal"] = ordinal
