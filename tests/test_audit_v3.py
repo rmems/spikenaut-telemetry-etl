@@ -316,6 +316,45 @@ def test_noncanonical_episode_identifier_fails_closed(tmp_path: Path) -> None:
     assert manifest["status"] == "incomplete"
 
 
+def test_null_episode_identifier_fails_closed_with_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "validation-00000.parquet"
+        table = pq.read_table(path)
+        nulls = pa.nulls(table.num_rows, type=pa.string())
+        table = table.set_column(
+            table.schema.get_field_index("episode_id"), "episode_id", nulls
+        )
+        pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="episode_id must be a non-empty string"):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_empty_required_split_fails_closed_with_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "validation-00000.parquet"
+        pq.write_table(pq.read_table(path).slice(0, 0), path)
+
+    with pytest.raises(AuditError, match="validation source split is empty"):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
 def test_wrong_existing_64_sample_outcome_is_excluded_and_reported(
     tmp_path: Path,
 ) -> None:
@@ -360,6 +399,12 @@ def test_non_finite_sensor_is_excluded(tmp_path: Path) -> None:
 def test_output_cannot_overlap_source_tree(tmp_path: Path, relative_output: str) -> None:
     source = tmp_path / "source"
     _write_corpus(source)
+    output = source / relative_output
+    output.mkdir(parents=True, exist_ok=True)
+    sentinel = output / "manifest.json"
+    sentinel.write_text("source-owned evidence")
 
     with pytest.raises(AuditError, match="overlap source"):
-        audit_v3(source, source / relative_output)
+        audit_v3(source, output)
+
+    assert sentinel.read_text() == "source-owned evidence"

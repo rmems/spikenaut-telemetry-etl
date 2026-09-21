@@ -92,7 +92,9 @@ def _assert_unique(keys: list[tuple[str, int]], label: str) -> None:
         raise AuditError(f"{label} has duplicate join keys; first={duplicates[0]!r}")
 
 
-def _episode_number(episode_id: str) -> int:
+def _episode_number(episode_id: object) -> int:
+    if not isinstance(episode_id, str) or not episode_id:
+        raise AuditError("episode_id must be a non-empty string")
     prefix, separator, value = episode_id.rpartition("-")
     if not separator or prefix != "gpu" or not value.isdigit():
         raise AuditError(
@@ -179,6 +181,8 @@ def _load_split(v3_root: Path, split: str) -> tuple[Path, Path, pa.Table, pa.Tab
         ("episode_id", "step_idx", "reward", "d_gpu_temp_c"),
         f"outcomes/{split}",
     )
+    if state.num_rows == 0 or outcomes.num_rows == 0:
+        raise AuditError(f"{split} source split is empty")
     return state_path, outcome_path, state, outcomes
 
 
@@ -475,6 +479,44 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
     return report
 
 
+def _write_incomplete_evidence(
+    output_root: Path,
+    error: AuditError,
+    dataset_root: Path | None,
+    v3_root: Path | None,
+) -> None:
+    failure = {"category": "structural_integrity", "reason": str(error)}
+    incomplete_report = {
+        "audit_version": AUDIT_VERSION,
+        "view_id": VIEW_ID,
+        "horizon_samples": HORIZON_SAMPLES,
+        "status": "incomplete",
+        "failure": failure,
+        "integrity": {"status": "failed"},
+        "splits": {},
+    }
+    incomplete_manifest = {
+        "audit_version": AUDIT_VERSION,
+        "view_id": VIEW_ID,
+        "horizon_samples": HORIZON_SAMPLES,
+        "status": "incomplete",
+        "failure": failure,
+        "source_git_commit": _git_head(dataset_root) if dataset_root else None,
+        "source_files": (
+            _available_source_hashes(dataset_root, v3_root)
+            if dataset_root is not None and v3_root is not None
+            else {}
+        ),
+        "outputs": {},
+    }
+    (output_root / "audit-report.json").write_text(
+        json.dumps(incomplete_report, indent=2, sort_keys=True) + "\n"
+    )
+    (output_root / "manifest.json").write_text(
+        json.dumps(incomplete_manifest, indent=2, sort_keys=True) + "\n"
+    )
+
+
 def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
     """Audit historical v3 and write a provenance-bound additive eligible view.
 
@@ -484,43 +526,19 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
     are read only and the output is forbidden from overlapping their tree.
     """
     output_root = Path(output_dir).resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
-    _clean_owned_outputs(output_root)
-    dataset_root: Path | None = None
-    v3_root: Path | None = None
     try:
         dataset_root, v3_root = _source_root(Path(source_dir))
-        _guard_output_path(dataset_root, v3_root, output_root)
+    except AuditError as exc:
+        output_root.mkdir(parents=True, exist_ok=True)
+        _clean_owned_outputs(output_root)
+        _write_incomplete_evidence(output_root, exc, None, None)
+        raise
+
+    _guard_output_path(dataset_root, v3_root, output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    _clean_owned_outputs(output_root)
+    try:
         return _audit_v3_impl(dataset_root, v3_root, output_root)
     except AuditError as exc:
-        failure = {"category": "structural_integrity", "reason": str(exc)}
-        incomplete_report = {
-            "audit_version": AUDIT_VERSION,
-            "view_id": VIEW_ID,
-            "horizon_samples": HORIZON_SAMPLES,
-            "status": "incomplete",
-            "failure": failure,
-            "integrity": {"status": "failed"},
-            "splits": {},
-        }
-        incomplete_manifest = {
-            "audit_version": AUDIT_VERSION,
-            "view_id": VIEW_ID,
-            "horizon_samples": HORIZON_SAMPLES,
-            "status": "incomplete",
-            "failure": failure,
-            "source_git_commit": _git_head(dataset_root) if dataset_root else None,
-            "source_files": (
-                _available_source_hashes(dataset_root, v3_root)
-                if dataset_root is not None and v3_root is not None
-                else {}
-            ),
-            "outputs": {},
-        }
-        (output_root / "audit-report.json").write_text(
-            json.dumps(incomplete_report, indent=2, sort_keys=True) + "\n"
-        )
-        (output_root / "manifest.json").write_text(
-            json.dumps(incomplete_manifest, indent=2, sort_keys=True) + "\n"
-        )
+        _write_incomplete_evidence(output_root, exc, dataset_root, v3_root)
         raise

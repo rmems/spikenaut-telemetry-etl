@@ -28,7 +28,10 @@ def _rows(start: int = 1_000_000, count: int = 111) -> list[dict[str, int]]:
 def _session(root: Path, session_id: str, rows: list[dict[str, int]]) -> Path:
     path = root / session_id
     path.mkdir()
-    pq.write_table(pa.Table.from_pylist(rows), path / "gpu_telemetry_v2_batch_0.parquet")
+    labeled_rows = [dict(row, session_label=session_id) for row in rows]
+    pq.write_table(
+        pa.Table.from_pylist(labeled_rows), path / "gpu_telemetry_v2_batch_0.parquet"
+    )
     manifest = {
         "schema_version": 1,
         "session_id": session_id,
@@ -237,12 +240,13 @@ def test_batches_are_read_in_numeric_order_and_zero_vram_is_valid(tmp_path: Path
     campaign = _campaign(tmp_path, [("session-01", "train", rows)])
     session_path = tmp_path / "session-01"
     (session_path / "gpu_telemetry_v2_batch_0.parquet").unlink()
+    labeled_rows = [dict(row, session_label="session-01") for row in rows]
     pq.write_table(
-        pa.Table.from_pylist(rows[:90]),
+        pa.Table.from_pylist(labeled_rows[:90]),
         session_path / "gpu_telemetry_v2_batch_2.parquet",
     )
     pq.write_table(
-        pa.Table.from_pylist(rows[90:]),
+        pa.Table.from_pylist(labeled_rows[90:]),
         session_path / "gpu_telemetry_v2_batch_10.parquet",
     )
 
@@ -389,6 +393,47 @@ def test_malformed_path_still_writes_incomplete_reports(tmp_path: Path) -> None:
 
     with pytest.raises(PreparationError, match="path"):
         prepare_campaign(campaign, tmp_path / "out")
+    assert (
+        json.loads((tmp_path / "out" / "manifest.json").read_text())["status"]
+        == "incomplete"
+    )
+
+
+def test_non_list_sessions_remove_stale_prepared_and_write_incomplete_reports(
+    tmp_path: Path,
+) -> None:
+    campaign = tmp_path / "campaign.json"
+    campaign.write_text(json.dumps({"min_examples_per_session": 1, "sessions": None}))
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "prepared.json").write_text("stale complete result")
+
+    with pytest.raises(PreparationError, match="sessions must be a non-empty list"):
+        prepare_campaign(campaign, output)
+
+    assert not (output / "prepared.json").exists()
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+    assert (
+        json.loads((output / "quality-report.json").read_text())["status"] == "incomplete"
+    )
+
+
+def test_parquet_rows_must_match_assigned_session_label(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    parquet = tmp_path / "session-01" / "gpu_telemetry_v2_batch_0.parquet"
+    table = pq.read_table(parquet)
+    labels = table.column("session_label").to_pylist()
+    labels[10] = "foreign-session"
+    table = table.set_column(
+        table.schema.get_field_index("session_label"),
+        "session_label",
+        pa.array(labels, type=pa.string()),
+    )
+    pq.write_table(table, parquet)
+
+    with pytest.raises(PreparationError, match="row session_label"):
+        prepare_campaign(campaign, tmp_path / "out")
+
     assert (
         json.loads((tmp_path / "out" / "manifest.json").read_text())["status"]
         == "incomplete"

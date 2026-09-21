@@ -41,7 +41,11 @@ TARGET_NAMES = [
     "temperature_delta_5s_c",
     "power_delta_5s_w",
 ]
-PARQUET_COLUMNS = ["timestamp_ms", *(item["source"] for item in FEATURE_MAP)]
+PARQUET_COLUMNS = [
+    "timestamp_ms",
+    "session_label",
+    *(item["source"] for item in FEATURE_MAP),
+]
 _BATCH_PATTERN = re.compile(r"^(?:gpu_telemetry_v2_|telemetry_)batch_(\d+)\.parquet$")
 
 
@@ -202,6 +206,10 @@ def _read_rows(
         except Exception as exc:  # pyarrow has several format/schema exception classes
             raise PreparationError(f"cannot read {parquet_path}: {exc}") from exc
         for raw in table.to_pylist():
+            if raw.get("session_label") != session_id:
+                raise PreparationError(
+                    f"session {session_id} row session_label does not match assignment"
+                )
             timestamp = raw.get("timestamp_ms")
             if not isinstance(timestamp, int) or isinstance(timestamp, bool):
                 raise PreparationError(
@@ -560,6 +568,8 @@ def _assignments(campaign_path: Path) -> list[dict[str, Any]]:
     try:
         raw = json.loads(campaign_path.read_text()).get("sessions", [])
     except OSError, json.JSONDecodeError, AttributeError:
+        return []
+    if not isinstance(raw, list):
         return []
     return [
         {key: item.get(key) for key in ("session_id", "split", "seed")}
