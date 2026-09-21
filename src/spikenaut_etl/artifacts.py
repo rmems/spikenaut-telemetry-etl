@@ -3,6 +3,7 @@
 import json
 import os
 import secrets
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -10,6 +11,13 @@ from typing import IO, Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+
+def directory_identity(path: Path) -> tuple[int, int]:
+    metadata = path.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise OSError(f"publication path is not a directory: {path}")
+    return metadata.st_dev, metadata.st_ino
 
 
 def _check_directory(path: Path, descriptor: int) -> None:

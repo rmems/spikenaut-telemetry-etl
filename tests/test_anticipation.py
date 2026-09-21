@@ -1064,3 +1064,43 @@ def test_overlap_guard_and_loader_share_campaign_snapshot(
     )
     manifest = json.loads((tmp_path / "out" / "manifest.json").read_text())
     assert manifest["assignments"][0]["session_id"] == "session-01"
+
+
+def test_preparation_rechecks_sources_after_quality_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    session = Path(json.loads(campaign.read_text())["sessions"][0]["path"])
+    manifest = session / "session_manifest.json"
+    original = anticipation._write_json
+
+    def mutate_after_quality(path: Path, value: object) -> None:
+        original(path, value)
+        if path.name == "quality-report.json":
+            manifest.write_bytes(manifest.read_bytes() + b" ")
+
+    monkeypatch.setattr(anticipation, "_write_json", mutate_after_quality)
+    with pytest.raises(PreparationError, match="source changed during preparation"):
+        prepare_campaign(campaign, tmp_path / "out")
+    assert (
+        json.loads((tmp_path / "out/manifest.json").read_text())["status"] == "incomplete"
+    )
+
+
+def test_preparation_output_generation_cannot_change_between_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    original = anticipation._write_json
+
+    def swap_after_quality(path: Path, value: object) -> None:
+        original(path, value)
+        if path.name == "quality-report.json" and not (tmp_path / "detached").exists():
+            output.rename(tmp_path / "detached")
+            output.mkdir()
+
+    monkeypatch.setattr(anticipation, "_write_json", swap_after_quality)
+    with pytest.raises(PreparationError, match="publication directory changed"):
+        prepare_campaign(campaign, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"

@@ -1132,3 +1132,62 @@ def test_directory_swap_during_replace_keeps_source_untouched(
         audit_v3(source, output)
     assert {p.name: p.read_bytes() for p in target.glob("*.parquet")} == before
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_eligible_view_preserves_action_labels_and_typed_missing_values(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    actions = pa.Table.from_pylist(
+        [
+            {
+                "episode_id": "gpu-000000",
+                "step_idx": 1,
+                "schema_version": "3.0.0",
+                "proposed_action": "hold",
+                "teacher_action": "cool",
+            }
+        ],
+        schema=PROPOSALS_SCHEMA,
+    )
+    pq.write_table(actions, source / "v3/action_proposals/train-00000.parquet")
+    audit_v3(source, output)
+    view = pq.read_table(output / "v3-forecast-eligible-v1/train-00000.parquet")
+    assert view.column("proposed_action").to_pylist() == [None, "hold"]
+    assert view.column("teacher_action").to_pylist() == [None, "cool"]
+    assert (
+        view.schema.field("proposed_action").type
+        == PROPOSALS_SCHEMA.field("proposed_action").type
+    )
+
+
+def test_state_outcome_column_collision_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/state_telemetry/train-00000.parquet"
+    state = pq.read_table(path)
+    pq.write_table(state.append_column("reward", pa.array([42.0] * state.num_rows)), path)
+    with pytest.raises(AuditError, match="column.*collision"):
+        audit_v3(source, tmp_path / "audit")
+
+
+def test_audit_output_generation_cannot_change_between_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original = audit_module.write_json
+
+    def swap_after_report(path: Path, value: object) -> None:
+        original(path, value)
+        if path.name == "audit-report.json" and not (tmp_path / "detached").exists():
+            output.rename(tmp_path / "detached")
+            output.mkdir()
+
+    monkeypatch.setattr(audit_module, "write_json", swap_after_report)
+    with pytest.raises(AuditError, match="publication directory changed"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"

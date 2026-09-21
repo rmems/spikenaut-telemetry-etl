@@ -15,7 +15,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .artifacts import write_json, write_parquet
+from .artifacts import directory_identity, write_json, write_parquet
 
 AUDIT_VERSION = "1.0.0"
 VIEW_ID = "v3-forecast-eligible-v1"
@@ -254,26 +254,27 @@ def _numeric_sensor_columns(state: pa.Table) -> tuple[str, ...]:
     )
 
 
-def _action_label_counts(
+def _load_actions(
     v3_root: Path,
     split: str,
     state_keys: list[tuple[str, int]],
     expected_hashes: dict[Path, str],
-) -> tuple[int, int]:
+) -> tuple[pa.Table, list[tuple[str, int]], int]:
     path = v3_root / "action_proposals" / f"{split}-00000.parquet"
     if not path.is_file():
         raise AuditError(f"missing source shard {path}")
     try:
-        table = _read_source_table(
-            path,
-            expected_hashes,
-            columns=[
+        table = _read_source_table(path, expected_hashes)
+        _require_columns(
+            table,
+            (
                 "episode_id",
                 "step_idx",
                 "proposed_action",
                 "teacher_action",
                 "schema_version",
-            ],
+            ),
+            f"action_proposals/{split}",
         )
     except (OSError, pa.ArrowException) as exc:
         raise AuditError(f"cannot read {split} action-proposal shard: {exc}") from exc
@@ -299,7 +300,7 @@ def _action_label_counts(
         if proposed is not None or teacher is not None
     }
     observed = len(observed_keys)
-    return len(state_keys) - observed, observed
+    return table, proposal_keys, len(state_keys) - observed
 
 
 def _guard_output_path(
@@ -393,7 +394,7 @@ def _append_output_columns(
         if name in {"episode_id", "step_idx", "ts_utc", "schema_version"}:
             continue
         if name in selected.column_names:
-            continue
+            raise AuditError(f"state/outcome column name collision: {name}")
         selected = selected.append_column(name, chosen_outcomes.column(name))
     n = len(state_indices)
     selected = selected.append_column(
@@ -414,7 +415,26 @@ def _append_output_columns(
     return selected
 
 
+def _append_action_columns(
+    selected: pa.Table,
+    actions: pa.Table,
+    action_keys: list[tuple[str, int]],
+    eligible_keys: list[tuple[str, int]],
+) -> pa.Table:
+    lookup = {key: index for index, key in enumerate(action_keys)}
+    indices = pa.array([lookup.get(key) for key in eligible_keys], type=pa.int64())
+    matched = actions.take(indices)
+    for name in actions.column_names:
+        if name in {"episode_id", "step_idx", "ts_utc", "schema_version"}:
+            continue
+        if name in selected.column_names:
+            raise AuditError(f"action/output column name collision: {name}")
+        selected = selected.append_column(name, matched.column(name))
+    return selected
+
+
 def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> AuditReport:
+    publication_identity = directory_identity(output_root)
     loaded: dict[str, tuple[Path, Path, pa.Table, pa.Table]] = {}
     episode_split: dict[str, str] = {}
     episodes_by_split: dict[str, set[str]] = {}
@@ -526,6 +546,9 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
             eligible_source_indices.append(_source_index(key))
             eligible_target_steps.append(step_idx + HORIZON_SAMPLES)
 
+        actions, action_keys, missing_actions = _load_actions(
+            v3_root, split, state_keys, expected_hashes
+        )
         eligible_tables[split] = _append_output_columns(
             state,
             outcomes,
@@ -534,6 +557,12 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
             split,
             eligible_source_indices,
             eligible_target_steps,
+        )
+        eligible_tables[split] = _append_action_columns(
+            eligible_tables[split],
+            actions,
+            action_keys,
+            [state_keys[index] for index in eligible_state_indices],
         )
         split_reports[split] = {
             "source_rows": state.num_rows,
@@ -547,9 +576,7 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
             "missing_fields": {
                 "timestamp_missing_count": state.column("ts_utc").null_count,
                 "reward_missing_count": outcomes.column("reward").null_count,
-                "action_label_missing_count": _action_label_counts(
-                    v3_root, split, state_keys, expected_hashes
-                )[0],
+                "action_label_missing_count": missing_actions,
             },
             **{name: _distribution(state.column(name)) for name in SENSOR_COLUMNS},
         }
@@ -578,6 +605,7 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
     output_root.mkdir(parents=True, exist_ok=True)
     view_root = output_root / VIEW_ID
     view_root.mkdir(parents=True, exist_ok=True)
+    view_identity = directory_identity(view_root)
     for split, table in eligible_tables.items():
         write_parquet(view_root / f"{split}-00000.parquet", table)
     exclusion_schema = pa.schema(
@@ -609,8 +637,14 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
         | {"exclusions.parquet": _sha256(output_root / "exclusions.parquet")},
     }
     write_json(output_root / "audit-report.json", report.to_dict())
+    if directory_identity(output_root) != publication_identity:
+        raise AuditError("publication directory changed during audit")
+    if directory_identity(view_root) != view_identity:
+        raise AuditError("publication directory changed during audit")
     if _available_source_hashes(dataset_root, v3_root) != source_hashes:
         raise AuditError("source shards changed during publication")
+    if directory_identity(output_root) != publication_identity:
+        raise AuditError("publication directory changed during audit")
     write_json(output_root / "manifest.json", manifest)
     return report
 

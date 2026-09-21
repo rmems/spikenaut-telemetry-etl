@@ -21,6 +21,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .artifacts import directory_identity
 from .artifacts import write_json as _write_json
 
 SCHEMA_VERSION = "anticipation-prepared-v1"
@@ -506,7 +507,7 @@ def _prepare_campaign(
     campaign: dict[str, Any],
     minimum: int,
     campaign_sha256: str,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[tuple[Path, frozenset[str]]], list[tuple[Path, str]]]:
     """Validate and prepare one immutable anticipation campaign.
 
     ``campaign_path`` contains the preassigned sessions and the predeclared
@@ -649,6 +650,15 @@ def _prepare_campaign(
             "sources": provenance_sources,
         },
     }
+    _check_preparation_sources(source_memberships, source_snapshots)
+    _write_json(output_dir / "prepared.json", prepared)
+    return prepared, source_memberships, source_snapshots
+
+
+def _check_preparation_sources(
+    source_memberships: list[tuple[Path, frozenset[str]]],
+    source_snapshots: list[tuple[Path, str]],
+) -> None:
     for session_path, expected_names in source_memberships:
         current_names = frozenset(path.name for path in session_path.glob("*.parquet"))
         if current_names != expected_names:
@@ -668,8 +678,6 @@ def _prepare_campaign(
             raise PreparationError(
                 f"source changed during preparation: {session_path} Parquet membership"
             )
-    _write_json(output_dir / "prepared.json", prepared)
-    return prepared
 
 
 def _assignments(campaign_bytes: bytes) -> list[dict[str, Any]]:
@@ -811,8 +819,10 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             )
         campaign, minimum, campaign_sha256 = _load_campaign(campaign_path, campaign_bytes)
         assignments = _campaign_assignments(campaign)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        publication_identity = directory_identity(output_dir)
         (output_dir / "manifest.json").unlink(missing_ok=True)
-        prepared = _prepare_campaign(
+        prepared, source_memberships, source_snapshots = _prepare_campaign(
             campaign_path,
             output_dir,
             campaign,
@@ -828,6 +838,13 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             "sources": prepared["provenance"]["sources"],
         }
         _write_json(output_dir / "quality-report.json", prepared["quality"])
+        if directory_identity(output_dir) != publication_identity:
+            raise PreparationError("publication directory changed during preparation")
+        if _sha256(output_dir / "prepared.json") != manifest["prepared_sha256"]:
+            raise PreparationError("prepared artifact changed during publication")
+        _check_preparation_sources(source_memberships, source_snapshots)
+        if directory_identity(output_dir) != publication_identity:
+            raise PreparationError("publication directory changed during preparation")
         _write_json(output_dir / "manifest.json", manifest)
     except (OSError, PreparationError) as exc:
         if not assignments:
