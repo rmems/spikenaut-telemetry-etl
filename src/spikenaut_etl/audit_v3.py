@@ -20,6 +20,7 @@ from .artifacts import (
     clean_artifacts,
     directory_identity,
     ensure_directory,
+    no_replace_publication,
     pin_directory,
     pinned_publication,
     write_json,
@@ -1169,13 +1170,14 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
         try:
             ensure_directory(output_root)
             _clean_owned_outputs(output_root, source_identities)
-            return _audit_v3_impl(
-                dataset_root,
-                v3_root,
-                output_root,
-                source_git_commit,
-                source_identities,
-            )
+            with no_replace_publication():
+                return _audit_v3_impl(
+                    dataset_root,
+                    v3_root,
+                    output_root,
+                    source_git_commit,
+                    source_identities,
+                )
         except (AuditError, OSError, pa.ArrowException) as raw_error:
             audit_error = (
                 raw_error

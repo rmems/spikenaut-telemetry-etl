@@ -17,6 +17,9 @@ import pyarrow.parquet as pq
 _PINNED_ROOT: ContextVar[tuple[Path, tuple[int, int], dict[Path, int]] | None] = (
     ContextVar("artifact_root", default=None)
 )
+_NO_REPLACE_PUBLICATION: ContextVar[bool] = ContextVar(
+    "no_replace_publication", default=False
+)
 
 
 def _check_pinned_root(path: Path) -> None:
@@ -59,6 +62,17 @@ def pinned_publication(
     finally:
         # Closing the retained descriptor also releases the publication lock.
         os.close(descriptor)
+
+
+@contextmanager
+def no_replace_publication() -> Iterator[None]:
+    """Publish new artifact names atomically and fail if a destination appears."""
+
+    token = _NO_REPLACE_PUBLICATION.set(True)
+    try:
+        yield
+    finally:
+        _NO_REPLACE_PUBLICATION.reset(token)
 
 
 def pin_directory(path: Path) -> None:
@@ -132,7 +146,18 @@ def _staged_output(path: Path, mode: str) -> Iterator[IO[Any]]:
         with os.fdopen(descriptor, mode) as stream:
             yield stream
         _check_directory(path.parent, directory)
-        os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+        if _NO_REPLACE_PUBLICATION.get():
+            os.link(
+                temporary,
+                path.name,
+                src_dir_fd=directory,
+                dst_dir_fd=directory,
+                follow_symlinks=False,
+            )
+            os.unlink(temporary, dir_fd=directory)
+            created = False
+        else:
+            os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
         _check_directory(path.parent, directory)
     finally:
         try:

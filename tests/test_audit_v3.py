@@ -928,7 +928,7 @@ def test_string_reward_is_rejected(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
-def test_audit_publication_does_not_follow_replacement_links(
+def test_audit_publication_rejects_replacement_links(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_kind: str
 ) -> None:
     source = tmp_path / "source"
@@ -949,7 +949,8 @@ def test_audit_publication_does_not_follow_replacement_links(
             destination.hardlink_to(sentinel)
 
     monkeypatch.setattr(audit_module, "_clean_owned_outputs", replace_after_cleanup)
-    audit_v3(source, output)
+    with pytest.raises(AuditError, match="cannot write audit outputs"):
+        audit_v3(source, output)
     assert sentinel.read_text() == "source sentinel"
 
 
@@ -1032,7 +1033,7 @@ def test_hash_pass_rechecks_earlier_directories(
 @pytest.mark.parametrize(
     "artifact", ["v3-forecast-eligible-v1/train-00000.parquet", "exclusions.parquet"]
 )
-def test_parquet_publication_replaces_links(
+def test_parquet_publication_rejects_replacement_links(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_kind: str, artifact: str
 ) -> None:
     source = tmp_path / "source"
@@ -1054,7 +1055,8 @@ def test_parquet_publication_replaces_links(
             destination.hardlink_to(sentinel)
 
     monkeypatch.setattr(audit_module, "_clean_owned_outputs", replace_after_cleanup)
-    audit_v3(source, output)
+    with pytest.raises(AuditError, match="cannot write audit outputs"):
+        audit_v3(source, output)
     assert sentinel.read_bytes() == b"preserve source bytes"
 
 
@@ -1109,7 +1111,7 @@ def test_source_change_during_publication_prevents_complete_manifest(
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
-def test_directory_swap_during_replace_keeps_source_untouched(
+def test_directory_swap_during_atomic_publish_keeps_source_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from spikenaut_etl import artifacts
@@ -1119,10 +1121,10 @@ def test_directory_swap_during_replace_keeps_source_untouched(
     _write_corpus(source)
     target = source / "v3/state_telemetry"
     before = {p.name: p.read_bytes() for p in target.glob("*.parquet")}
-    original = artifacts.os.replace
+    original = artifacts.os.link
     swapped = False
 
-    def swap_before_replace(src: str, dst: str, **kwargs: int) -> None:
+    def swap_before_link(src: str, dst: str, **kwargs: int | bool) -> None:
         nonlocal swapped
         if dst.endswith(".parquet") and not swapped:
             view = output / "v3-forecast-eligible-v1"
@@ -1131,7 +1133,7 @@ def test_directory_swap_during_replace_keeps_source_untouched(
             swapped = True
         original(src, dst, **kwargs)
 
-    monkeypatch.setattr(artifacts.os, "replace", swap_before_replace)
+    monkeypatch.setattr(artifacts.os, "link", swap_before_link)
     with pytest.raises(AuditError, match="directory changed during publication"):
         audit_v3(source, output)
     assert {p.name: p.read_bytes() for p in target.glob("*.parquet")} == before
@@ -1558,6 +1560,49 @@ def test_root_publication_preserves_source_renamed_after_snapshot(
         return hashes
 
     monkeypatch.setattr(audit_module, "_available_source_hashes", move_after_snapshot)
+    with pytest.raises(AuditError):
+        audit_v3(source, output)
+    assert artifact.read_bytes() == source_bytes
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    [audit_module.EXCLUSIONS_NAME, audit_module.AUDIT_REPORT_NAME],
+)
+def test_atomic_publication_preserves_source_moved_after_destination_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact_name: str
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    shard = source / "v3/action_proposals/train-00000.parquet"
+    source_bytes = shard.read_bytes()
+    output = tmp_path / "audit"
+    artifact = output / artifact_name
+    moved = False
+
+    def move_source(path: Path) -> None:
+        nonlocal moved
+        if path == artifact and not moved:
+            moved = True
+            shard.rename(artifact)
+
+    if artifact_name == audit_module.EXCLUSIONS_NAME:
+        original_parquet = audit_module.write_parquet
+
+        def intercept_parquet(path: Path, table: pa.Table) -> None:
+            move_source(path)
+            original_parquet(path, table)
+
+        monkeypatch.setattr(audit_module, "write_parquet", intercept_parquet)
+    else:
+        original_json = audit_module.write_json
+
+        def intercept_json(path: Path, value: object) -> None:
+            move_source(path)
+            original_json(path, value)
+
+        monkeypatch.setattr(audit_module, "write_json", intercept_json)
+
     with pytest.raises(AuditError):
         audit_v3(source, output)
     assert artifact.read_bytes() == source_bytes
