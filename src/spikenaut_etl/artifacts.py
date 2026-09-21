@@ -90,3 +90,48 @@ def write_json(path: Path, value: Any) -> None:
 def write_parquet(path: Path, table: pa.Table) -> None:
     with _staged_output(path, "wb") as stream:
         pq.write_table(table, stream)
+
+
+def clean_artifacts(path: Path, names: tuple[str, ...] | None = None) -> None:
+    """Delete owned files relative to a pinned directory, never through symlinks."""
+    directory = _open_directory(path)
+    try:
+        _check_directory(path, directory)
+        _clean_entries(directory, names)
+        _check_directory(path, directory)
+    finally:
+        os.close(directory)
+
+
+def _clean_entries(directory: int, names: tuple[str, ...] | None) -> None:
+    selected = names if names is not None else tuple(os.listdir(directory))
+    for name in selected:
+        try:
+            metadata = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if names is None and stat.S_ISDIR(metadata.st_mode):
+            child = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory
+            )
+            try:
+                _clean_entries(child, None)
+            finally:
+                os.close(child)
+        elif names is None and not name.endswith(".parquet"):
+            continue
+        elif stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            os.unlink(name, dir_fd=directory)
+        elif stat.S_ISDIR(metadata.st_mode) and name.endswith(".tmp"):
+            try:
+                os.rmdir(name, dir_fd=directory)
+            except OSError:
+                pass
+
+
+def ensure_directory(path: Path) -> None:
+    descriptor = _open_directory(path)
+    try:
+        _check_directory(path, descriptor)
+    finally:
+        os.close(descriptor)

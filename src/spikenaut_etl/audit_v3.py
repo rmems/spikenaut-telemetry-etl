@@ -15,8 +15,14 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .artifacts import directory_identity, write_json, write_parquet
-from .v3_build import PROPOSALS_SCHEMA
+from .artifacts import (
+    clean_artifacts,
+    directory_identity,
+    ensure_directory,
+    write_json,
+    write_parquet,
+)
+from .v3_build import OUTCOMES_SCHEMA, PROPOSALS_SCHEMA, STATE_SCHEMA
 
 AUDIT_VERSION = "1.0.0"
 VIEW_ID = "v3-forecast-eligible-v1"
@@ -240,6 +246,15 @@ def _load_split(
             raise AuditError(f"{config}/{split} schema_version must be 3.0.0")
     _require_numeric_columns(state, SENSOR_COLUMNS, f"state_telemetry/{split}")
     _require_numeric_columns(outcomes, ("reward", "d_gpu_temp_c"), f"outcomes/{split}")
+    for table, schema in ((state, STATE_SCHEMA), (outcomes, OUTCOMES_SCHEMA)):
+        for field in schema:
+            if (
+                field.name not in table.column_names
+                or table.schema.field(field.name).type != field.type
+            ):
+                raise AuditError(
+                    f"source schema field missing or wrong type: {field.name}"
+                )
     if state.num_rows == 0 or outcomes.num_rows == 0:
         raise AuditError(f"{split} source split is empty")
     return state_path, outcome_path, state, outcomes
@@ -266,6 +281,9 @@ def _load_actions(
         raise AuditError(f"missing source shard {path}")
     try:
         table = _read_source_table(path, expected_hashes)
+        unexpected = set(table.column_names) - set(PROPOSALS_SCHEMA.names)
+        if unexpected:
+            raise AuditError(f"unexpected action proposal fields: {sorted(unexpected)}")
         for field in PROPOSALS_SCHEMA:
             if (
                 field.name not in table.column_names
@@ -332,17 +350,17 @@ def _guard_output_path(
 
 
 def _clean_owned_outputs(output_root: Path) -> None:
-    for name in ("manifest.json", "audit-report.json", "exclusions.parquet"):
-        path = output_root / name
-        if path.is_symlink() or path.is_file():
-            path.unlink()
-    view_root = output_root / VIEW_ID
-    if view_root.is_symlink():
-        raise AuditError(f"audit view directory must not be a symlink: {view_root}")
-    if view_root.is_dir():
-        for path in view_root.rglob("*.parquet"):
-            if path.is_symlink() or path.is_file():
-                path.unlink()
+    try:
+        clean_artifacts(
+            output_root, ("manifest.json", "audit-report.json", "exclusions.parquet")
+        )
+        view_root = output_root / VIEW_ID
+        if view_root.is_symlink():
+            raise AuditError(f"audit view directory must not be a symlink: {view_root}")
+        if view_root.exists():
+            clean_artifacts(view_root)
+    except OSError as exc:
+        raise AuditError(f"cannot safely clean audit outputs: {exc}") from exc
 
 
 def _available_source_hashes(
@@ -619,9 +637,9 @@ def _audit_v3_impl(dataset_root: Path, v3_root: Path, output_root: Path) -> Audi
     final_source_hashes = _available_source_hashes(dataset_root, v3_root)
     if final_source_hashes != source_hashes:
         raise AuditError("source shards changed during audit")
-    output_root.mkdir(parents=True, exist_ok=True)
+    ensure_directory(output_root)
     view_root = output_root / VIEW_ID
-    view_root.mkdir(parents=True, exist_ok=True)
+    ensure_directory(view_root)
     view_identity = directory_identity(view_root)
     for split, table in eligible_tables.items():
         write_parquet(view_root / f"{split}-00000.parquet", table)
@@ -745,7 +763,7 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
             raise AuditError(
                 f"output directory would overlap supplied source path: {output_root}"
             ) from exc
-        output_root.mkdir(parents=True, exist_ok=True)
+        ensure_directory(output_root)
         try:
             _clean_owned_outputs(output_root)
         except AuditError:
@@ -756,7 +774,7 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
 
     _guard_output_path(dataset_root, v3_root, output_root, source_is_dataset_root)
     try:
-        output_root.mkdir(parents=True, exist_ok=True)
+        ensure_directory(output_root)
         _clean_owned_outputs(output_root)
         return _audit_v3_impl(dataset_root, v3_root, output_root)
     except (AuditError, OSError, pa.ArrowException) as raw_error:

@@ -828,23 +828,10 @@ def test_non_finite_sensor_is_excluded(tmp_path: Path) -> None:
     assert report.splits["train"]["exclusion_reasons"]["non_finite_gpu_temp_c"] == 1
 
 
-def test_distribution_mean_is_overflow_resistant(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    output = tmp_path / "audit"
-    _write_corpus(source)
-    for split in SPLITS:
-        path = source / "v3" / "state_telemetry" / f"{split}-00000.parquet"
-        table = pq.read_table(path)
-        values = pa.array([1e308] * table.num_rows, type=pa.float64())
-        table = table.set_column(
-            table.schema.get_field_index("mem_util_pct"), "mem_util_pct", values
-        )
-        pq.write_table(table, path)
-
-    report = audit_v3(source, output)
-
-    mean = report.splits["train"]["numeric_sensor_columns"]["mem_util_pct"]["mean"]
-    assert mean == 1e308
+def test_distribution_mean_is_overflow_resistant() -> None:
+    # Exercise float64 aggregation directly; published v3 sensor fields are float32.
+    result = audit_module._distribution(pa.array([1e308] * 66, type=pa.float64()))
+    assert result["mean"] == 1e308
 
 
 @pytest.mark.parametrize(
@@ -1274,3 +1261,63 @@ def test_output_snapshot_rechecked_after_source_pass(
     monkeypatch.setattr(audit_module, "_available_source_hashes", mutate_after_hash)
     with pytest.raises(AuditError, match="output.*changed"):
         audit_v3(source, output)
+
+
+def test_extra_action_proposal_field_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/action_proposals/train-00000.parquet"
+    table = pq.read_table(path)
+    pq.write_table(
+        table.append_column("unexpected", pa.array([], type=pa.string())), path
+    )
+    with pytest.raises(AuditError, match="unexpected action proposal fields"):
+        audit_v3(source, tmp_path / "audit")
+
+
+def test_cleanup_cannot_follow_replaced_output_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    output.mkdir()
+    sentinel = source / "manifest.json"
+    sentinel.write_text("source sentinel")
+    original = audit_module._guard_output_path
+
+    def swap_after_guard(*args: object) -> None:
+        original(*args)
+        output.rename(tmp_path / "detached")
+        output.symlink_to(source, target_is_directory=True)
+
+    monkeypatch.setattr(audit_module, "_guard_output_path", swap_after_guard)
+    with pytest.raises((AuditError, OSError)):
+        audit_v3(source, output)
+    assert sentinel.read_text() == "source sentinel"
+
+
+@pytest.mark.parametrize(
+    "config,field,mutation",
+    [
+        ("state_telemetry", "synthetic", "missing"),
+        ("state_telemetry", "step_idx", "type"),
+        ("outcomes", "d_tokens_per_s", "type"),
+    ],
+)
+def test_all_state_outcome_fields_match_schema(
+    tmp_path: Path, config: str, field: str, mutation: str
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3" / config / "train-00000.parquet"
+    table = pq.read_table(path)
+    if mutation == "missing":
+        table = table.drop([field])
+    else:
+        table = table.set_column(
+            table.schema.get_field_index(field), field, pa.array([1.0] * table.num_rows)
+        )
+    pq.write_table(table, path)
+    with pytest.raises(AuditError, match="schema field"):
+        audit_v3(source, tmp_path / "audit")

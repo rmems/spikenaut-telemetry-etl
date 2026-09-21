@@ -21,7 +21,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .artifacts import directory_identity
+from .artifacts import clean_artifacts, directory_identity, ensure_directory
 from .artifacts import write_json as _write_json
 
 SCHEMA_VERSION = "anticipation-prepared-v1"
@@ -703,22 +703,17 @@ def _campaign_assignments(campaign: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _remove_owned_preparation_outputs(output_dir: Path) -> None:
-    for name in (
-        "prepared.json",
-        "quality-report.json",
-        "manifest.json",
-        "prepared.json.tmp",
-        "quality-report.json.tmp",
-        "manifest.json.tmp",
-    ):
-        path = output_dir / name
-        if path.is_symlink() or path.is_file():
-            path.unlink(missing_ok=True)
-        elif path.is_dir() and name.endswith(".tmp"):
-            try:
-                path.rmdir()
-            except OSError:
-                pass
+    clean_artifacts(
+        output_dir,
+        (
+            "prepared.json",
+            "quality-report.json",
+            "manifest.json",
+            "prepared.json.tmp",
+            "quality-report.json.tmp",
+            "manifest.json.tmp",
+        ),
+    )
 
 
 def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[str, Any]:
@@ -819,9 +814,9 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             )
         campaign, minimum, campaign_sha256 = _load_campaign(campaign_path, campaign_bytes)
         assignments = _campaign_assignments(campaign)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        ensure_directory(output_dir)
         publication_identity = directory_identity(output_dir)
-        (output_dir / "manifest.json").unlink(missing_ok=True)
+        clean_artifacts(output_dir, ("manifest.json",))
         prepared, source_memberships, source_snapshots = _prepare_campaign(
             campaign_path,
             output_dir,
