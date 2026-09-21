@@ -99,6 +99,8 @@ Plus, structurally:
 
 ## Usage
 
+Python 3.14 or newer is required.
+
 ```bash
 pip install -e ".[dev]"
 

@@ -78,9 +78,7 @@ def write_v2_aux(root) -> None:
     with (full_data / "qubic_ticks_snn.jsonl").open("w") as f:
         for i in range(10):
             f.write(
-                json.dumps(
-                    {"timestamp": f"2026-03-20T08:55:{i:02d}+00:00", "tick": i}
-                )
+                json.dumps({"timestamp": f"2026-03-20T08:55:{i:02d}+00:00", "tick": i})
                 + "\n"
             )
 
@@ -139,12 +137,8 @@ def test_split_of_covers_every_episode():
     layout = split_episodes(20)
     names = [layout.split_of(e) for e in range(20)]
     assert names.count(None) == 2
-    assert names.index("validation") > max(
-        i for i, n in enumerate(names) if n == "train"
-    )
-    assert names.index("test") > max(
-        i for i, n in enumerate(names) if n == "validation"
-    )
+    assert names.index("validation") > max(i for i, n in enumerate(names) if n == "train")
+    assert names.index("test") > max(i for i, n in enumerate(names) if n == "validation")
 
 
 def test_too_few_episodes_refuse_to_split():
@@ -245,9 +239,7 @@ def test_no_episode_spans_two_splits(built):
     root, _ = built
     by_split = {}
     for split in ("train", "validation", "test"):
-        table = pq.read_table(
-            root / "v3" / "state_telemetry" / f"{split}-00000.parquet"
-        )
+        table = pq.read_table(root / "v3" / "state_telemetry" / f"{split}-00000.parquet")
         by_split[split] = set(table.column("episode_id").to_pylist())
     assert not by_split["train"] & by_split["validation"]
     assert not by_split["train"] & by_split["test"]
@@ -258,9 +250,7 @@ def test_embargo_episodes_are_published_nowhere(built):
     root, report = built
     published: set[str] = set()
     for split in ("train", "validation", "test"):
-        table = pq.read_table(
-            root / "v3" / "state_telemetry" / f"{split}-00000.parquet"
-        )
+        table = pq.read_table(root / "v3" / "state_telemetry" / f"{split}-00000.parquet")
         published |= set(table.column("episode_id").to_pylist())
     assert report.embargo_episodes
     assert not published & set(report.embargo_episodes)
@@ -270,18 +260,14 @@ def test_backfill_emits_zero_teacher_labels(built):
     """v2 rows carry no throttle mask or ECC counters: labeling must refuse."""
     root, _ = built
     for split in ("train", "validation", "test"):
-        table = pq.read_table(
-            root / "v3" / "action_proposals" / f"{split}-00000.parquet"
-        )
+        table = pq.read_table(root / "v3" / "action_proposals" / f"{split}-00000.parquet")
         assert table.num_rows == 0
         assert table.schema.equals(PROPOSALS_SCHEMA)
 
 
 def test_safety_filter_log_is_empty_but_typed(built):
     root, _ = built
-    table = pq.read_table(
-        root / "v3" / "safety_filter_log" / "train-00000.parquet"
-    )
+    table = pq.read_table(root / "v3" / "safety_filter_log" / "train-00000.parquet")
     assert table.num_rows == 0
     assert table.schema.equals(SAFETY_SCHEMA)
 

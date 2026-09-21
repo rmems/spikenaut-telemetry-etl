@@ -141,9 +141,7 @@ def _sustained_kv_pressure(history: Sequence[TeacherState], steps: int) -> bool:
     )
 
 
-def _queue_growing_throughput_flat(
-    history: Sequence[TeacherState], steps: int
-) -> bool:
+def _queue_growing_throughput_flat(history: Sequence[TeacherState], steps: int) -> bool:
     """Strictly growing request queue while token throughput stays flat."""
     if len(history) < steps:
         return False

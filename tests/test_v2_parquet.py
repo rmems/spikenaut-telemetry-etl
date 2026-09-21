@@ -85,9 +85,7 @@ def test_all_sources_convert_and_report_counts(v2_repo):
 def test_parquet_serves_identical_content(v2_repo):
     build_v2_parquet(v2_repo)
     for config, rel in V2_SOURCES.items():
-        js = datasets.load_dataset(
-            "json", data_files=str(v2_repo / rel), split="train"
-        )
+        js = datasets.load_dataset("json", data_files=str(v2_repo / rel), split="train")
         pq_ds = datasets.load_dataset(
             "parquet",
             data_files=str(v2_repo / "v2_parquet" / config / "train-00000.parquet"),
@@ -116,9 +114,7 @@ def test_nulls_survive_conversion(v2_repo):
 def test_timestamp_resolution_shift_is_the_only_feature_change(v2_repo):
     build_v2_parquet(v2_repo)
     for config, rel in V2_SOURCES.items():
-        js = datasets.load_dataset(
-            "json", data_files=str(v2_repo / rel), split="train"
-        )
+        js = datasets.load_dataset("json", data_files=str(v2_repo / rel), split="train")
         pq_ds = datasets.load_dataset(
             "parquet",
             data_files=str(v2_repo / "v2_parquet" / config / "train-00000.parquet"),

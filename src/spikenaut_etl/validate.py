@@ -175,9 +175,7 @@ def gate_no_all_null_columns(rows: Sequence[dict[str, Any]]) -> list[GateFailure
     return failures
 
 
-def gate_row_count_delta(
-    n_in: int, n_out: int, max_ratio: float
-) -> list[GateFailure]:
+def gate_row_count_delta(n_in: int, n_out: int, max_ratio: float) -> list[GateFailure]:
     if n_in == 0:
         return []
     delta = abs(n_in - n_out) / n_in
@@ -265,8 +263,7 @@ def gate_timestamps_ordered(
         return []
     index, seconds = breaks[0]
     detail = (
-        f"time runs backwards {seconds:,.0f}s at record {index} "
-        f"(tolerance {tolerance}s)"
+        f"time runs backwards {seconds:,.0f}s at record {index} (tolerance {tolerance}s)"
     )
     if len(breaks) > 1:
         detail += f"; {len(breaks)} such breaks total"

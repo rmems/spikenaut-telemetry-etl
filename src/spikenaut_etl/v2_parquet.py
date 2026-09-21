@@ -100,9 +100,7 @@ def _write_converted(
     try:
         loaded.to_parquet(str(path))
         # Verify the fidelity contract by reloading what was just written.
-        reloaded = datasets.load_dataset(
-            "parquet", data_files=str(path), split="train"
-        )
+        reloaded = datasets.load_dataset("parquet", data_files=str(path), split="train")
     except Exception as exc:  # noqa: BLE001 -- write/reload failures (disk,
         # Arrow, loader internals) are expected failure modes of this entry
         # point and must exit through the CLI's BuildError path.

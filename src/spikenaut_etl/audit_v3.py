@@ -65,7 +65,7 @@ def _git_head(path: Path) -> str | None:
             capture_output=True,
             text=True,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         return None
     return result.stdout.strip() or None
 
@@ -116,7 +116,7 @@ def _sensor_reason(name: str, value: Any) -> str | None:
         return f"missing_{name}"
     try:
         finite = math.isfinite(float(value))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         finite = False
     if not finite:
         return f"non_finite_{name}"

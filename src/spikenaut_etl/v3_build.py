@@ -450,9 +450,7 @@ def build_qubic_signals(gpu: pa.Table) -> pa.Table:
     return pa.table(cols)
 
 
-def build_state_telemetry(
-    gpu: pa.Table, episode_len: int = EPISODE_LEN
-) -> pa.Table:
+def build_state_telemetry(gpu: pa.Table, episode_len: int = EPISODE_LEN) -> pa.Table:
     """One state row per v2 GPU row, in the full v3 schema.
 
     Signals v2 never carried stay typed nulls. ``synthetic`` is False: these
@@ -578,9 +576,7 @@ def build_action_proposals(state: pa.Table) -> pa.Table:
         decision = propose(history)
         if decision is None:
             continue
-        paired = (
-            decision.paired_action.action_name if decision.paired_action else None
-        )
+        paired = decision.paired_action.action_name if decision.paired_action else None
         rows.append(
             {
                 "episode_id": episode_ids[i],

@@ -34,7 +34,7 @@ import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
@@ -64,12 +64,6 @@ from .schemas import (
     RawQubicTick,
     TelemetryEnvelope,
 )
-
-# Preserves the caller's concrete model type through read_validated. Returning
-# the bare BaseModel would erase it, and every downstream `record.telemetry` /
-# `record.timestamp` access would go unchecked -- which is a poor look for a
-# pipeline whose whole argument is that declared schemas catch field errors.
-M = TypeVar("M", bound=BaseModel)
 
 # Distinctive Theseus-Quarry envelope keys. Present together without
 # schema_version means a v1-shaped line that forgot to declare its version.
@@ -120,7 +114,7 @@ class IngestStats:
         return out
 
 
-def read_validated(
+def read_validated[M: BaseModel](
     path: Path, model: type[M], stats: IngestStats
 ) -> Iterator[tuple[int, BaseModel]]:
     """Stream a source through its declared schema, or schema v1.
@@ -164,7 +158,7 @@ def read_validated(
             yield row, record
 
 
-def parse_record(
+def parse_record[M: BaseModel](
     payload: dict[str, Any],
     model: type[M],
     *,
@@ -204,7 +198,7 @@ def parse_record(
     return record
 
 
-def _parse_legacy(
+def _parse_legacy[M: BaseModel](
     payload: dict[str, Any],
     model: type[M],
     *,
@@ -254,7 +248,7 @@ def _parse_qubic_payload(payload: dict[str, Any], *, row: int, source: str) -> B
     return _validate_model(payload, RawQubicTick, row=row, source=source)
 
 
-def _validate_model(
+def _validate_model[M: BaseModel](
     payload: dict[str, Any],
     model: type[M],
     *,

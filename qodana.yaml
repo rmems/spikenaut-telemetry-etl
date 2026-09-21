@@ -28,15 +28,15 @@ exclude:
   # The inspection resolves no Python SDK for the project (SARIF logicalLocations
   # report a bare "project" module) and falls back to a pre-3.10 language level.
   # Neither QODANA_PYTHON_PATH nor a bootstrap conda env changes it; the linter
-  # container itself already ships Python 3.12.4.
+  # container's bundled interpreter also does not define the project SDK.
   #
-  # The syntax is correct here: requires-python is >=3.10, ruff targets py310,
-  # every module has `from __future__ import annotations`, and CI passes on 3.10
-  # and 3.12. ruff's UP rules actively rewrite `Optional[X]` into `X | None`, so
+  # The syntax is correct here: requires-python is >=3.14, ruff targets py314,
+  # and every module has `from __future__ import annotations`. Ruff's UP rules
+  # actively rewrite `Optional[X]` into `X | None`, so
   # leaving this on puts the two linters in permanent conflict.
   #
   # Type-hint correctness is covered properly by mypy, which runs in CI against
-  # python_version 3.10 and passes clean.
+  # python_version 3.14 and passes clean.
   - name: PyTypeHintsInspection
 
   # 11 findings, "Class has no __init__ method", on pydantic BaseModel

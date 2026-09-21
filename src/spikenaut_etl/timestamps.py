@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 # Real datetime forms observed across the sources, by frequency in the recovered
 # 120,334-row node_sync_harvest original:
@@ -65,8 +65,7 @@ _EPOCH_SECONDS = re.compile(r"^\d{9,11}$")
 # by a Rust producer whose timestamps carry *nanoseconds*
 # ("2026-03-11T18:22:37.433458521+00:00" -- 9 digits). Python's %f accepts at most
 # 6, and datetime cannot represent finer than microseconds at all, so the tail is
-# truncated. Caught by CI on 3.10; newer interpreters are more permissive here,
-# which is precisely why the pinned matrix matters.
+# truncated explicitly so the result does not depend on parser permissiveness.
 _SUBSECOND = re.compile(r"(?<=\.)(\d{7,})")
 
 
@@ -120,7 +119,7 @@ def from_epoch_ms(timestamp_ms: object) -> datetime:
             f"got {timestamp_ms!r}"
         )
     try:
-        return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+        return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=UTC)
     except (OverflowError, OSError, ValueError) as exc:
         raise ValueError(
             f"timestamp_ms {timestamp_ms!r} is not a convertible UTC clock"
@@ -134,7 +133,7 @@ def parse(raw: object) -> ParsedTimestamp:
         if isinstance(raw, (int, float)):
             return ParsedTimestamp(
                 raw=str(raw),
-                moment=datetime.fromtimestamp(float(raw), tz=timezone.utc),
+                moment=datetime.fromtimestamp(float(raw), tz=UTC),
             )
         return ParsedTimestamp(raw=repr(raw))
 
@@ -156,13 +155,10 @@ def parse(raw: object) -> ParsedTimestamp:
         )
 
     if _EPOCH_SECONDS.match(text):
-        return ParsedTimestamp(
-            raw=raw, moment=datetime.fromtimestamp(int(text), tz=timezone.utc)
-        )
+        return ParsedTimestamp(raw=raw, moment=datetime.fromtimestamp(int(text), tz=UTC))
 
-    # Theseus-Quarry chrono DateTime<Utc> serializes with a trailing Z.
-    # Python 3.10's fromisoformat rejects Z; the %z patterns want ±HH:MM.
-    # Some producers emit lowercase z; treat it the same as Z.
+    # Theseus-Quarry chrono DateTime<Utc> serializes with a trailing Z. Normalize
+    # both cases explicitly so every supported producer follows the same path.
     if text.endswith(("Z", "z")) and "T" in text:
         text = text[:-1] + "+00:00"
 
@@ -170,9 +166,7 @@ def parse(raw: object) -> ParsedTimestamp:
 
     for pattern in _DATETIME_PATTERNS:
         try:
-            return ParsedTimestamp(
-                raw=raw, moment=datetime.strptime(normalized, pattern)
-            )
+            return ParsedTimestamp(raw=raw, moment=datetime.strptime(normalized, pattern))
         except ValueError:
             continue
 

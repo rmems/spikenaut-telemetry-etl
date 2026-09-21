@@ -559,7 +559,7 @@ def _write_json(path: Path, value: Any) -> None:
 def _assignments(campaign_path: Path) -> list[dict[str, Any]]:
     try:
         raw = json.loads(campaign_path.read_text()).get("sessions", [])
-    except (OSError, json.JSONDecodeError, AttributeError):
+    except OSError, json.JSONDecodeError, AttributeError:
         return []
     return [
         {key: item.get(key) for key in ("session_id", "split", "seed")}
