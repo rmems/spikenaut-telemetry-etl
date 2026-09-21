@@ -1056,6 +1056,66 @@ def test_source_renamed_to_root_artifact_before_pin_is_preserved(
     assert json.loads((output / evidence_name).read_text())["status"] == "incomplete"
 
 
+@pytest.mark.parametrize(
+    "artifact_name", ["prepared.json", "quality-report.json", "manifest.json"]
+)
+def test_atomic_preparation_publication_preserves_late_session_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact_name: str
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    session = Path(json.loads(campaign.read_text())["sessions"][0]["path"])
+    source = session / "session_manifest.json"
+    source_bytes = source.read_bytes()
+    output = tmp_path / "out"
+    artifact = output / artifact_name
+    original_write = anticipation._write_json
+    moved = False
+
+    def move_source_before_write(path: Path, value: object) -> None:
+        nonlocal moved
+        if path == artifact and not moved:
+            moved = True
+            source.rename(artifact)
+        original_write(path, value)
+
+    monkeypatch.setattr(anticipation, "_write_json", move_source_before_write)
+
+    with pytest.raises((OSError, PreparationError)):
+        prepare_campaign(campaign, output)
+    assert artifact.read_bytes() == source_bytes
+
+
+@pytest.mark.parametrize("artifact_name", ["quality-report.json", "manifest.json"])
+def test_atomic_preparation_failure_evidence_preserves_late_session_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact_name: str
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    session = Path(json.loads(campaign.read_text())["sessions"][0]["path"])
+    source = session / "session_manifest.json"
+    source_bytes = source.read_bytes()
+    output = tmp_path / "out"
+    artifact = output / artifact_name
+    original_write = anticipation._write_json
+    moved = False
+
+    def fail_campaign_load(*_args: object, **_kwargs: object) -> None:
+        raise PreparationError("forced preparation failure")
+
+    def move_source_before_evidence(path: Path, value: object) -> None:
+        nonlocal moved
+        if path == artifact and not moved:
+            moved = True
+            source.rename(artifact)
+        original_write(path, value)
+
+    monkeypatch.setattr(anticipation, "_load_campaign", fail_campaign_load)
+    monkeypatch.setattr(anticipation, "_write_json", move_source_before_evidence)
+
+    with pytest.raises((OSError, PreparationError)):
+        prepare_campaign(campaign, output)
+    assert artifact.read_bytes() == source_bytes
+
+
 def test_replacement_invalidates_prior_completion_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

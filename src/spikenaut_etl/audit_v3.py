@@ -1188,9 +1188,11 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
             try:
                 _clean_owned_outputs(output_root, source_identities)
             except AuditError:
-                # Preserve an unsafe view symlink without following it; the JSON
-                # evidence files live directly under the already-guarded root.
-                pass
+                # Preserve an unsafe view symlink while replacing only root evidence.
+                try:
+                    _clean_root_evidence(output_root, source_identities)
+                except OSError as cleanup_error:
+                    raise audit_error from cleanup_error
             try:
                 _write_incomplete_evidence(
                     output_root,

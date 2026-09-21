@@ -25,6 +25,7 @@ from .artifacts import (
     clean_artifacts,
     directory_identity,
     ensure_directory,
+    no_replace_publication,
     pinned_publication,
 )
 from .artifacts import write_json as _write_json
@@ -978,45 +979,46 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             assignments = _campaign_assignments(campaign)
             ensure_directory(output_dir)
             publication_identity = directory_identity(output_dir)
-            clean_artifacts(output_dir, ("manifest.json",))
-            prepared, source_memberships, source_snapshots = _prepare_campaign(
-                campaign_path,
-                output_dir,
-                campaign,
-                minimum,
-                campaign_sha256,
-            )
-            manifest = {
-                "schema_version": SCHEMA_VERSION,
-                "status": "complete",
-                "assignments": assignments,
-                "prepared_sha256": _sha256(output_dir / "prepared.json"),
-                "session_counts": prepared["quality"]["session_summaries"],
-                "sources": prepared["provenance"]["sources"],
-            }
-            _write_json(output_dir / "quality-report.json", prepared["quality"])
-            if directory_identity(output_dir) != publication_identity:
-                raise PreparationError(PUBLICATION_DIRECTORY_ERROR)
-            manifest["quality_report_sha256"] = _sha256(
-                output_dir / "quality-report.json"
-            )
-            _verify_publication(
-                output_dir,
-                publication_identity,
-                manifest["prepared_sha256"],
-                manifest["quality_report_sha256"],
-            )
-            _check_preparation_sources(source_memberships, source_snapshots)
-            _verify_publication(
-                output_dir,
-                publication_identity,
-                manifest["prepared_sha256"],
-                manifest["quality_report_sha256"],
-                hash_first=True,
-            )
-            _write_json(output_dir / "manifest.json", manifest)
-            if directory_identity(output_dir) != publication_identity:
-                raise PreparationError(PUBLICATION_DIRECTORY_ERROR)
+            _remove_owned_preparation_outputs(output_dir, set())
+            with no_replace_publication():
+                prepared, source_memberships, source_snapshots = _prepare_campaign(
+                    campaign_path,
+                    output_dir,
+                    campaign,
+                    minimum,
+                    campaign_sha256,
+                )
+                manifest = {
+                    "schema_version": SCHEMA_VERSION,
+                    "status": "complete",
+                    "assignments": assignments,
+                    "prepared_sha256": _sha256(output_dir / "prepared.json"),
+                    "session_counts": prepared["quality"]["session_summaries"],
+                    "sources": prepared["provenance"]["sources"],
+                }
+                _write_json(output_dir / "quality-report.json", prepared["quality"])
+                if directory_identity(output_dir) != publication_identity:
+                    raise PreparationError(PUBLICATION_DIRECTORY_ERROR)
+                manifest["quality_report_sha256"] = _sha256(
+                    output_dir / "quality-report.json"
+                )
+                _verify_publication(
+                    output_dir,
+                    publication_identity,
+                    manifest["prepared_sha256"],
+                    manifest["quality_report_sha256"],
+                )
+                _check_preparation_sources(source_memberships, source_snapshots)
+                _verify_publication(
+                    output_dir,
+                    publication_identity,
+                    manifest["prepared_sha256"],
+                    manifest["quality_report_sha256"],
+                    hash_first=True,
+                )
+                _write_json(output_dir / "manifest.json", manifest)
+                if directory_identity(output_dir) != publication_identity:
+                    raise PreparationError(PUBLICATION_DIRECTORY_ERROR)
         except (OSError, PreparationError) as exc:
             if not assignments:
                 assignments = _assignments(campaign_bytes)
@@ -1032,10 +1034,11 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
                     campaign_path, output_dir, campaign_bytes, source_identities
                 )
                 _remove_owned_preparation_outputs(output_dir, protected)
-                if "quality-report.json" not in protected:
-                    _write_json(output_dir / "quality-report.json", incomplete)
-                if "manifest.json" not in protected:
-                    _write_json(output_dir / "manifest.json", incomplete)
+                with no_replace_publication():
+                    if "quality-report.json" not in protected:
+                        _write_json(output_dir / "quality-report.json", incomplete)
+                    if "manifest.json" not in protected:
+                        _write_json(output_dir / "manifest.json", incomplete)
             except OSError as publication_error:
                 raise PreparationError(str(exc)) from publication_error
             raise

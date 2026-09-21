@@ -1092,6 +1092,39 @@ def test_publication_rejects_replaced_view_directory(
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
+def test_late_view_replacement_republishes_incomplete_root_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    source_view = source / "v3/state_telemetry"
+    before = {path.name: path.read_bytes() for path in source_view.glob("*.parquet")}
+    original = audit_module._check_output_snapshot
+    replaced = False
+
+    def replace_view_after_report(*args: object, **kwargs: object) -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            view = output / audit_module.VIEW_ID
+            view.rename(tmp_path / "detached-view")
+            view.symlink_to(source_view, target_is_directory=True)
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(audit_module, "_check_output_snapshot", replace_view_after_report)
+
+    with pytest.raises(AuditError):
+        audit_v3(source, output)
+    assert {
+        path.name: path.read_bytes() for path in source_view.glob("*.parquet")
+    } == before
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
 def test_source_change_during_publication_prevents_complete_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
