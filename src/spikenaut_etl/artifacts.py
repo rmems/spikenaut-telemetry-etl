@@ -145,6 +145,8 @@ def _staged_output(path: Path, mode: str) -> Iterator[IO[Any]]:
         created = True
         with os.fdopen(descriptor, mode) as stream:
             yield stream
+            stream.flush()
+            os.fsync(stream.fileno())
         _check_directory(path.parent, directory)
         if _NO_REPLACE_PUBLICATION.get():
             os.link(
@@ -158,6 +160,7 @@ def _staged_output(path: Path, mode: str) -> Iterator[IO[Any]]:
             created = False
         else:
             os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
         _check_directory(path.parent, directory)
     finally:
         try:

@@ -77,3 +77,41 @@ def test_publisher_lock_released_after_failure(tmp_path):
             raise ValueError("fixture failure")
     with pinned_publication(output):
         write_json(output / "manifest.json", {"complete": True})
+
+
+@pytest.mark.parametrize("create_only", [False, True])
+def test_publication_syncs_file_before_install_and_directory_after(
+    tmp_path, monkeypatch, create_only
+):
+    from spikenaut_etl import artifacts
+
+    output = tmp_path / "output"
+    artifact = output / "manifest.json"
+    events = []
+    original_fsync = artifacts.os.fsync
+    original_link = artifacts.os.link
+    original_replace = artifacts.os.replace
+
+    def record_fsync(descriptor):
+        events.append("fsync")
+        original_fsync(descriptor)
+
+    def record_link(*args, **kwargs):
+        events.append("publish")
+        original_link(*args, **kwargs)
+
+    def record_replace(*args, **kwargs):
+        events.append("publish")
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(artifacts.os, "fsync", record_fsync)
+    monkeypatch.setattr(artifacts.os, "link", record_link)
+    monkeypatch.setattr(artifacts.os, "replace", record_replace)
+
+    if create_only:
+        with artifacts.no_replace_publication():
+            write_json(artifact, {"complete": True})
+    else:
+        write_json(artifact, {"complete": True})
+
+    assert events == ["fsync", "publish", "fsync"]
