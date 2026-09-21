@@ -49,7 +49,9 @@ PARQUET_COLUMNS = [
     "session_label",
     *(item["source"] for item in FEATURE_MAP),
 ]
-_BATCH_PATTERN = re.compile(r"^(?:gpu_telemetry_v2_|telemetry_)batch_(\d+)\.parquet$")
+_BATCH_PATTERN = re.compile(
+    r"^(?:gpu_telemetry_v2_|telemetry_)batch_([0-9]{1,10})\.parquet$"
+)
 
 
 class PreparationError(ValueError):
@@ -165,11 +167,26 @@ def _load_manifest(
         raise PreparationError(
             f"session {expected_id} ended_at_utc must be a valid UTC timestamp"
         )
-    if manifest.get("parquet_write_failures") != 0:
+    parquet_write_failures = manifest.get("parquet_write_failures")
+    if (
+        not isinstance(parquet_write_failures, int)
+        or isinstance(parquet_write_failures, bool)
+        or parquet_write_failures != 0
+    ):
         raise PreparationError(f"session {expected_id} reports Parquet write failures")
-    if manifest.get("unclean_restart_count") != 0:
+    unclean_restart_count = manifest.get("unclean_restart_count")
+    if (
+        not isinstance(unclean_restart_count, int)
+        or isinstance(unclean_restart_count, bool)
+        or unclean_restart_count != 0
+    ):
         raise PreparationError(f"session {expected_id} reports an unclean restart")
-    if manifest.get("restart_count") != 0:
+    restart_count = manifest.get("restart_count")
+    if (
+        not isinstance(restart_count, int)
+        or isinstance(restart_count, bool)
+        or restart_count != 0
+    ):
         raise PreparationError(f"session {expected_id} is a restarted capture")
     if manifest.get("poll_interval_ms_requested") != FRAME_INTERVAL_MS:
         raise PreparationError(
@@ -500,6 +517,7 @@ def _prepare_campaign(
     summaries: list[dict[str, Any]] = []
     deficiencies: list[str] = []
     source_snapshots: list[tuple[Path, str]] = []
+    source_memberships: list[tuple[Path, frozenset[str]]] = []
     for item in campaign["sessions"]:
         session_id = item["session_id"]
         raw_path = Path(item["path"])
@@ -525,6 +543,9 @@ def _prepare_campaign(
             ]
             source_snapshots.append((manifest_path, manifest_sha256))
             source_snapshots.extend(parquet_snapshots)
+            source_memberships.append(
+                (session_path, frozenset(path.name for path, _ in parquet_snapshots))
+            )
         except (PreparationError, OSError) as exc:
             details = {
                 "session_summaries": summaries,
@@ -625,6 +646,12 @@ def _prepare_campaign(
             "sources": provenance_sources,
         },
     }
+    for session_path, expected_names in source_memberships:
+        current_names = frozenset(path.name for path in session_path.glob("*.parquet"))
+        if current_names != expected_names:
+            raise PreparationError(
+                f"source changed during preparation: {session_path} Parquet membership"
+            )
     for path, expected_sha256 in source_snapshots:
         try:
             current_sha256 = _sha256(path)

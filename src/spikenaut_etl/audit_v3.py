@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -181,7 +182,14 @@ def _distribution(column: pa.ChunkedArray) -> dict[str, int | float | None]:
 
 
 def _source_root(source_dir: Path) -> tuple[Path, Path, bool]:
-    source_dir = source_dir.resolve()
+    try:
+        source_dir = source_dir.resolve(strict=True)
+    except FileNotFoundError:
+        source_dir = source_dir.resolve()
+    except (OSError, RuntimeError) as exc:
+        if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
+            raise AuditError(f"cannot resolve source path {source_dir}: {exc}") from exc
+        raise AuditError(f"source path has a symlink loop: {source_dir}") from exc
     v3 = source_dir / "v3"
     if (v3 / "state_telemetry").is_dir():
         return source_dir, v3, True
@@ -603,10 +611,24 @@ def audit_v3(source_dir: str | Path, output_dir: str | Path) -> AuditReport:
     manifest. Row-level defects are written with exact reasons. Source files
     are read only and the output is forbidden from overlapping their tree.
     """
-    output_root = Path(output_dir).resolve()
+    source_path = Path(source_dir)
     try:
-        dataset_root, v3_root, source_is_dataset_root = _source_root(Path(source_dir))
+        output_root = Path(output_dir).resolve()
+    except RuntimeError as exc:
+        raise AuditError(f"output path has a symlink loop: {output_dir}") from exc
+    try:
+        dataset_root, v3_root, source_is_dataset_root = _source_root(source_path)
     except AuditError as exc:
+        try:
+            provisional_source = source_path.resolve()
+        except RuntimeError:
+            provisional_source = source_path.absolute()
+        if output_root == provisional_source or output_root.is_relative_to(
+            provisional_source
+        ):
+            raise AuditError(
+                f"output directory would overlap supplied source path: {output_root}"
+            ) from exc
         output_root.mkdir(parents=True, exist_ok=True)
         _clean_owned_outputs(output_root)
         _write_incomplete_evidence(output_root, exc, None, None)

@@ -525,6 +525,67 @@ def test_boolean_collector_schema_version_fails_closed(tmp_path: Path) -> None:
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
+@pytest.mark.parametrize(
+    ("field", "match"),
+    [
+        ("parquet_write_failures", "write failures"),
+        ("unclean_restart_count", "unclean restart"),
+        ("restart_count", "restarted capture"),
+    ],
+)
+def test_boolean_collector_completion_counters_fail_closed(
+    tmp_path: Path, field: str, match: str
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    manifest_path = tmp_path / "session-01" / "session_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest[field] = False
+    manifest_path.write_text(json.dumps(manifest))
+    output = tmp_path / "out"
+
+    with pytest.raises(PreparationError, match=match):
+        prepare_campaign(campaign, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_batch_suffix_is_bounded_before_integer_conversion(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    oversized = tmp_path / "session-01" / f"gpu_telemetry_v2_batch_{'9' * 100}.parquet"
+    oversized.write_bytes(b"not read")
+
+    with pytest.raises(PreparationError, match="unexpected Parquet"):
+        prepare_campaign(campaign, tmp_path / "out")
+
+    assert (
+        json.loads((tmp_path / "out" / "manifest.json").read_text())["status"]
+        == "incomplete"
+    )
+
+
+def test_late_parquet_batch_fails_final_membership_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    session = tmp_path / "session-01"
+    canonical = session / "gpu_telemetry_v2_batch_0.parquet"
+    original = anticipation._out_of_training_range
+
+    def add_batch(*args: object, **kwargs: object) -> dict[str, object]:
+        (session / "gpu_telemetry_v2_batch_1.parquet").write_bytes(canonical.read_bytes())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(anticipation, "_out_of_training_range", add_batch)
+
+    with pytest.raises(PreparationError, match="Parquet membership"):
+        prepare_campaign(campaign, tmp_path / "out")
+
+    assert (
+        json.loads((tmp_path / "out" / "manifest.json").read_text())["status"]
+        == "incomplete"
+    )
+
+
 def test_final_report_write_failure_removes_complete_payload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

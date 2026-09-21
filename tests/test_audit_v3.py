@@ -272,6 +272,36 @@ def test_missing_source_root_writes_incomplete_evidence(tmp_path: Path) -> None:
     assert manifest["source_files"] == {}
 
 
+def test_cyclic_source_path_writes_incomplete_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "source-loop"
+    source.symlink_to(source, target_is_directory=True)
+    output = tmp_path / "audit"
+
+    with pytest.raises(AuditError, match="source path has a symlink loop"):
+        audit_v3(source, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_invalid_source_output_overlap_is_rejected_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "invalid-source"
+    source.mkdir()
+    sentinels = {
+        "manifest.json": b"source manifest",
+        "audit-report.json": b"source audit report",
+        "exclusions.parquet": b"source exclusions",
+    }
+    for name, content in sentinels.items():
+        (source / name).write_bytes(content)
+
+    with pytest.raises(AuditError, match="overlap supplied source path"):
+        audit_v3(source, source)
+
+    assert {name: (source / name).read_bytes() for name in sentinels} == sentinels
+
+
 def test_missing_timestamp_column_fails_closed_with_evidence(tmp_path: Path) -> None:
     source = tmp_path / "source"
     output = tmp_path / "audit"
