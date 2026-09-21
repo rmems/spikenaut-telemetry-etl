@@ -391,6 +391,7 @@ def test_unexpected_action_proposal_shard_fails_closed(tmp_path: Path) -> None:
                 {
                     "episode_id": "gpu-000000",
                     "step_idx": 0,
+                    "schema_version": "3.0.0",
                     "proposed_action": "hold",
                     "teacher_action": None,
                 }
@@ -726,6 +727,7 @@ def test_action_proposal_keys_must_be_unique_and_match_state(
         {
             "episode_id": "gpu-000000",
             "step_idx": 0,
+            "schema_version": "3.0.0",
             "proposed_action": "hold",
             "teacher_action": None,
         }
@@ -736,6 +738,7 @@ def test_action_proposal_keys_must_be_unique_and_match_state(
         else {
             "episode_id": "gpu-999999",
             "step_idx": 0,
+            "schema_version": "3.0.0",
             "proposed_action": "hold",
             "teacher_action": None,
         }
@@ -887,7 +890,7 @@ def test_missing_action_shard_is_incomplete(tmp_path: Path) -> None:
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
-@pytest.mark.parametrize("config", ["state_telemetry", "outcomes"])
+@pytest.mark.parametrize("config", ["state_telemetry", "outcomes", "action_proposals"])
 @pytest.mark.parametrize("version", ["missing", "4.0.0", None])
 def test_unsupported_source_schema_is_incomplete(
     tmp_path: Path, config: str, version: str | None
@@ -896,6 +899,17 @@ def test_unsupported_source_schema_is_incomplete(
     _write_corpus(source)
     path = source / "v3" / config / "train-00000.parquet"
     table = pq.read_table(path).drop(["schema_version"])
+    if config == "action_proposals":
+        table = pa.Table.from_pylist(
+            [
+                {
+                    "episode_id": "gpu-000000",
+                    "step_idx": 0,
+                    "proposed_action": None,
+                    "teacher_action": None,
+                }
+            ]
+        )
     if version != "missing":
         table = table.append_column(
             "schema_version", pa.array([version] * table.num_rows, type=pa.string())
@@ -905,3 +919,18 @@ def test_unsupported_source_schema_is_incomplete(
     with pytest.raises(AuditError, match="schema_version"):
         audit_v3(source, output)
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_string_reward_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/outcomes/train-00000.parquet"
+    table = pq.read_table(path)
+    table = table.set_column(
+        table.schema.get_field_index("reward"),
+        "reward",
+        pa.array(["1.0"] * table.num_rows),
+    )
+    pq.write_table(table, path)
+    with pytest.raises(AuditError, match="reward"):
+        audit_v3(source, tmp_path / "audit")

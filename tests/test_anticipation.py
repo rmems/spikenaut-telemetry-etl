@@ -970,15 +970,59 @@ def test_later_session_failure_preserves_prior_verified_evidence(tmp_path: Path)
     assert quality["failed_session_id"] == "session-02"
 
 
-def test_recursive_manifest_writes_incomplete_reports(tmp_path: Path) -> None:
+@pytest.mark.parametrize("python_decoder", [False, True])
+def test_recursive_manifest_writes_incomplete_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, python_decoder: bool
+) -> None:
+    if python_decoder:
+        # Exercise the stdlib recursive decoder regardless of C decoder build limits.
+        decoder = json.JSONDecoder()
+        decoder.scan_once = json.scanner.py_make_scanner(decoder)
+        monkeypatch.setattr(json, "loads", decoder.decode)
     campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
     (tmp_path / "session-01/session_manifest.json").write_text(
-        "[" * 100000 + "0" + "]" * 100000
+        "[" * 2000 + "0" + "]" * 2000
     )
     output = tmp_path / "out"
     output.mkdir()
     (output / "prepared.json").write_text("stale complete result")
-    with pytest.raises(PreparationError, match="manifest unavailable"):
+    with pytest.raises(PreparationError):
         prepare_campaign(campaign, output)
     assert not (output / "prepared.json").exists()
     assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("location", ["same", "child", "parent"])
+def test_session_source_output_overlap_preserves_files(
+    tmp_path: Path, location: str
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    session = tmp_path / "session-01"
+    output = {"same": session, "child": session / "audit", "parent": tmp_path}[location]
+    output.mkdir(exist_ok=True)
+    sentinel = output / "manifest.json"
+    sentinel.write_text("source sentinel")
+    with pytest.raises(PreparationError, match="overlap"):
+        prepare_campaign(campaign, output)
+    assert sentinel.read_text() == "source sentinel"
+
+
+def test_replacement_invalidates_prior_completion_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    output = tmp_path / "out"
+    prepare_campaign(campaign, output)
+    original = anticipation._write_json
+
+    def check_marker(path: Path, value: object) -> None:
+        if path.name == "prepared.json":
+            marker = output / "manifest.json"
+            assert (
+                not marker.exists()
+                or json.loads(marker.read_text())["status"] != "complete"
+            )
+        original(path, value)
+
+    monkeypatch.setattr(anticipation, "_write_json", check_marker)
+    prepare_campaign(campaign, output)

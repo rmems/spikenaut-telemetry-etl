@@ -226,7 +226,7 @@ def _load_split(v3_root: Path, split: str) -> tuple[Path, Path, pa.Table, pa.Tab
         ):
             raise AuditError(f"{config}/{split} schema_version must be 3.0.0")
     _require_numeric_columns(state, SENSOR_COLUMNS, f"state_telemetry/{split}")
-    _require_numeric_columns(outcomes, ("d_gpu_temp_c",), f"outcomes/{split}")
+    _require_numeric_columns(outcomes, ("reward", "d_gpu_temp_c"), f"outcomes/{split}")
     if state.num_rows == 0 or outcomes.num_rows == 0:
         raise AuditError(f"{split} source split is empty")
     return state_path, outcome_path, state, outcomes
@@ -251,10 +251,18 @@ def _action_label_counts(
     try:
         table = pq.read_table(
             path,
-            columns=["episode_id", "step_idx", "proposed_action", "teacher_action"],
+            columns=[
+                "episode_id",
+                "step_idx",
+                "proposed_action",
+                "teacher_action",
+                "schema_version",
+            ],
         )
     except (OSError, pa.ArrowException) as exc:
         raise AuditError(f"cannot read {split} action-proposal shard: {exc}") from exc
+    if any(version != "3.0.0" for version in table.column("schema_version").to_pylist()):
+        raise AuditError(f"action_proposals/{split} schema_version must be 3.0.0")
     proposal_keys = _key_columns(table, f"action_proposals/{split}")
     _assert_unique(proposal_keys, f"action_proposals/{split}")
     state_key_set = set(state_keys)

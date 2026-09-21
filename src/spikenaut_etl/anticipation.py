@@ -761,6 +761,21 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
                 )
     if campaign_path in output_artifacts:
         raise PreparationError(f"campaign {campaign_path} collides with output artifact")
+    # Guard source directories before the error handler can clean or publish outputs.
+    for item in _assignments(campaign_path):
+        raw_path = item.get("path")
+        if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+            continue
+        session_path = Path(raw_path)
+        if not session_path.is_absolute():
+            session_path = campaign_path.parent / session_path
+        session_path = session_path.resolve()
+        if output_dir.is_relative_to(session_path) or session_path.is_relative_to(
+            output_dir
+        ):
+            raise PreparationError(
+                f"output directory overlaps session source: {session_path}"
+            )
     assignments: list[dict[str, Any]] = []
     try:
         if resolution_error is not None:
@@ -783,6 +798,7 @@ def prepare_campaign(campaign_path: Path | str, output_dir: Path | str) -> dict[
             )
         campaign, minimum, campaign_sha256 = _load_campaign(campaign_path)
         assignments = _campaign_assignments(campaign)
+        (output_dir / "manifest.json").unlink(missing_ok=True)
         prepared = _prepare_campaign(
             campaign_path,
             output_dir,
