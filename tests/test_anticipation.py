@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -1441,6 +1442,76 @@ def test_completion_marker_must_cover_last_row(tmp_path: Path) -> None:
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(PreparationError, match="completion.*last.*timestamp"):
         prepare_campaign(campaign, tmp_path / "out")
+
+
+def test_final_sample_must_cover_declared_completion(tmp_path: Path) -> None:
+    rows = _rows()
+    campaign = _campaign(tmp_path, [("session-01", "train", rows)])
+    manifest_path = tmp_path / "session-01" / "session_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    tolerance_ms = max(
+        anticipation.FRAME_INTERVAL_MS,
+        anticipation.MAX_SOURCE_AGE_MS,
+    )
+    manifest["ended_at_utc"] = (
+        datetime(1970, 1, 1, tzinfo=UTC)
+        + timedelta(milliseconds=rows[-1]["timestamp_ms"] + tolerance_ms + 1)
+    ).isoformat()
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(PreparationError, match="final sample.*completion"):
+        prepare_campaign(campaign, tmp_path / "out")
+
+    assert json.loads((tmp_path / "out" / "manifest.json").read_text())["status"] == (
+        "incomplete"
+    )
+
+
+def test_final_sample_accepts_completion_tolerance_boundary(tmp_path: Path) -> None:
+    rows = _rows()
+    campaign = _campaign(tmp_path, [("session-01", "train", rows)])
+    manifest_path = tmp_path / "session-01" / "session_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    tolerance_ms = max(
+        anticipation.FRAME_INTERVAL_MS,
+        anticipation.MAX_SOURCE_AGE_MS,
+    )
+    manifest["ended_at_utc"] = (
+        datetime(1970, 1, 1, tzinfo=UTC)
+        + timedelta(milliseconds=rows[-1]["timestamp_ms"] + tolerance_ms)
+    ).isoformat()
+    manifest_path.write_text(json.dumps(manifest))
+
+    prepared = prepare_campaign(campaign, tmp_path / "out")
+
+    assert prepared["sessions"][0]["session_id"] == "session-01"
+
+
+@pytest.mark.parametrize(
+    "source_name", ["session_manifest.json", "gpu_telemetry_v2_batch_0.parquet"]
+)
+def test_session_fifo_source_fails_without_blocking(
+    tmp_path: Path, source_name: str
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    source = tmp_path / "session-01" / source_name
+    source.unlink()
+    os.mkfifo(source)
+    output = tmp_path / "out"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(prepare_campaign, campaign, output)
+        done, _ = wait((future,), timeout=0.5)
+        if not done:
+            writer = os.open(source, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer)
+            with pytest.raises(PreparationError):
+                future.result(timeout=1)
+            pytest.fail(f"reading session source {source_name} blocked on a FIFO")
+        with pytest.raises(PreparationError):
+            future.result()
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
 
 
 def test_preparation_rechecks_source_overlap_after_output_pin(

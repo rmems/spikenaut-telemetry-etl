@@ -96,15 +96,23 @@ def directory_identity(path: Path) -> tuple[int, int]:
 
 
 class RetainedArtifact:
-    """A regular, single-link artifact held open through a publication boundary."""
+    """A regular artifact held open through an identity-sensitive boundary."""
 
-    def __init__(self, path: Path, directory: int, descriptor: int) -> None:
+    def __init__(
+        self,
+        path: Path,
+        directory: int,
+        descriptor: int,
+        *,
+        require_single_link: bool,
+    ) -> None:
         self._path = path
         self._directory = directory
         self._descriptor = descriptor
+        self._require_single_link = require_single_link
 
     def verify(self) -> None:
-        """Require the path to still name this exact regular, single-link inode."""
+        """Require the path to still name this exact regular inode."""
         _check_directory(self._path.parent, self._directory)
         opened = os.fstat(self._descriptor)
         current = os.stat(
@@ -114,12 +122,24 @@ class RetainedArtifact:
         )
         if (
             not stat.S_ISREG(opened.st_mode)
-            or opened.st_nlink != 1
             or not stat.S_ISREG(current.st_mode)
-            or current.st_nlink != 1
             or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            or (
+                self._require_single_link
+                and (opened.st_nlink != 1 or current.st_nlink != 1)
+            )
         ):
             raise OSError(f"artifact changed during publication: {self._path}")
+
+    def read_bytes(self) -> bytes:
+        """Read the retained inode without resolving the artifact path again."""
+        self.verify()
+        chunks: list[bytes] = []
+        os.lseek(self._descriptor, 0, os.SEEK_SET)
+        while chunk := os.read(self._descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        self.verify()
+        return b"".join(chunks)
 
     def sha256(self) -> str:
         """Hash the retained inode without resolving the artifact path again."""
@@ -133,7 +153,9 @@ class RetainedArtifact:
 
 
 @contextmanager
-def retain_regular_artifact(path: Path) -> Iterator[RetainedArtifact]:
+def retain_regular_artifact(
+    path: Path, *, require_single_link: bool = True
+) -> Iterator[RetainedArtifact]:
     """Open an artifact without following links and retain its exact identity."""
     if (
         not path.name
@@ -151,7 +173,12 @@ def retain_regular_artifact(path: Path) -> Iterator[RetainedArtifact]:
             os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
             dir_fd=directory,
         )
-        retained = RetainedArtifact(path, directory, descriptor)
+        retained = RetainedArtifact(
+            path,
+            directory,
+            descriptor,
+            require_single_link=require_single_link,
+        )
         retained.verify()
         yield retained
     finally:
@@ -311,6 +338,22 @@ def _clean_file(
     os.unlink(temporary, dir_fd=directory)
 
 
+def _clean_directory(
+    directory: int,
+    name: str,
+    protected_identities: set[tuple[int, int]],
+) -> None:
+    child = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=directory,
+    )
+    try:
+        _clean_entries(child, None, protected_identities)
+    finally:
+        os.close(child)
+
+
 def _clean_entries(
     directory: int,
     names: tuple[str, ...] | None,
@@ -323,13 +366,7 @@ def _clean_entries(
         except FileNotFoundError:
             continue
         if names is None and stat.S_ISDIR(metadata.st_mode):
-            child = os.open(
-                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory
-            )
-            try:
-                _clean_entries(child, None, protected_identities)
-            finally:
-                os.close(child)
+            _clean_directory(directory, name, protected_identities)
         elif names is None and not name.endswith(".parquet"):
             continue
         elif stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):

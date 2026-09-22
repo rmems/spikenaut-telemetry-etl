@@ -42,6 +42,7 @@ ZERO_SUSPECT_COLUMNS = SENSOR_COLUMNS
 MANIFEST_NAME = "manifest.json"
 AUDIT_REPORT_NAME = "audit-report.json"
 EXCLUSIONS_NAME = "exclusions.parquet"
+OUTPUT_ARTIFACT_ERROR = "output artifacts changed during publication"
 ROOT_ARTIFACT_NAMES = (MANIFEST_NAME, AUDIT_REPORT_NAME, EXCLUSIONS_NAME)
 
 
@@ -919,7 +920,7 @@ def _publish_audit(
                 for name, path in artifact_paths.items()
             }
         except OSError as exc:
-            raise AuditError("output artifacts changed during publication") from exc
+            raise AuditError(OUTPUT_ARTIFACT_ERROR) from exc
         output_hashes = _retained_output_hashes(retained_outputs)
         manifest: dict[str, Any] = {
             "status": "complete",
@@ -937,17 +938,13 @@ def _publish_audit(
         if _available_source_hashes(dataset_root, v3_root) != source_hashes:
             raise AuditError("source shards changed during publication")
         _verify_audit_directory(output_root, publication_identity)
-        _check_output_snapshot(
-            output_root, view_root, manifest["outputs"], retained_outputs
-        )
+        _check_output_snapshot(view_root, manifest["outputs"], retained_outputs)
         manifest_path = output_root / MANIFEST_NAME
         _guard_publication_destination(manifest_path, source_identities)
         write_json(manifest_path, manifest)
         _verify_audit_directory(output_root, publication_identity)
         _verify_audit_directory(view_root, view_identity)
-        _check_output_snapshot(
-            output_root, view_root, manifest["outputs"], retained_outputs
-        )
+        _check_output_snapshot(view_root, manifest["outputs"], retained_outputs)
 
 
 def _audit_v3_impl(
@@ -1016,11 +1013,10 @@ def _retained_output_hashes(
     try:
         return {name: artifact.sha256() for name, artifact in retained.items()}
     except OSError as exc:
-        raise AuditError("output artifacts changed during publication") from exc
+        raise AuditError(OUTPUT_ARTIFACT_ERROR) from exc
 
 
 def _check_output_snapshot(
-    output_root: Path,
     view_root: Path,
     expected: dict[str, str],
     retained: dict[str, RetainedArtifact],
@@ -1032,7 +1028,7 @@ def _check_output_snapshot(
         retained.keys() != expected.keys()
         or _retained_output_hashes(retained) != expected
     ):
-        raise AuditError("output artifacts changed during publication")
+        raise AuditError(OUTPUT_ARTIFACT_ERROR)
     if {path.name for path in view_root.glob(SHARD_GLOB)} != names:
         raise AuditError("output shard membership changed during publication")
 

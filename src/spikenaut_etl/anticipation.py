@@ -37,6 +37,7 @@ from .artifacts import write_json as _write_json
 SCHEMA_VERSION = "anticipation-prepared-v1"
 FRAME_INTERVAL_MS = 100
 MAX_SOURCE_AGE_MS = 200
+COMPLETION_TAIL_TOLERANCE_MS = max(FRAME_INTERVAL_MS, MAX_SOURCE_AGE_MS)
 MAX_TARGET_LATENESS_MS = 100
 MAX_FRAME_COUNT = 100_000
 HISTORY_OFFSETS_MS = (500, 1_000, 2_000, 5_000)
@@ -76,11 +77,13 @@ class PreparationError(ValueError):
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    with retain_regular_artifact(path, require_single_link=False) as retained:
+        return retained.sha256()
+
+
+def _read_source_bytes(path: Path) -> bytes:
+    with retain_regular_artifact(path, require_single_link=False) as retained:
+        return retained.read_bytes()
 
 
 def _require_mapping(value: Any, context: str) -> dict[str, Any]:
@@ -140,7 +143,7 @@ def _load_manifest(
 ) -> tuple[dict[str, Any], Path, str, int, int]:
     manifest_path = session_path / "session_manifest.json"
     try:
-        manifest_bytes = manifest_path.read_bytes()
+        manifest_bytes = _read_source_bytes(manifest_path)
         manifest_raw = json.loads(manifest_bytes.decode())
     except (OSError, ValueError, RecursionError) as exc:
         raise PreparationError(
@@ -272,7 +275,7 @@ def _read_rows(
     previous_timestamp: int | None = None
     for parquet_path in parquet_paths:
         try:
-            parquet_bytes = parquet_path.read_bytes()
+            parquet_bytes = _read_source_bytes(parquet_path)
             table = pq.read_table(pa.BufferReader(parquet_bytes), columns=PARQUET_COLUMNS)
         except Exception as exc:  # pyarrow has several format/schema exception classes
             raise PreparationError(f"cannot read {parquet_path}: {exc}") from exc
@@ -561,13 +564,19 @@ def _prepare_campaign(
                     f"session {session_id} timing sample_count does not equal "
                     "persisted rows"
                 )
-            if started_ms > min(row["timestamp_ms"] for row in rows):
+            first_timestamp_ms = min(row["timestamp_ms"] for row in rows)
+            final_timestamp_ms = max(row["timestamp_ms"] for row in rows)
+            if started_ms > first_timestamp_ms:
                 raise PreparationError(
                     f"session {session_id} row timestamp precedes session start"
                 )
-            if ended_ms < max(row["timestamp_ms"] for row in rows):
+            if ended_ms < final_timestamp_ms:
                 raise PreparationError(
                     f"session {session_id} completion precedes last row timestamp"
+                )
+            if ended_ms - final_timestamp_ms > COMPLETION_TAIL_TOLERANCE_MS:
+                raise PreparationError(
+                    f"session {session_id} final sample does not cover completion"
                 )
             session_rejections: Counter[str] = Counter()
             frames = _frames(rows)
@@ -667,6 +676,7 @@ def _prepare_campaign(
             "criteria": {
                 "frame_interval_ms": FRAME_INTERVAL_MS,
                 "max_source_age_ms": MAX_SOURCE_AGE_MS,
+                "completion_tail_tolerance_ms": COMPLETION_TAIL_TOLERANCE_MS,
                 "max_target_lateness_ms": MAX_TARGET_LATENESS_MS,
                 "history_offsets_ms": list(HISTORY_OFFSETS_MS),
                 "target_offsets_ms": list(TARGET_OFFSETS_MS),

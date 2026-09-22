@@ -1,7 +1,7 @@
 """Artifact publication rejects substituted ancestor directories."""
 
 import os
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import pytest
 
@@ -28,18 +28,15 @@ def test_retained_artifact_rejects_fifo_without_blocking(tmp_path):
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(retain)
-        try:
-            future.result(timeout=0.5)
-        except TimeoutError:
+        done, _ = wait((future,), timeout=0.5)
+        if not done:
             writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
             os.close(writer)
             with pytest.raises(OSError):
                 future.result(timeout=1)
             pytest.fail("retaining a FIFO blocked while waiting for a writer")
-        except OSError:
-            pass
-        else:
-            pytest.fail("retaining a FIFO unexpectedly succeeded")
+        with pytest.raises(OSError):
+            future.result()
 
 
 def test_cleanup_keeps_pinned_directory_when_path_is_replaced(tmp_path, monkeypatch):
