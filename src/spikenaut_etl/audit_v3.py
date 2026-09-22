@@ -29,7 +29,13 @@ from .artifacts import (
     write_json,
     write_parquet,
 )
-from .v3_build import OUTCOMES_SCHEMA, PROPOSALS_SCHEMA, STATE_SCHEMA
+from .v3_build import (
+    OUTCOMES_SCHEMA,
+    PROPOSALS_SCHEMA,
+    STATE_SCHEMA,
+    BuildError,
+    split_episodes,
+)
 
 AUDIT_VERSION = "1.0.0"
 VIEW_ID = "v3-forecast-eligible-v1"
@@ -631,6 +637,29 @@ type LoadedSplit = tuple[Path, Path, pa.Table, pa.Table]
 type RowKey = tuple[str, int]
 
 
+def _validate_canonical_split_layout(episodes_by_split: dict[str, set[str]]) -> None:
+    assigned = [
+        (split, episode_id, _episode_number(episode_id))
+        for split, episode_ids in episodes_by_split.items()
+        for episode_id in episode_ids
+    ]
+    if not assigned:
+        raise AuditError("v3 corpus has no assigned episodes")
+    try:
+        layout = split_episodes(max(number for _, _, number in assigned) + 1)
+    except BuildError as exc:
+        raise AuditError(f"cannot derive canonical episode split layout: {exc}") from exc
+    for actual_split, episode_id, episode_number in assigned:
+        expected_split = layout.split_of(episode_number)
+        if expected_split is None:
+            raise AuditError(f"embargo episode {episode_id!r} belongs to a split")
+        if actual_split != expected_split:
+            raise AuditError(
+                f"episode {episode_id!r} belongs to noncanonical split "
+                f"{actual_split}; expected {expected_split}"
+            )
+
+
 def _load_validated_splits(
     v3_root: Path, expected_hashes: dict[Path, str]
 ) -> tuple[dict[str, LoadedSplit], dict[str, set[str]]]:
@@ -667,6 +696,7 @@ def _load_validated_splits(
                     f"episode {episode_id!r} belongs to multiple splits: "
                     f"{previous}, {split}"
                 )
+    _validate_canonical_split_layout(episodes_by_split)
     return loaded, episodes_by_split
 
 

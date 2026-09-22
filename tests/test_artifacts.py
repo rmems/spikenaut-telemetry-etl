@@ -39,6 +39,17 @@ def test_retained_artifact_rejects_fifo_without_blocking(tmp_path):
             future.result()
 
 
+def test_retained_artifact_does_not_create_missing_parent(tmp_path):
+    missing_root = tmp_path / "missing"
+    artifact = missing_root / "nested" / "artifact.json"
+
+    with pytest.raises(FileNotFoundError):
+        with retain_regular_artifact(artifact):
+            pass
+
+    assert not missing_root.exists()
+
+
 def test_cleanup_keeps_pinned_directory_when_path_is_replaced(tmp_path, monkeypatch):
     from spikenaut_etl import artifacts
 

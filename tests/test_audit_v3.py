@@ -14,6 +14,11 @@ from spikenaut_etl.cli import main
 from spikenaut_etl.v3_build import OUTCOMES_SCHEMA, PROPOSALS_SCHEMA, STATE_SCHEMA
 
 SPLITS = ("train", "validation", "test")
+CANONICAL_EPISODE_BY_SPLIT = {
+    "train": "gpu-000000",
+    "validation": "gpu-000008",
+    "test": "gpu-000010",
+}
 
 
 def test_cli_reports_audit_os_error(
@@ -95,8 +100,8 @@ def _write_corpus(
     wrong_delta_at: int | None = None,
 ) -> None:
     steps = steps or list(range(66))
-    for split_index, split in enumerate(SPLITS):
-        episode = f"gpu-{split_index:06d}"
+    for split in SPLITS:
+        episode = CANONICAL_EPISODE_BY_SPLIT[split]
         state_dir = root / "v3" / "state_telemetry"
         outcomes_dir = root / "v3" / "outcomes"
         proposal_dir = root / "v3" / "action_proposals"
@@ -614,6 +619,37 @@ def test_episode_cannot_belong_to_two_splits(tmp_path: Path) -> None:
     )
 
     with pytest.raises(AuditError, match="multiple splits"):
+        audit_v3(source, tmp_path / "audit")
+
+
+def test_episode_must_belong_to_canonical_chronological_split(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        train = source / "v3" / config / "train-00000.parquet"
+        test = source / "v3" / config / "test-00000.parquet"
+        train_table = pq.read_table(train)
+        test_table = pq.read_table(test)
+        pq.write_table(test_table, train)
+        pq.write_table(train_table, test)
+
+    with pytest.raises(AuditError, match="noncanonical split"):
+        audit_v3(source, tmp_path / "audit")
+
+
+def test_embargo_episode_cannot_appear_in_a_split(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "validation-00000.parquet"
+        table = pq.read_table(path)
+        embargo_ids = pa.array(["gpu-000007"] * table.num_rows, type=pa.string())
+        table = table.set_column(
+            table.schema.get_field_index("episode_id"), "episode_id", embargo_ids
+        )
+        pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="embargo"):
         audit_v3(source, tmp_path / "audit")
 
 

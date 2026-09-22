@@ -78,12 +78,24 @@ class PreparationError(ValueError):
 
 def _sha256(path: Path) -> str:
     with retain_regular_artifact(path, require_single_link=False) as retained:
-        return retained.sha256()
+        digest = retained.sha256()
+    return digest
 
 
 def _read_source_bytes(path: Path) -> bytes:
     with retain_regular_artifact(path, require_single_link=False) as retained:
-        return retained.read_bytes()
+        content = retained.read_bytes()
+    return content
+
+
+def _read_parquet_source(path: Path) -> tuple[pa.Table, str]:
+    with retain_regular_artifact(path, require_single_link=False) as retained:
+        digest = retained.sha256()
+        with retained.open_reader() as stream:
+            table = pq.read_table(stream, columns=PARQUET_COLUMNS)
+        if retained.sha256() != digest:
+            raise OSError(f"source changed while reading: {path}")
+    return table, digest
 
 
 def _require_mapping(value: Any, context: str) -> dict[str, Any]:
@@ -275,11 +287,10 @@ def _read_rows(
     previous_timestamp: int | None = None
     for parquet_path in parquet_paths:
         try:
-            parquet_bytes = _read_source_bytes(parquet_path)
-            table = pq.read_table(pa.BufferReader(parquet_bytes), columns=PARQUET_COLUMNS)
+            table, parquet_sha256 = _read_parquet_source(parquet_path)
         except Exception as exc:  # pyarrow has several format/schema exception classes
             raise PreparationError(f"cannot read {parquet_path}: {exc}") from exc
-        snapshots.append((parquet_path, hashlib.sha256(parquet_bytes).hexdigest()))
+        snapshots.append((parquet_path, parquet_sha256))
         for raw in table.to_pylist():
             if raw.get("session_label") != session_id:
                 raise PreparationError(

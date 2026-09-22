@@ -601,6 +601,24 @@ def test_batch_suffix_is_bounded_before_integer_conversion(tmp_path: Path) -> No
     )
 
 
+def test_parquet_source_streams_from_retained_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _campaign(tmp_path, [("session-01", "train", _rows())])
+    original = anticipation._read_source_bytes
+
+    def reject_parquet_copy(path: Path) -> bytes:
+        if path.suffix == ".parquet":
+            raise AssertionError("Parquet source was copied into memory")
+        return original(path)
+
+    monkeypatch.setattr(anticipation, "_read_source_bytes", reject_parquet_copy)
+
+    prepared = prepare_campaign(campaign, tmp_path / "out")
+
+    assert prepared["sessions"][0]["session_id"] == "session-01"
+
+
 def test_late_parquet_batch_fails_final_membership_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

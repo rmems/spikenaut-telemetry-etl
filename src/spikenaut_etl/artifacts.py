@@ -141,6 +141,18 @@ class RetainedArtifact:
         self.verify()
         return b"".join(chunks)
 
+    @contextmanager
+    def open_reader(self) -> Iterator[IO[bytes]]:
+        """Yield a binary stream over the retained inode without copying it."""
+        self.verify()
+        os.lseek(self._descriptor, 0, os.SEEK_SET)
+        stream = os.fdopen(self._descriptor, "rb", closefd=False)
+        try:
+            yield stream
+        finally:
+            stream.close()
+            self.verify()
+
     def sha256(self) -> str:
         """Hash the retained inode without resolving the artifact path again."""
         self.verify()
@@ -164,7 +176,7 @@ def retain_regular_artifact(
         or "\x00" in path.name
     ):
         raise OSError("artifact name must be a single path component")
-    directory = _open_directory(path.parent)
+    directory = _open_directory(path.parent, create=False)
     descriptor: int | None = None
     try:
         _check_directory(path.parent, directory)
@@ -195,7 +207,7 @@ def _check_directory(path: Path, descriptor: int) -> None:
         raise OSError(f"artifact directory changed during publication: {path}")
 
 
-def _open_directory(path: Path) -> int:
+def _open_directory(path: Path, *, create: bool = True) -> int:
     """Walk from the filesystem root without following any symlink component."""
     _check_pinned_root(path)
     absolute = path.absolute()
@@ -205,11 +217,12 @@ def _open_directory(path: Path) -> int:
             if component == "..":
                 raise OSError("parent traversal is not allowed for artifact paths")
             created = False
-            try:
-                os.mkdir(component, dir_fd=descriptor)
-                created = True
-            except FileExistsError:
-                pass
+            if create:
+                try:
+                    os.mkdir(component, dir_fd=descriptor)
+                    created = True
+                except FileExistsError:
+                    pass
             if created:
                 os.fsync(descriptor)
             child = os.open(
