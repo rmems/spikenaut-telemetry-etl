@@ -1,5 +1,7 @@
 # spikenaut-telemetry-etl
 
+[![Maintainability](https://qlty.sh/gh/rmems/projects/spikenaut-telemetry-etl/maintainability.svg)](https://qlty.sh/gh/rmems/projects/spikenaut-telemetry-etl)
+
 Cleaning and validation pipeline for Spikenaut SNN telemetry, sitting between the
 Rust collectors that produce it and the Hugging Face dataset that publishes it.
 
@@ -98,6 +100,8 @@ Plus, structurally:
 ---
 
 ## Usage
+
+Python 3.14 or newer is required.
 
 ```bash
 pip install -e ".[dev]"
@@ -242,3 +246,53 @@ Fold this back into beads once the vault remote is fixed, if one tracker is want
 ## License
 
 MIT OR Apache-2.0.
+
+## Forecasting research operations
+
+`prepare-anticipation` consumes a preassigned campaign JSON whose `sessions` have
+`session_id`, `split` (`train`, `validation`, `test`), `seed`, and collector-directory
+`path`. Set `min_examples_per_session` before capture; the pilot uses 500. Collector
+labels must match the stable campaign ID, while the timestamped collector ID is
+retained separately in provenance.
+
+```sh
+spikenaut-etl prepare-anticipation --input campaign.json --output artifacts/prepared
+spikenaut-etl audit-v3 --input /path/to/Spikenaut-SNN-Telemetry --output artifacts/v3-audit
+```
+
+Both operations need the `v3` extra for Parquet support and write versioned quality
+reports and manifests. Failures produce `status: incomplete` and explicit reasons.
+Fresh preparation checks finalized schema-v1 manifests, zero restarts/write failures,
+100 ms polling, `ai-compute` workload class, and persisted versus declared row counts.
+It retains causal 100 ms frames, original timestamps, source ages, invalid gaps, and
+segment IDs. Observations older than 200 ms are rejected; history cannot cross gaps
+or sessions. Targets use the first actual observation at or after +1/+5 seconds,
+with no more than 100 ms lateness. Missing or invalid future observations invalidate
+the example. Clock reversals fail the session rather than reordering acquisition.
+
+The separate `anticipation-observed-gpu-v1` feature map is VRAM occupancy (MiB), GPU
+power (W), GPU temperature (C), graphics clock (MHz), and memory clock (MHz). It does
+not reinterpret occupancy as utilization or graphics clock as SM clock. Training
+sessions alone fit input/target means and standard deviations; constant scales are
+recorded and replaced with 1. Quality reports include input rejection rates and
+held-out values outside the training range. All original session assignments remain
+in complete or incomplete evidence. `prepared.json` is emitted only for a complete
+campaign meeting every assigned session's predeclared minimum.
+
+`audit-v3` reads historical state/outcome/action shards without changing them. It
+checks duplicate join keys, exact joins, episode split membership, all numeric sensor
+distributions, missing values, and existing temperature targets at exactly 64 original
+samples. Its additive `v3-forecast-eligible-v1` view preserves published splits,
+episode/step IDs, source row indices, null timestamps/rewards/actions, and source
+hashes. The historical required forecasting fields are `gpu_temp_c`, `power_w`,
+`sm_clock_mhz`, and `mem_clock_mhz`; missing/nonfinite values and suspicious zeros in
+these fields exclude every affected window. Other optional numeric fields are audited
+without treating legitimate zero counters/utilization or absent sensors as corruption.
+Historical column names are preserved without asserting equivalence to the fresh
+feature map. Filtering never closes an original index gap or turns 64 samples into
+seconds. `exclusions.parquet` contains every excluded source key and its reasons.
+The published test split is not rebalanced in response to the audit.
+
+The Spikenaut experiment repository owns the workload generator, SNN readout training,
+baselines, candidate checkpoints, and comparison report. Large capture/view artifacts
+remain local for this pilot; publication is a separate operation.

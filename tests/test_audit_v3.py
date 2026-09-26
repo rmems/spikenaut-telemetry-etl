@@ -1,0 +1,2141 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+import spikenaut_etl.audit_v3 as audit_module
+from spikenaut_etl.audit_v3 import AuditError, audit_v3
+from spikenaut_etl.cli import main
+from spikenaut_etl.v3_build import OUTCOMES_SCHEMA, PROPOSALS_SCHEMA, STATE_SCHEMA
+
+SPLITS = ("train", "validation", "test")
+CANONICAL_EPISODE_BY_SPLIT = {
+    "train": "gpu-000000",
+    "validation": "gpu-000008",
+    "test": "gpu-000010",
+}
+
+
+def test_cli_reports_audit_os_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fail_audit(*_args: object, **_kwargs: object) -> None:
+        raise OSError("source filesystem unavailable")
+
+    monkeypatch.setattr(audit_module, "audit_v3", fail_audit)
+
+    assert (
+        main(
+            [
+                "audit-v3",
+                "--input",
+                str(tmp_path / "v3"),
+                "--output",
+                str(tmp_path / "audit"),
+            ]
+        )
+        == 1
+    )
+    assert capsys.readouterr().err == "audit-v3 failed: source filesystem unavailable\n"
+
+
+def _state_table(
+    episode: str, steps: list[int], *, zero_at: int | None = None
+) -> pa.Table:
+    rows = []
+    for step in steps:
+        row = {field.name: None for field in STATE_SCHEMA}
+        row.update(
+            episode_id=episode,
+            step_idx=step,
+            schema_version="3.0.0",
+            mem_util_pct=float(20 + step % 5),
+            power_w=0.0 if step == zero_at else float(100 + step),
+            gpu_temp_c=float(40 + step),
+            sm_clock_mhz=1500.0,
+            mem_clock_mhz=9000.0,
+            synthetic=False,
+        )
+        rows.append(row)
+    return pa.Table.from_pylist(rows, schema=STATE_SCHEMA)
+
+
+def _outcomes_table(
+    episode: str,
+    steps: list[int],
+    *,
+    wrong_delta_at: int | None = None,
+) -> pa.Table:
+    rows = []
+    present = set(steps)
+    for step in steps:
+        row = {field.name: None for field in OUTCOMES_SCHEMA}
+        delta = 64.0 if step + 64 in present else None
+        if step == wrong_delta_at:
+            delta = 63.0
+        row.update(
+            episode_id=episode,
+            step_idx=step,
+            schema_version="3.0.0",
+            d_gpu_temp_c=delta,
+            discount=1.0,
+            is_terminal=False,
+            is_first=step == min(steps),
+            is_last=step == max(steps),
+        )
+        rows.append(row)
+    return pa.Table.from_pylist(rows, schema=OUTCOMES_SCHEMA)
+
+
+def _write_corpus(
+    root: Path,
+    *,
+    steps: list[int] | None = None,
+    zero_at: int | None = None,
+    wrong_delta_at: int | None = None,
+) -> None:
+    steps = steps or list(range(66))
+    for split in SPLITS:
+        episode = CANONICAL_EPISODE_BY_SPLIT[split]
+        state_dir = root / "v3" / "state_telemetry"
+        outcomes_dir = root / "v3" / "outcomes"
+        proposal_dir = root / "v3" / "action_proposals"
+        proposal_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            PROPOSALS_SCHEMA.empty_table(), proposal_dir / f"{split}-00000.parquet"
+        )
+        state_dir.mkdir(parents=True, exist_ok=True)
+        outcomes_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            _state_table(episode, steps, zero_at=zero_at if split == "train" else None),
+            state_dir / f"{split}-00000.parquet",
+        )
+        pq.write_table(
+            _outcomes_table(
+                episode,
+                steps,
+                wrong_delta_at=wrong_delta_at if split == "train" else None,
+            ),
+            outcomes_dir / f"{split}-00000.parquet",
+        )
+
+
+def test_audit_preserves_rows_splits_indices_and_missing_fields(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+
+    report = audit_v3(source, output)
+
+    eligible = pq.read_table(output / "v3-forecast-eligible-v1" / "train-00000.parquet")
+    assert eligible.column("source_split").to_pylist() == ["train", "train"]
+    assert eligible.column("source_row_index").to_pylist() == [0, 1]
+    assert eligible.column("step_idx").to_pylist() == [0, 1]
+    assert eligible.column("target_step_idx").to_pylist() == [64, 65]
+    assert eligible.column("d_gpu_temp_c_64").to_pylist() == [64.0, 64.0]
+    assert eligible.column("reward").null_count == 2
+    assert report.splits["train"]["source_rows"] == 66
+    assert report.splits["train"]["eligible_rows"] == 2
+    assert report.splits["train"]["gpu_temp_c"]["min"] == 40.0
+    assert report.splits["train"]["gpu_temp_c"]["max"] == 105.0
+    assert report.splits["train"]["numeric_sensor_columns"]["mem_util_pct"] == {
+        "count": 66,
+        "null_count": 0,
+        "non_finite_count": 0,
+        "zero_count": 0,
+        "min": 20.0,
+        "max": 24.0,
+        "mean": pytest.approx(21.9696969697),
+    }
+    assert report.splits["train"]["numeric_sensor_columns"]["cpu_temp_c"] == {
+        "count": 66,
+        "null_count": 66,
+        "non_finite_count": 0,
+        "zero_count": 0,
+        "min": None,
+        "max": None,
+        "mean": None,
+    }
+    assert report.integrity == {
+        "duplicate_keys": "passed",
+        "state_outcome_joins": "passed",
+        "episode_split_membership": "passed",
+        "episodes_by_split": {"test": 1, "train": 1, "validation": 1},
+        "overlapping_episode_count": 0,
+    }
+    assert report.splits["train"]["missing_fields"] == {
+        "action_label_missing_count": 66,
+        "reward_missing_count": 66,
+        "timestamp_missing_count": 66,
+    }
+
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["view_id"] == "v3-forecast-eligible-v1"
+    assert manifest["horizon_samples"] == 64
+    state_path = source / "v3" / "state_telemetry" / "train-00000.parquet"
+    expected_hash = hashlib.sha256(state_path.read_bytes()).hexdigest()
+    assert (
+        manifest["source_files"]["v3/state_telemetry/train-00000.parquet"]
+        == expected_hash
+    )
+
+
+def test_suspicious_reading_excludes_every_64_sample_window_that_contains_it(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source, zero_at=32)
+
+    report = audit_v3(source, output)
+
+    eligible = pq.read_table(output / "v3-forecast-eligible-v1" / "train-00000.parquet")
+    assert eligible.num_rows == 0
+    assert eligible.schema.field("source_split").type == pa.string()
+    exclusions = pq.read_table(output / "exclusions.parquet").to_pylist()
+    row_zero = next(
+        row
+        for row in exclusions
+        if row["source_split"] == "train" and row["step_idx"] == 0
+    )
+    assert row_zero["reasons"] == ["window_contains_zero_power_w"]
+    assert report.splits["train"]["exclusion_reasons"] == {
+        "missing_exact_64_sample_target": 64,
+        "window_contains_zero_power_w": 2,
+        "zero_power_w": 1,
+    }
+
+
+def test_gap_is_not_compressed_into_a_false_64_sample_target(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source, steps=[0, *range(2, 67)])
+
+    audit_v3(source, output)
+
+    eligible = pq.read_table(output / "v3-forecast-eligible-v1" / "train-00000.parquet")
+    # Step 0 has a real +64 endpoint, but its 64-sample window contains the
+    # missing step 1 and is excluded. Step 2 targets the exact source step 66;
+    # the 65th retained row is never allowed to stand in for another index.
+    assert eligible.column("step_idx").to_pylist() == [2]
+    assert eligible.column("target_step_idx").to_pylist() == [66]
+    assert eligible.column("source_row_index").to_pylist() == [2]
+    exclusions = pq.read_table(output / "exclusions.parquet").to_pylist()
+    row_zero = next(
+        row
+        for row in exclusions
+        if row["source_split"] == "train" and row["step_idx"] == 0
+    )
+    assert row_zero["reasons"] == ["window_has_index_gap"]
+
+
+@pytest.mark.parametrize("duplicate_side", ["state", "outcomes"])
+def test_duplicate_join_keys_fail_closed(tmp_path: Path, duplicate_side: str) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = (
+        source
+        / "v3"
+        / ("state_telemetry" if duplicate_side == "state" else "outcomes")
+        / "train-00000.parquet"
+    )
+    table = pq.read_table(path)
+    pq.write_table(pa.concat_tables([table, table.slice(0, 1)]), path)
+
+    output = tmp_path / "audit"
+    with pytest.raises(AuditError, match="duplicate"):
+        audit_v3(source, output)
+    report = json.loads((output / "audit-report.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert report["status"] == "incomplete"
+    assert report["failure"]["category"] == "structural_integrity"
+    assert "duplicate" in report["failure"]["reason"]
+    assert manifest["status"] == "incomplete"
+    assert manifest["outputs"] == {}
+
+
+def test_state_outcome_join_mismatch_fails_closed(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3" / "outcomes" / "train-00000.parquet"
+    pq.write_table(pq.read_table(path).slice(0, 65), path)
+
+    with pytest.raises(AuditError, match="join keys"):
+        audit_v3(source, tmp_path / "audit")
+
+
+def test_missing_source_root_writes_incomplete_evidence(tmp_path: Path) -> None:
+    output = tmp_path / "audit"
+
+    with pytest.raises(AuditError, match="cannot find v3 state_telemetry"):
+        audit_v3(tmp_path / "missing-source", output)
+
+    report = json.loads((output / "audit-report.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert report["status"] == "incomplete"
+    assert manifest["status"] == "incomplete"
+    assert manifest["source_files"] == {}
+
+
+def test_cyclic_source_path_writes_incomplete_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "source-loop"
+    source.symlink_to(source, target_is_directory=True)
+    output = tmp_path / "audit"
+
+    with pytest.raises(AuditError, match="source path has a symlink loop"):
+        audit_v3(source, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_invalid_source_output_overlap_is_rejected_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "invalid-source"
+    source.mkdir()
+    sentinels = {
+        "manifest.json": b"source manifest",
+        "audit-report.json": b"source audit report",
+        "exclusions.parquet": b"source exclusions",
+    }
+    for name, content in sentinels.items():
+        (source / name).write_bytes(content)
+
+    with pytest.raises(AuditError, match="overlap supplied source path"):
+        audit_v3(source, source)
+
+    assert {name: (source / name).read_bytes() for name in sentinels} == sentinels
+
+
+def test_invalid_nested_source_cannot_clean_ancestor_output(tmp_path: Path) -> None:
+    output = tmp_path / "corpus"
+    source = output / "invalid-source"
+    source.mkdir(parents=True)
+    sentinels = {
+        "manifest.json": b"source manifest",
+        "audit-report.json": b"source audit report",
+        "exclusions.parquet": b"source exclusions",
+    }
+    for name, content in sentinels.items():
+        (output / name).write_bytes(content)
+
+    with pytest.raises(AuditError, match="overlap supplied source path"):
+        audit_v3(source, output)
+
+    assert {name: (output / name).read_bytes() for name in sentinels} == sentinels
+
+
+def test_missing_timestamp_column_fails_closed_with_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    path = source / "v3" / "state_telemetry" / "train-00000.parquet"
+    table = pq.read_table(path).drop_columns(["ts_utc"])
+    pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="missing required columns: ts_utc"):
+        audit_v3(source, output)
+
+    report = json.loads((output / "audit-report.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert report["status"] == "incomplete"
+    assert manifest["status"] == "incomplete"
+
+
+def test_required_sensor_columns_must_have_numeric_arrow_types(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    path = source / "v3" / "state_telemetry" / "train-00000.parquet"
+    table = pq.read_table(path)
+    table = table.set_column(
+        table.schema.get_field_index("gpu_temp_c"),
+        "gpu_temp_c",
+        pa.array(["42.0"] * table.num_rows, type=pa.string()),
+    )
+    pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="gpu_temp_c must have a numeric Arrow type"):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+
+
+def test_unexpected_source_shard_fails_closed(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    source_shard = source / "v3" / "state_telemetry" / "train-00000.parquet"
+    extra_shard = source / "v3" / "state_telemetry" / "train-00001.parquet"
+    extra_shard.write_bytes(source_shard.read_bytes())
+
+    with pytest.raises(AuditError, match="unexpected source shards"):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+
+
+def test_unexpected_action_proposal_shard_fails_closed(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    proposal_dir = source / "v3" / "action_proposals"
+    proposal_dir.mkdir(exist_ok=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "episode_id": "gpu-000000",
+                    "step_idx": 0,
+                    "schema_version": "3.0.0",
+                    "proposed_action": "hold",
+                    "teacher_action": None,
+                }
+            ]
+        ),
+        proposal_dir / "train-00001.parquet",
+    )
+
+    with pytest.raises(AuditError, match="unexpected source shards"):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+
+
+def test_rebuild_removes_every_stale_owned_view_shard(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    stale = output / "v3-forecast-eligible-v1" / "train-00001.parquet"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"stale shard")
+
+    audit_v3(source, output)
+
+    assert not stale.exists()
+
+
+def test_symlinked_view_directory_is_rejected_without_touching_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    target = source / "v3" / "state_telemetry"
+    before = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in target.glob("*.parquet")
+    }
+    output.mkdir()
+    (output / "v3-forecast-eligible-v1").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(AuditError, match="must not be a symlink"):
+        audit_v3(source, output)
+
+    after = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in target.glob("*.parquet")
+    }
+    assert after == before
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+
+
+@pytest.mark.parametrize(
+    "artifact_name", ["manifest.json", "audit-report.json", "exclusions.parquet"]
+)
+def test_dangling_root_artifact_symlink_is_removed_without_following(
+    tmp_path: Path, artifact_name: str
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    outside = tmp_path / "outside" / artifact_name
+    _write_corpus(source)
+    output.mkdir()
+    (output / artifact_name).symlink_to(outside)
+
+    audit_v3(source, output)
+
+    assert not outside.exists()
+    assert not (output / artifact_name).is_symlink()
+    assert (output / artifact_name).is_file()
+
+
+def test_dangling_view_shard_symlink_is_removed_without_following(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    outside = tmp_path / "outside" / "train-00000.parquet"
+    _write_corpus(source)
+    shard = output / "v3-forecast-eligible-v1" / "train-00000.parquet"
+    shard.parent.mkdir(parents=True)
+    shard.symlink_to(outside)
+
+    audit_v3(source, output)
+
+    assert not outside.exists()
+    assert not shard.is_symlink()
+    assert shard.is_file()
+
+
+def test_incomplete_evidence_tolerates_unreadable_source_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original_sha256 = audit_module._sha256
+
+    def fail_train_hash(path: Path) -> str:
+        if path.name == "train-00000.parquet":
+            raise OSError("source disappeared")
+        return original_sha256(path)
+
+    monkeypatch.setattr(audit_module, "_sha256", fail_train_hash)
+
+    with pytest.raises(AuditError, match="cannot write audit outputs"):
+        audit_v3(source, output)
+
+    report = json.loads((output / "audit-report.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert report["status"] == "incomplete"
+    assert manifest["status"] == "incomplete"
+    assert not any(
+        name.endswith("train-00000.parquet") for name in manifest["source_files"]
+    )
+
+
+def test_source_hash_change_during_audit_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original_hashes = audit_module._available_source_hashes
+    calls = 0
+
+    def changed_hashes(
+        dataset_root: Path, v3_root: Path, *, tolerate_unreadable: bool = False
+    ) -> dict[str, str]:
+        nonlocal calls
+        hashes = original_hashes(
+            dataset_root, v3_root, tolerate_unreadable=tolerate_unreadable
+        )
+        calls += 1
+        if calls == 2:
+            first = next(iter(hashes))
+            hashes[first] = "0" * 64
+        return hashes
+
+    monkeypatch.setattr(audit_module, "_available_source_hashes", changed_hashes)
+
+    with pytest.raises(AuditError, match="source shards changed during audit"):
+        audit_v3(source, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_late_unexpected_source_shard_fails_final_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original_hashes = audit_module._available_source_hashes
+    calls = 0
+
+    def add_shard_before_final_snapshot(
+        dataset_root: Path, v3_root: Path, *, tolerate_unreadable: bool = False
+    ) -> dict[str, str]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            canonical = v3_root / "state_telemetry" / "train-00000.parquet"
+            (canonical.parent / "train-00001.parquet").write_bytes(canonical.read_bytes())
+        return original_hashes(
+            dataset_root, v3_root, tolerate_unreadable=tolerate_unreadable
+        )
+
+    monkeypatch.setattr(
+        audit_module, "_available_source_hashes", add_shard_before_final_snapshot
+    )
+
+    with pytest.raises(AuditError, match="unexpected source shards"):
+        audit_v3(source, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_source_shard_membership_is_rechecked_after_directory_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original_sha256 = audit_module._sha256
+    inserted = False
+
+    def add_shard_during_hash(path: Path) -> str:
+        nonlocal inserted
+        digest = original_sha256(path)
+        if not inserted and path.parent.name == "state_telemetry":
+            inserted = True
+            (path.parent / "train-00001.parquet").write_bytes(path.read_bytes())
+        return digest
+
+    monkeypatch.setattr(audit_module, "_sha256", add_shard_during_hash)
+
+    with pytest.raises(AuditError, match="membership changed during hashing"):
+        audit_v3(source, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_episode_cannot_belong_to_two_splits(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    train_state = pq.read_table(source / "v3" / "state_telemetry" / "train-00000.parquet")
+    train_outcomes = pq.read_table(source / "v3" / "outcomes" / "train-00000.parquet")
+    pq.write_table(
+        train_state,
+        source / "v3" / "state_telemetry" / "validation-00000.parquet",
+    )
+    pq.write_table(
+        train_outcomes,
+        source / "v3" / "outcomes" / "validation-00000.parquet",
+    )
+
+    with pytest.raises(AuditError, match="multiple splits"):
+        audit_v3(source, tmp_path / "audit")
+
+
+def test_episode_must_belong_to_canonical_chronological_split(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        train = source / "v3" / config / "train-00000.parquet"
+        test = source / "v3" / config / "test-00000.parquet"
+        train_table = pq.read_table(train)
+        test_table = pq.read_table(test)
+        pq.write_table(test_table, train)
+        pq.write_table(train_table, test)
+
+    with pytest.raises(AuditError, match="noncanonical split"):
+        audit_v3(source, tmp_path / "audit")
+
+
+def test_embargo_episode_cannot_appear_in_a_split(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "validation-00000.parquet"
+        table = pq.read_table(path)
+        embargo_ids = pa.array(["gpu-000007"] * table.num_rows, type=pa.string())
+        table = table.set_column(
+            table.schema.get_field_index("episode_id"), "episode_id", embargo_ids
+        )
+        pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="embargo"):
+        audit_v3(source, tmp_path / "audit")
+
+
+def test_noncanonical_episode_identifier_fails_closed(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "validation-00000.parquet"
+        table = pq.read_table(path)
+        aliases = pa.array(["gpu-0"] * table.num_rows, type=pa.string())
+        table = table.set_column(
+            table.schema.get_field_index("episode_id"), "episode_id", aliases
+        )
+        pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="noncanonical episode_id"):
+        audit_v3(source, output)
+
+    report = json.loads((output / "audit-report.json").read_text())
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert report["status"] == "incomplete"
+    assert manifest["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    ("episode_id", "match"),
+    [
+        ("gpu-²", "cannot recover source row_index"),
+        ("gpu-" + "9" * 5_000, "noncanonical"),
+    ],
+)
+def test_unparseable_digit_episode_identifier_fails_closed(
+    tmp_path: Path, episode_id: str, match: str
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "validation-00000.parquet"
+        table = pq.read_table(path)
+        values = pa.array([episode_id] * table.num_rows, type=pa.string())
+        table = table.set_column(
+            table.schema.get_field_index("episode_id"), "episode_id", values
+        )
+        pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match=match):
+        audit_v3(source, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_null_episode_identifier_fails_closed_with_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "validation-00000.parquet"
+        table = pq.read_table(path)
+        nulls = pa.nulls(table.num_rows, type=pa.string())
+        table = table.set_column(
+            table.schema.get_field_index("episode_id"), "episode_id", nulls
+        )
+        pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="episode_id must be a non-empty string"):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_null_step_index_fails_closed_with_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "validation-00000.parquet"
+        table = pq.read_table(path)
+        values = table.column("step_idx").to_pylist()
+        values[0] = None
+        table = table.set_column(
+            table.schema.get_field_index("step_idx"),
+            "step_idx",
+            pa.array(values, type=pa.int32()),
+        )
+        pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="step_idx must be an integer"):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("proposal_defect", ["duplicate", "orphan"])
+def test_action_proposal_keys_must_be_unique_and_match_state(
+    tmp_path: Path, proposal_defect: str
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    proposal_dir = source / "v3" / "action_proposals"
+    proposal_dir.mkdir(exist_ok=True)
+    rows = [
+        {
+            "episode_id": "gpu-000000",
+            "step_idx": 0,
+            "schema_version": "3.0.0",
+            "proposed_action": "hold",
+            "teacher_action": None,
+        }
+    ]
+    rows.append(
+        dict(rows[0])
+        if proposal_defect == "duplicate"
+        else {
+            "episode_id": "gpu-999999",
+            "step_idx": 0,
+            "schema_version": "3.0.0",
+            "proposed_action": "hold",
+            "teacher_action": None,
+        }
+    )
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=PROPOSALS_SCHEMA),
+        proposal_dir / "train-00000.parquet",
+    )
+
+    expected = "duplicate" if proposal_defect == "duplicate" else "orphan"
+    with pytest.raises(AuditError, match=expected):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_empty_required_split_fails_closed_with_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "validation-00000.parquet"
+        pq.write_table(pq.read_table(path).slice(0, 0), path)
+
+    with pytest.raises(AuditError, match="validation source split is empty"):
+        audit_v3(source, output)
+
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_wrong_existing_64_sample_outcome_is_excluded_and_reported(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source, wrong_delta_at=0)
+
+    report = audit_v3(source, output)
+
+    eligible = pq.read_table(output / "v3-forecast-eligible-v1" / "train-00000.parquet")
+    assert eligible.column("step_idx").to_pylist() == [1]
+    assert report.splits["train"]["exclusion_reasons"]["outcome_delta_mismatch"] == 1
+
+
+def test_window_gap_does_not_hide_later_sensor_rejection(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    steps = [0, *range(2, 66)]
+    _write_corpus(source, steps=steps, zero_at=2)
+
+    report = audit_v3(source, output)
+
+    reasons = report.splits["train"]["exclusion_reasons"]
+    assert reasons["window_has_index_gap"] >= 1
+    assert reasons["window_contains_zero_power_w"] >= 1
+
+
+def test_non_finite_sensor_is_excluded(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    path = source / "v3" / "state_telemetry" / "train-00000.parquet"
+    table = pq.read_table(path)
+    values = table.column("gpu_temp_c").to_pylist()
+    values[10] = float("nan")
+    table = table.set_column(
+        table.schema.get_field_index("gpu_temp_c"),
+        "gpu_temp_c",
+        pa.array(values, type=pa.float32()),
+    )
+    pq.write_table(table, path)
+
+    report = audit_v3(source, output)
+
+    assert (
+        report.splits["train"]["exclusion_reasons"][
+            "window_contains_non_finite_gpu_temp_c"
+        ]
+        == 2
+    )
+    assert report.splits["train"]["exclusion_reasons"]["non_finite_gpu_temp_c"] == 1
+
+
+def test_distribution_mean_is_overflow_resistant() -> None:
+    # Exercise float64 aggregation directly; published v3 sensor fields are float32.
+    result = audit_module._distribution(pa.array([1e308] * 66, type=pa.float64()))
+    assert result["mean"] == 1e308
+
+
+@pytest.mark.parametrize(
+    "relative_output", [".", "v3", "v3/state_telemetry/audit", "full_data/audit"]
+)
+def test_output_cannot_overlap_source_tree(tmp_path: Path, relative_output: str) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    output = source / relative_output
+    output.mkdir(parents=True, exist_ok=True)
+    sentinel = output / "manifest.json"
+    sentinel.write_text("source-owned evidence")
+
+    with pytest.raises(AuditError, match="overlap source"):
+        audit_v3(source, output)
+
+    assert sentinel.read_text() == "source-owned evidence"
+
+
+@pytest.mark.parametrize("location", ["target", "child", "parent"])
+def test_symlinked_v3_target_cannot_overlap_output(tmp_path: Path, location: str) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    target = tmp_path / "external" / "v3"
+    target.parent.mkdir()
+    (source / "v3").rename(target)
+    (source / "v3").symlink_to(target, target_is_directory=True)
+    output = {"target": target, "child": target / "audit", "parent": target.parent}[
+        location
+    ]
+    output.mkdir(exist_ok=True)
+    sentinel = output / "manifest.json"
+    sentinel.write_text("source sentinel")
+    with pytest.raises(AuditError, match="overlap"):
+        audit_v3(source, output)
+    assert sentinel.read_text() == "source sentinel"
+
+
+def test_missing_action_shard_is_incomplete(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    (source / "v3/action_proposals/train-00000.parquet").unlink()
+    output = tmp_path / "audit"
+    with pytest.raises(AuditError, match="missing source shard"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("config", ["state_telemetry", "outcomes", "action_proposals"])
+@pytest.mark.parametrize("version", ["missing", "4.0.0", None])
+def test_unsupported_source_schema_is_incomplete(
+    tmp_path: Path, config: str, version: str | None
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3" / config / "train-00000.parquet"
+    table = pq.read_table(path).drop(["schema_version"])
+    if config == "action_proposals":
+        table = pa.Table.from_pylist(
+            [
+                {
+                    "episode_id": "gpu-000000",
+                    "step_idx": 0,
+                    "proposed_action": None,
+                    "teacher_action": None,
+                }
+            ],
+            schema=PROPOSALS_SCHEMA,
+        ).drop(["schema_version"])
+    if version != "missing":
+        table = table.append_column(
+            "schema_version", pa.array([version] * table.num_rows, type=pa.string())
+        )
+    pq.write_table(table, path)
+    output = tmp_path / "audit"
+    with pytest.raises(AuditError, match="schema_version"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_string_reward_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/outcomes/train-00000.parquet"
+    table = pq.read_table(path)
+    table = table.set_column(
+        table.schema.get_field_index("reward"),
+        "reward",
+        pa.array(["1.0"] * table.num_rows),
+    )
+    pq.write_table(table, path)
+    with pytest.raises(AuditError, match="reward"):
+        audit_v3(source, tmp_path / "audit")
+
+
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+def test_audit_publication_rejects_replacement_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_kind: str
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    sentinel = tmp_path / "source-sentinel.json"
+    sentinel.write_text("source sentinel")
+    original = audit_module._clean_owned_outputs
+
+    def replace_after_cleanup(
+        root: Path, source_identities: set[tuple[int, int]] | None = None
+    ) -> None:
+        original(root, source_identities)
+        destination = root / "manifest.json"
+        if link_kind == "symlink":
+            destination.symlink_to(sentinel)
+        else:
+            destination.hardlink_to(sentinel)
+
+    monkeypatch.setattr(audit_module, "_clean_owned_outputs", replace_after_cleanup)
+    with pytest.raises(AuditError, match="cannot write audit outputs"):
+        audit_v3(source, output)
+    assert sentinel.read_text() == "source sentinel"
+
+
+def test_audit_parses_the_same_bytes_it_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    target = source / "v3/state_telemetry/train-00000.parquet"
+    original_bytes = target.read_bytes()
+    read_table = pq.read_table
+    changed = read_table(target)
+    changed = changed.set_column(
+        changed.schema.get_field_index("mem_util_pct"),
+        "mem_util_pct",
+        pa.array([77.0] * changed.num_rows),
+    )
+
+    changed_during_read = False
+
+    def replace_while_reading(path: object, *args: object, **kwargs: object) -> pa.Table:
+        nonlocal changed_during_read
+        if not changed_during_read:
+            changed_during_read = True
+            pq.write_table(changed, target)
+            try:
+                return read_table(path, *args, **kwargs)
+            finally:
+                target.write_bytes(original_bytes)
+        return read_table(path, *args, **kwargs)
+
+    monkeypatch.setattr(pq, "read_table", replace_while_reading)
+    audit_v3(source, output)
+    assert changed_during_read
+    view = read_table(output / "v3-forecast-eligible-v1/train-00000.parquet")
+    assert view.column("mem_util_pct").to_pylist() == [20.0, 21.0]
+
+
+def test_missing_source_with_view_symlink_writes_incomplete_evidence(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "audit"
+    output.mkdir()
+    target = tmp_path / "untouched"
+    target.mkdir()
+    sentinel = target / "manifest.json"
+    sentinel.write_text("preserve")
+    view = output / "v3-forecast-eligible-v1"
+    view.symlink_to(target, target_is_directory=True)
+    (output / "manifest.json").write_text('{"status": "complete"}')
+    with pytest.raises(AuditError, match="cannot find v3 state_telemetry"):
+        audit_v3(tmp_path / "missing-source", output)
+    assert view.is_symlink()
+    assert sentinel.read_text() == "preserve"
+    for name in ("manifest.json", "audit-report.json"):
+        assert json.loads((output / name).read_text())["status"] == "incomplete"
+
+
+def test_hash_pass_rechecks_earlier_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    original = audit_module._sha256
+    added = source / "v3/state_telemetry/train-00001.parquet"
+
+    def add_while_hashing_later_directory(path: Path) -> str:
+        digest = original(path)
+        if path.parent.name == "outcomes" and not added.exists():
+            added.write_bytes(b"new shard")
+        return digest
+
+    monkeypatch.setattr(audit_module, "_sha256", add_while_hashing_later_directory)
+    with pytest.raises(AuditError, match="membership changed"):
+        audit_module._available_source_hashes(source, source / "v3")
+
+
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+@pytest.mark.parametrize(
+    "artifact", ["v3-forecast-eligible-v1/train-00000.parquet", "exclusions.parquet"]
+)
+def test_parquet_publication_rejects_replacement_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_kind: str, artifact: str
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    sentinel = tmp_path / "source-sentinel.parquet"
+    sentinel.write_bytes(b"preserve source bytes")
+    original = audit_module._clean_owned_outputs
+
+    def replace_after_cleanup(
+        root: Path, source_identities: set[tuple[int, int]] | None = None
+    ) -> None:
+        original(root, source_identities)
+        destination = root / artifact
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if link_kind == "symlink":
+            destination.symlink_to(sentinel)
+        else:
+            destination.hardlink_to(sentinel)
+
+    monkeypatch.setattr(audit_module, "_clean_owned_outputs", replace_after_cleanup)
+    with pytest.raises(AuditError, match="cannot write audit outputs"):
+        audit_v3(source, output)
+    assert sentinel.read_bytes() == b"preserve source bytes"
+
+
+def test_publication_rejects_replaced_view_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    target = source / "v3/state_telemetry"
+    before = {p.name: p.read_bytes() for p in target.glob("*.parquet")}
+    original = audit_module._clean_owned_outputs
+    replaced = False
+
+    def swap_after_cleanup(
+        root: Path, source_identities: set[tuple[int, int]] | None = None
+    ) -> None:
+        nonlocal replaced
+        original(root, source_identities)
+        if not replaced:
+            view = root / "v3-forecast-eligible-v1"
+            if view.exists():
+                view.rmdir()
+            view.symlink_to(target, target_is_directory=True)
+            replaced = True
+
+    monkeypatch.setattr(audit_module, "_clean_owned_outputs", swap_after_cleanup)
+    with pytest.raises(
+        AuditError, match="cannot write audit outputs|retained source identity"
+    ):
+        audit_v3(source, output)
+    assert {p.name: p.read_bytes() for p in target.glob("*.parquet")} == before
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_late_view_replacement_republishes_incomplete_root_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    source_view = source / "v3/state_telemetry"
+    before = {path.name: path.read_bytes() for path in source_view.glob("*.parquet")}
+    original = audit_module._check_output_snapshot
+    replaced = False
+
+    def replace_view_after_report(*args: object, **kwargs: object) -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            view = output / audit_module.VIEW_ID
+            view.rename(tmp_path / "detached-view")
+            view.symlink_to(source_view, target_is_directory=True)
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(audit_module, "_check_output_snapshot", replace_view_after_report)
+
+    with pytest.raises(AuditError):
+        audit_v3(source, output)
+    assert {
+        path.name: path.read_bytes() for path in source_view.glob("*.parquet")
+    } == before
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_root_cleanup_preserves_source_moved_after_identity_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    shard = source / "v3/action_proposals/train-00000.parquet"
+    source_bytes = shard.read_bytes()
+    artifact = output / audit_module.AUDIT_REPORT_NAME
+    source_view = source / "v3/state_telemetry"
+    original_snapshot = audit_module._check_output_snapshot
+    original_clean = audit_module.clean_artifacts
+    replaced = False
+    moved = False
+
+    def replace_view_after_report(*args: object, **kwargs: object) -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            view = output / audit_module.VIEW_ID
+            view.rename(tmp_path / "detached-view")
+            view.symlink_to(source_view, target_is_directory=True)
+        original_snapshot(*args, **kwargs)
+
+    def move_source_before_root_cleanup(
+        path: Path, names: tuple[str, ...] | None = None, **kwargs: object
+    ) -> None:
+        nonlocal moved
+        if (
+            names == audit_module.ROOT_ARTIFACT_NAMES
+            and (output / audit_module.VIEW_ID).is_symlink()
+            and not moved
+        ):
+            moved = True
+            shard.rename(artifact)
+        original_clean(path, names, **kwargs)
+
+    monkeypatch.setattr(audit_module, "_check_output_snapshot", replace_view_after_report)
+    monkeypatch.setattr(audit_module, "clean_artifacts", move_source_before_root_cleanup)
+
+    with pytest.raises(AuditError):
+        audit_v3(source, output)
+    assert artifact.read_bytes() == source_bytes
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_source_change_during_publication_prevents_complete_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    target = source / "v3/state_telemetry/train-00000.parquet"
+    original = audit_module.write_parquet
+
+    def change_after_output(path: Path, table: pa.Table) -> None:
+        original(path, table)
+        target.write_bytes(target.read_bytes() + b"changed")
+
+    monkeypatch.setattr(audit_module, "write_parquet", change_after_output)
+    with pytest.raises(AuditError, match="source shards changed during publication"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_directory_swap_during_atomic_publish_keeps_source_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from spikenaut_etl import artifacts
+
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    target = source / "v3/state_telemetry"
+    before = {p.name: p.read_bytes() for p in target.glob("*.parquet")}
+    original = artifacts.os.link
+    swapped = False
+
+    def swap_before_link(src: str, dst: str, **kwargs: int | bool) -> None:
+        nonlocal swapped
+        if dst.endswith(".parquet") and not swapped:
+            view = output / "v3-forecast-eligible-v1"
+            view.rename(output / "detached-view")
+            view.symlink_to(target, target_is_directory=True)
+            swapped = True
+        original(src, dst, **kwargs)
+
+    monkeypatch.setattr(artifacts.os, "link", swap_before_link)
+    with pytest.raises(AuditError, match="directory changed during publication"):
+        audit_v3(source, output)
+    assert {p.name: p.read_bytes() for p in target.glob("*.parquet")} == before
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("timestamp", [None, 100])
+def test_eligible_view_preserves_action_labels_and_typed_missing_values(
+    tmp_path: Path,
+    timestamp: int | None,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "train-00000.parquet"
+        table = pq.read_table(path)
+        pq.write_table(
+            table.set_column(
+                table.schema.get_field_index("ts_utc"),
+                "ts_utc",
+                pa.array([timestamp] * table.num_rows, type=pa.int64()),
+            ),
+            path,
+        )
+    actions = pa.Table.from_pylist(
+        [
+            {
+                "episode_id": "gpu-000000",
+                "step_idx": 1,
+                "ts_utc": timestamp,
+                "schema_version": "3.0.0",
+                "proposed_action": "hold",
+                "teacher_action": "cool",
+            }
+        ],
+        schema=PROPOSALS_SCHEMA,
+    )
+    pq.write_table(actions, source / "v3/action_proposals/train-00000.parquet")
+    audit_v3(source, output)
+    view = pq.read_table(output / "v3-forecast-eligible-v1/train-00000.parquet")
+    assert view.column("proposed_action").to_pylist() == [None, "hold"]
+    assert view.column("teacher_action").to_pylist() == [None, "cool"]
+    assert (
+        view.schema.field("proposed_action").type
+        == PROPOSALS_SCHEMA.field("proposed_action").type
+    )
+
+
+def test_state_outcome_column_collision_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/state_telemetry/train-00000.parquet"
+    state = pq.read_table(path)
+    pq.write_table(state.append_column("reward", pa.array([42.0] * state.num_rows)), path)
+    with pytest.raises(AuditError, match="unexpected source fields"):
+        audit_v3(source, tmp_path / "audit")
+
+
+def test_audit_output_generation_cannot_change_between_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original = audit_module.write_json
+
+    def swap_after_report(path: Path, value: object) -> None:
+        original(path, value)
+        if path.name == "audit-report.json" and not (tmp_path / "detached").exists():
+            output.rename(tmp_path / "detached")
+            output.mkdir()
+
+    monkeypatch.setattr(audit_module, "write_json", swap_after_report)
+    with pytest.raises(AuditError, match="publication directory changed"):
+        audit_v3(source, output)
+    assert not (output / "manifest.json").exists()
+
+
+def test_audit_output_generation_cannot_change_at_manifest_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original = audit_module.write_json
+
+    def swap_before_manifest(path: Path, value: object) -> None:
+        if path.name == "manifest.json" and not (tmp_path / "detached").exists():
+            output.rename(tmp_path / "detached")
+            output.mkdir()
+        original(path, value)
+
+    monkeypatch.setattr(audit_module, "write_json", swap_before_manifest)
+    with pytest.raises(AuditError, match="publication directory changed"):
+        audit_v3(source, output)
+    assert not (output / "manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    "relative_name",
+    [
+        audit_module.AUDIT_REPORT_NAME,
+        audit_module.EXCLUSIONS_NAME,
+        f"{audit_module.VIEW_ID}/train-00000.parquet",
+    ],
+)
+def test_audit_artifacts_retained_through_manifest_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_name: str,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original = audit_module.write_json
+    replaced = False
+
+    def replace_after_manifest(path: Path, value: object) -> None:
+        nonlocal replaced
+        original(path, value)
+        if path.name == audit_module.MANIFEST_NAME and not replaced:
+            replaced = True
+            artifact = output / relative_name
+            replacement = tmp_path / f"replacement-{artifact.name}"
+            replacement.write_bytes(artifact.read_bytes())
+            replacement.replace(artifact)
+
+    monkeypatch.setattr(audit_module, "write_json", replace_after_manifest)
+    with pytest.raises(AuditError, match="output artifacts changed"):
+        audit_v3(source, output)
+
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    "name", ["proposed_action", "teacher_action", "label_confidence"]
+)
+def test_action_proposal_types_match_published_schema(tmp_path: Path, name: str) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/action_proposals/train-00000.parquet"
+    table = pq.read_table(path)
+    index = table.schema.get_field_index(name)
+    table = table.set_column(index, name, pa.array([], type=pa.int64()))
+    pq.write_table(table, path)
+    with pytest.raises(AuditError, match="proposal.*type"):
+        audit_v3(source, tmp_path / "audit")
+
+
+@pytest.mark.parametrize("mutation", ["order", "nullability"])
+def test_action_proposals_require_canonical_schema(tmp_path: Path, mutation: str) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/action_proposals/train-00000.parquet"
+    table = pq.read_table(path)
+    if mutation == "order":
+        table = table.select(list(reversed(table.column_names)))
+    else:
+        fields = list(table.schema)
+        fields[0] = fields[0].with_nullable(False)
+        table = pa.Table.from_arrays(table.columns, schema=pa.schema(fields))
+    pq.write_table(table, path)
+
+    with pytest.raises(AuditError, match="canonical.*schema"):
+        audit_v3(source, tmp_path / "audit")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "source_split",
+        "source_row_index",
+        "target_step_idx",
+        "forecast_horizon_samples",
+        "d_gpu_temp_c_64",
+    ],
+)
+def test_generated_column_names_are_reserved(tmp_path: Path, name: str) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/state_telemetry/train-00000.parquet"
+    table = pq.read_table(path)
+    pq.write_table(table.append_column(name, pa.array([1] * table.num_rows)), path)
+    with pytest.raises(AuditError, match="unexpected source fields"):
+        audit_v3(source, tmp_path / "audit")
+
+
+@pytest.mark.parametrize("mutation", ["replace", "extra"])
+def test_output_snapshot_rechecked_after_source_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    original = audit_module._available_source_hashes
+
+    def mutate_after_hash(*args: object, **kwargs: object) -> dict[str, str]:
+        result = original(*args, **kwargs)
+        if (output / "audit-report.json").exists():
+            view = output / audit_module.VIEW_ID
+            target = view / (
+                "train-00000.parquet" if mutation == "replace" else "extra.parquet"
+            )
+            target.write_bytes(b"changed")
+        return result
+
+    monkeypatch.setattr(audit_module, "_available_source_hashes", mutate_after_hash)
+    with pytest.raises(AuditError, match="output.*changed"):
+        audit_v3(source, output)
+
+
+def test_extra_action_proposal_field_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/action_proposals/train-00000.parquet"
+    table = pq.read_table(path)
+    pq.write_table(
+        table.append_column("unexpected", pa.array([], type=pa.string())), path
+    )
+    with pytest.raises(AuditError, match="unexpected action proposal fields"):
+        audit_v3(source, tmp_path / "audit")
+
+
+def test_cleanup_cannot_follow_replaced_output_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    output.mkdir()
+    sentinel = source / "manifest.json"
+    sentinel.write_text("source sentinel")
+    original = audit_module._guard_output_path
+
+    def swap_after_guard(*args: object) -> None:
+        original(*args)
+        output.rename(tmp_path / "detached")
+        output.symlink_to(source, target_is_directory=True)
+
+    monkeypatch.setattr(audit_module, "_guard_output_path", swap_after_guard)
+    with pytest.raises((AuditError, OSError)):
+        audit_v3(source, output)
+    assert sentinel.read_text() == "source sentinel"
+
+
+@pytest.mark.parametrize(
+    "config,field,mutation",
+    [
+        ("state_telemetry", "synthetic", "missing"),
+        ("state_telemetry", "step_idx", "type"),
+        ("outcomes", "d_tokens_per_s", "type"),
+    ],
+)
+def test_all_state_outcome_fields_match_schema(
+    tmp_path: Path, config: str, field: str, mutation: str
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3" / config / "train-00000.parquet"
+    table = pq.read_table(path)
+    if mutation == "missing":
+        table = table.drop([field])
+    else:
+        table = table.set_column(
+            table.schema.get_field_index(field), field, pa.array([1.0] * table.num_rows)
+        )
+    pq.write_table(table, path)
+    with pytest.raises(AuditError, match="schema field"):
+        audit_v3(source, tmp_path / "audit")
+
+
+def test_output_identity_survives_cleanup_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "audit"
+    _write_corpus(source)
+    sentinel = source / "manifest.json"
+    sentinel.write_text("source sentinel")
+    original = audit_module._clean_owned_outputs
+    swapped = False
+
+    def move_source_after_cleanup(
+        path: Path, source_identities: set[tuple[int, int]] | None = None
+    ) -> None:
+        nonlocal swapped
+        original(path, source_identities)
+        if not swapped:
+            swapped = True
+            output.rename(tmp_path / "detached")
+            source.rename(output)
+            source.symlink_to(output, target_is_directory=True)
+
+    monkeypatch.setattr(audit_module, "_clean_owned_outputs", move_source_after_cleanup)
+    with pytest.raises((AuditError, OSError)):
+        audit_v3(source, output)
+    assert (output / "manifest.json").read_text() == "source sentinel"
+
+
+@pytest.mark.parametrize("config", ["state_telemetry", "outcomes", "action_proposals"])
+def test_duplicate_schema_fields_publish_incomplete(tmp_path: Path, config: str) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3" / config / "train-00000.parquet"
+    table = pq.read_table(path)
+    pq.write_table(table.append_column("step_idx", table.column("step_idx")), path)
+    output = tmp_path / "audit"
+    with pytest.raises(AuditError):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_git_provenance_rejects_ancestor_repository(tmp_path: Path) -> None:
+    import subprocess
+
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    dataset = tmp_path / "nested-dataset"
+    dataset.mkdir()
+    assert audit_module._git_head(dataset) is None
+    assert audit_module._git_head(tmp_path) is not None
+
+
+def test_invalid_source_keeps_original_output_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "out"
+    output.mkdir()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "manifest.json").write_text("sentinel")
+    original = audit_module.ensure_directory
+    moved = False
+
+    def replace_before_ensure(path: Path) -> None:
+        nonlocal moved
+        if not moved:
+            moved = True
+            output.rename(tmp_path / "detached")
+            replacement.rename(output)
+        original(path)
+
+    monkeypatch.setattr(audit_module, "ensure_directory", replace_before_ensure)
+    with pytest.raises((AuditError, OSError)):
+        audit_v3(tmp_path / "missing-source", output)
+    assert (output / "manifest.json").read_text() == "sentinel"
+
+
+def test_git_provenance_marks_untracked_content_unknown(tmp_path: Path) -> None:
+    test_git_provenance_rejects_ancestor_repository(tmp_path)
+    (tmp_path / "untracked.parquet").write_text("untracked")
+    assert audit_module._git_head(tmp_path) is None
+
+
+@pytest.mark.parametrize("config", ["state_telemetry", "outcomes", "action_proposals"])
+@pytest.mark.parametrize("link_kind", ["directory", "file"])
+def test_source_links_into_output_are_preserved(
+    tmp_path: Path, config: str, link_kind: str
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    output = tmp_path / "audit"
+    view = output / audit_module.VIEW_ID
+    view.mkdir(parents=True)
+    config_path = source / "v3" / config
+    if link_kind == "directory":
+        target = view / config
+        config_path.rename(target)
+        config_path.symlink_to(target, target_is_directory=True)
+    else:
+        shard = config_path / "train-00000.parquet"
+        target = view / "source.parquet"
+        shard.rename(target)
+        shard.symlink_to(target)
+    before = {path: path.read_bytes() for path in view.rglob("*.parquet")}
+    with pytest.raises(AuditError, match="overlap"):
+        audit_v3(source, output)
+    assert {path: path.read_bytes() for path in before} == before
+    assert not (output / "manifest.json").exists()
+
+
+@pytest.mark.parametrize("config", ["state_telemetry", "outcomes", "action_proposals"])
+def test_source_shard_renamed_to_root_artifact_before_pin_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: str
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    shard = source / "v3" / config / "train-00000.parquet"
+    source_bytes = shard.read_bytes()
+    output = tmp_path / "audit"
+    output.mkdir()
+    artifact = output / "manifest.json"
+    original = audit_module._guard_output_path
+    calls = 0
+
+    def move_before_post_pin_guard(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            shard.rename(artifact)
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(audit_module, "_guard_output_path", move_before_post_pin_guard)
+    with pytest.raises(AuditError):
+        audit_v3(source, output)
+    assert artifact.read_bytes() == source_bytes
+    assert (
+        json.loads((output / "audit-report.json").read_text())["status"] == "incomplete"
+    )
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "snapshot_call"),
+    [
+        (audit_module.EXCLUSIONS_NAME, 2),
+        (audit_module.AUDIT_REPORT_NAME, 2),
+        (audit_module.MANIFEST_NAME, 3),
+    ],
+)
+def test_root_publication_preserves_source_renamed_after_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_name: str,
+    snapshot_call: int,
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    shard = source / "v3/action_proposals/train-00000.parquet"
+    source_bytes = shard.read_bytes()
+    output = tmp_path / "audit"
+    artifact = output / artifact_name
+    original = audit_module._available_source_hashes
+    calls = 0
+
+    def move_after_snapshot(*args: object, **kwargs: object) -> dict[str, str]:
+        nonlocal calls
+        hashes = original(*args, **kwargs)
+        calls += 1
+        if calls == snapshot_call:
+            shard.rename(artifact)
+        return hashes
+
+    monkeypatch.setattr(audit_module, "_available_source_hashes", move_after_snapshot)
+    with pytest.raises(AuditError):
+        audit_v3(source, output)
+    assert artifact.read_bytes() == source_bytes
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    [audit_module.EXCLUSIONS_NAME, audit_module.AUDIT_REPORT_NAME],
+)
+def test_atomic_publication_preserves_source_moved_after_destination_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact_name: str
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    shard = source / "v3/action_proposals/train-00000.parquet"
+    source_bytes = shard.read_bytes()
+    output = tmp_path / "audit"
+    artifact = output / artifact_name
+    moved = False
+
+    def move_source(path: Path) -> None:
+        nonlocal moved
+        if path == artifact and not moved:
+            moved = True
+            shard.rename(artifact)
+
+    if artifact_name == audit_module.EXCLUSIONS_NAME:
+        original_parquet = audit_module.write_parquet
+
+        def intercept_parquet(path: Path, table: pa.Table) -> None:
+            move_source(path)
+            original_parquet(path, table)
+
+        monkeypatch.setattr(audit_module, "write_parquet", intercept_parquet)
+    else:
+        original_json = audit_module.write_json
+
+        def intercept_json(path: Path, value: object) -> None:
+            move_source(path)
+            original_json(path, value)
+
+        monkeypatch.setattr(audit_module, "write_json", intercept_json)
+
+    with pytest.raises(AuditError):
+        audit_v3(source, output)
+    assert artifact.read_bytes() == source_bytes
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    [audit_module.AUDIT_REPORT_NAME, audit_module.MANIFEST_NAME],
+)
+def test_atomic_incomplete_evidence_preserves_source_moved_after_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact_name: str
+) -> None:
+    source = tmp_path / "source"
+    _write_corpus(source)
+    shard = source / "v3/action_proposals/train-00000.parquet"
+    source_bytes = shard.read_bytes()
+    output = tmp_path / "audit"
+    artifact = output / artifact_name
+    original_json = audit_module.write_json
+    moved = False
+
+    def fail_publication(*_args: object, **_kwargs: object) -> None:
+        raise AuditError("forced publication failure")
+
+    def move_source_before_incomplete_write(path: Path, value: object) -> None:
+        nonlocal moved
+        if path == artifact and not moved:
+            moved = True
+            shard.rename(artifact)
+        original_json(path, value)
+
+    monkeypatch.setattr(audit_module, "_publish_audit", fail_publication)
+    monkeypatch.setattr(audit_module, "write_json", move_source_before_incomplete_write)
+
+    with pytest.raises(AuditError, match="forced publication failure"):
+        audit_v3(source, output)
+    assert artifact.read_bytes() == source_bytes
+
+
+def test_invalid_corpus_preserves_linked_source_in_output(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    config = source / "v3" / "outcomes"
+    config.parent.mkdir(parents=True)
+    output = tmp_path / "audit"
+    target = output / audit_module.VIEW_ID
+    target.mkdir(parents=True)
+    sentinel = target / "train-00000.parquet"
+    sentinel.write_bytes(b"source sentinel")
+    config.symlink_to(target, target_is_directory=True)
+    with pytest.raises(AuditError, match="overlap"):
+        audit_v3(source, output)
+    assert sentinel.read_bytes() == b"source sentinel"
+
+
+def test_unencodable_audit_source_has_incomplete_evidence(tmp_path: Path) -> None:
+    output = tmp_path / "out"
+    with pytest.raises(AuditError, match="cannot resolve source"):
+        audit_v3(tmp_path / "\ud800", output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("ignored", [False, True])
+def test_git_provenance_precedes_sibling_output_publication(
+    tmp_path: Path, ignored: bool
+) -> None:
+    import subprocess
+
+    source = tmp_path / "repo"
+    _write_corpus(source)
+    if ignored:
+        (source / ".gitignore").write_text("audit/\nignored-sentinel\n")
+    subprocess.run(["git", "init", str(source)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(source), "add", "."], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "source corpus",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    expected = audit_module._git_head(source)
+    assert expected is not None
+    output = source / "audit"
+    audit_v3(source / "v3", output)
+    assert (
+        json.loads((output / "manifest.json").read_text())["source_git_commit"]
+        == expected
+    )
+
+    audit_v3(source / "v3", output)
+    assert (
+        json.loads((output / "manifest.json").read_text())["source_git_commit"]
+        == expected
+    )
+    (source / "unrelated.txt").write_text("untracked input")
+    audit_v3(source / "v3", output)
+    assert json.loads((output / "manifest.json").read_text())["source_git_commit"] is None
+    (source / "unrelated.txt").unlink()
+    if ignored:
+        (source / "ignored-sentinel").write_text("untracked ignored input")
+        assert audit_module._git_head(source, output) is None
+        (source / "ignored-sentinel").unlink()
+    shard = source / "v3/state_telemetry/train-00000.parquet"
+    shard.write_bytes(shard.read_bytes() + b"changed")
+    assert audit_module._git_head(source, output) is None
+
+
+@pytest.mark.parametrize(
+    "state_time,outcome_time", [(None, 100), (100, None), (100, 200)]
+)
+def test_outcome_timestamp_must_match_joined_state(tmp_path, state_time, outcome_time):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    for config, timestamp in (
+        ("state_telemetry", state_time),
+        ("outcomes", outcome_time),
+    ):
+        path = source / "v3" / config / "train-00000.parquet"
+        table = pq.read_table(path)
+        table = table.set_column(
+            table.schema.get_field_index("ts_utc"),
+            "ts_utc",
+            pa.array([timestamp] * table.num_rows, type=pa.int64()),
+        )
+        pq.write_table(table, path)
+    output = tmp_path / "audit"
+    with pytest.raises(AuditError, match="timestamps differ"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_outcome_timestamps_join_by_key_after_reordering(tmp_path):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "train-00000.parquet"
+        table = pq.read_table(path)
+        table = table.set_column(
+            table.schema.get_field_index("ts_utc"),
+            "ts_utc",
+            pa.array(range(table.num_rows), type=pa.int64()),
+        )
+        if config == "outcomes":
+            table = table.take(pa.array(list(reversed(range(table.num_rows)))))
+        pq.write_table(table, path)
+    audit_v3(source, tmp_path / "audit")
+    assert (
+        json.loads((tmp_path / "audit/manifest.json").read_text())["status"] == "complete"
+    )
+
+
+@pytest.mark.parametrize("phase", ["before_snapshot", "before_manifest"])
+def test_git_provenance_drops_revision_when_source_state_changes(
+    tmp_path, monkeypatch, phase
+):
+    import subprocess
+
+    source = tmp_path / "source"
+    _write_corpus(source)
+    subprocess.run(["git", "init", str(source)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(source), "add", "."], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "source corpus",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    original_head = audit_module._git_head
+    original_write = audit_module.write_json
+    changed = False
+
+    def change_before_snapshot(*args):
+        nonlocal changed
+        revision = original_head(*args)
+        if phase == "before_snapshot" and not changed:
+            changed = True
+            shard = source / "v3/state_telemetry/train-00000.parquet"
+            table = pq.read_table(shard)
+            table = table.set_column(
+                table.schema.get_field_index("mem_util_pct"),
+                "mem_util_pct",
+                pa.array(
+                    [50.0] * table.num_rows, type=table.schema.field("mem_util_pct").type
+                ),
+            )
+            pq.write_table(table, shard)
+        return revision
+
+    def change_before_manifest(path, value):
+        if phase == "before_manifest" and path.name == "audit-report.json":
+            (source / "new-source.txt").write_text("untracked source")
+        original_write(path, value)
+
+    monkeypatch.setattr(audit_module, "_git_head", change_before_snapshot)
+    monkeypatch.setattr(audit_module, "write_json", change_before_manifest)
+    output = tmp_path / "out"
+    audit_v3(source, output)
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    assert manifest["source_git_commit"] is None
+
+
+@pytest.mark.parametrize("state_time,action_time", [(None, 100), (100, None), (100, 200)])
+def test_action_timestamp_must_match_joined_state(tmp_path, state_time, action_time):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    for config in ("state_telemetry", "outcomes"):
+        path = source / "v3" / config / "train-00000.parquet"
+        table = pq.read_table(path)
+        pq.write_table(
+            table.set_column(
+                table.schema.get_field_index("ts_utc"),
+                "ts_utc",
+                pa.array([state_time] * table.num_rows, type=pa.int64()),
+            ),
+            path,
+        )
+    actions = pa.Table.from_pylist(
+        [
+            {
+                "episode_id": "gpu-000000",
+                "step_idx": 1,
+                "schema_version": "3.0.0",
+                "ts_utc": action_time,
+                "teacher_action": "hold",
+            }
+        ],
+        schema=PROPOSALS_SCHEMA,
+    )
+    pq.write_table(actions, source / "v3/action_proposals/train-00000.parquet")
+    output = tmp_path / "out"
+    with pytest.raises(AuditError, match="action.*timestamps differ"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_final_git_scan_cannot_hide_output_replacement(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    output = tmp_path / "out"
+    original = audit_module._retained_revision
+
+    def replace_after_scan(*args):
+        revision = original(*args)
+        artifact = output / "exclusions.parquet"
+        if artifact.exists():
+            artifact.write_bytes(b"replaced during git scan")
+        return revision
+
+    monkeypatch.setattr(audit_module, "_retained_revision", replace_after_scan)
+    with pytest.raises(AuditError, match="output artifacts changed"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("link_kind", ["file", "directory"])
+def test_symlinked_sources_do_not_claim_git_owned_bytes(tmp_path, monkeypatch, link_kind):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    path = source / "v3/state_telemetry"
+    if link_kind == "file":
+        path /= "train-00000.parquet"
+    external = tmp_path / "external"
+    path.rename(external)
+    path.symlink_to(external, target_is_directory=link_kind == "directory")
+    # Even an apparently clean tracked link cannot attest its external target bytes.
+    monkeypatch.setattr(audit_module, "_git_head", lambda *_args: "clean-revision")
+    output = tmp_path / "out"
+    audit_v3(source, output)
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    assert manifest["source_git_commit"] is None
+
+
+def test_replaced_view_cannot_overwrite_or_clean_source_shards(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    output = tmp_path / "out"
+    view = output / audit_module.VIEW_ID
+    source_config = source / "v3/state_telemetry"
+    before = {path.name: path.read_bytes() for path in source_config.glob("*.parquet")}
+    original = audit_module.write_parquet
+    moved = False
+
+    def replace_before_first_write(path, table):
+        nonlocal moved
+        if not moved and path.parent == view:
+            moved = True
+            view.rename(tmp_path / "detached-view")
+            source_config.rename(view)
+            source_config.symlink_to(view, target_is_directory=True)
+        original(path, table)
+
+    monkeypatch.setattr(audit_module, "write_parquet", replace_before_first_write)
+    with pytest.raises((AuditError, OSError), match="directory changed"):
+        audit_v3(source, output)
+    assert {path.name: path.read_bytes() for path in view.glob("*.parquet")} == before
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("config", ["state_telemetry", "outcomes"])
+def test_extra_source_fields_are_rejected(tmp_path, config):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    shard = source / "v3" / config / "train-00000.parquet"
+    table = pq.read_table(shard)
+    pq.write_table(
+        table.append_column("unexpected", pa.array([1] * table.num_rows)), shard
+    )
+    with pytest.raises(AuditError, match="unexpected source fields"):
+        audit_v3(source, tmp_path / "out")
+
+
+def test_report_replacement_prevents_complete_manifest(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    output = tmp_path / "out"
+    original = audit_module._retained_revision
+
+    def replace_report(*args):
+        result = original(*args)
+        report = output / "audit-report.json"
+        if report.exists():
+            report.write_text('{"status":"tampered"}')
+        return result
+
+    monkeypatch.setattr(audit_module, "_retained_revision", replace_report)
+    with pytest.raises(AuditError, match="output artifacts changed"):
+        audit_v3(source, output)
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_source_substitution_before_view_pin_preserves_shards(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    _write_corpus(source)
+    output = tmp_path / "out"
+    audit_v3(source, output)
+    view = output / audit_module.VIEW_ID
+    config = source / "v3/state_telemetry"
+    before = {p.name: p.read_bytes() for p in config.glob("*.parquet")}
+    original = audit_module._pin_audit_view
+
+    def substitute(*args):
+        view.rename(tmp_path / "detached")
+        config.rename(view)
+        config.symlink_to(view, target_is_directory=True)
+        original(*args)
+
+    monkeypatch.setattr(audit_module, "_pin_audit_view", substitute)
+    with pytest.raises(AuditError, match="overlap"):
+        audit_v3(source, output)
+    assert {p.name: p.read_bytes() for p in view.glob("*.parquet")} == before
+    assert json.loads((output / "manifest.json").read_text())["status"] == "incomplete"
+
+
+def test_unencodable_output_has_scoped_audit_error(tmp_path):
+    with pytest.raises(AuditError, match="output path"):
+        audit_v3(tmp_path / "source", tmp_path / "\ud800")

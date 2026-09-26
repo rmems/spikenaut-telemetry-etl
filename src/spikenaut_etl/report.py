@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -81,7 +81,7 @@ def build(result: CleanResult, validation: ValidationResult) -> FileReport:
         columns=profile(rows),
         gates_passed=validation.ok,
         gate_failures=[str(f) for f in validation.failures],
-        generated_at=datetime.now(timezone.utc).isoformat(),
+        generated_at=datetime.now(UTC).isoformat(),
     )
 
 
@@ -101,7 +101,7 @@ def ingest_failure(source: str, detail: str, *, n_in: int = 0) -> FileReport:
         columns=[],
         gates_passed=False,
         gate_failures=[f"ingest: {detail}"],
-        generated_at=datetime.now(timezone.utc).isoformat(),
+        generated_at=datetime.now(UTC).isoformat(),
     )
 
 

@@ -276,9 +276,7 @@ class RawSystemTelemetry(StrictRecord):
     def _nonempty_session_label(cls, value: str) -> str:
         label = value.strip()
         if not label:
-            raise ValueError(
-                "session_label is ETL session hygiene and must be non-empty"
-            )
+            raise ValueError("session_label is ETL session hygiene and must be non-empty")
         return label
 
     @model_validator(mode="after")

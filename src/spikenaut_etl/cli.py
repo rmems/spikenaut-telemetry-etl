@@ -4,6 +4,8 @@
     spikenaut-etl clean    --input <dir> --output <dir>
     spikenaut-etl report   --input <dir>
     spikenaut-etl build-v3 --input <dataset-repo> [--output <dataset-repo>]
+    spikenaut-etl audit-v3 --input <dataset-repo> --output <audit-dir>
+    spikenaut-etl prepare-anticipation --input <campaign.json> --output <prepared-dir>
 
 Exit status is 1 if any source fails a gate, so CI fails on corrupt data.
 
@@ -48,7 +50,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "command",
-        choices=("validate", "clean", "report", "build-v3"),
+        choices=(
+            "validate",
+            "clean",
+            "report",
+            "build-v3",
+            "audit-v3",
+            "prepare-anticipation",
+        ),
         help="action to perform",
     )
     parser.add_argument(
@@ -60,10 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile live-columns needs stripped sm_clock_mhz JSONL; "
         "v3/state_telemetry parquet is the LiveStimAdapter consumer path, "
         "not something validate reads. For build-v3: the dataset repo "
-        "checkout holding full_data/",
+        "checkout holding full_data/. For audit-v3: the v3 dataset checkout; "
+        "for prepare-anticipation: the preassigned campaign JSON",
     )
     parser.add_argument(
-        "--output", type=Path, help="dataset repo root (required for 'clean')"
+        "--output",
+        type=Path,
+        help="output directory (required for clean, audit-v3, prepare-anticipation)",
     )
     parser.add_argument(
         "--reports", type=Path, default=DEFAULT_REPORTS, help="report output directory"
@@ -93,6 +105,50 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "clean" and args.output is None:
         print("error: --output is required for 'clean'", file=sys.stderr)
         return 2
+
+    if args.command == "prepare-anticipation":
+        if args.output is None:
+            print(
+                "error: --output is required for 'prepare-anticipation'", file=sys.stderr
+            )
+            return 2
+        try:
+            from .anticipation import PreparationError, prepare_campaign
+        except ImportError as exc:
+            print(f"prepare-anticipation failed: {exc}", file=sys.stderr)
+            return 1
+        try:
+            prepared = prepare_campaign(args.input, args.output)
+        except (PreparationError, OSError) as exc:
+            print(f"prepare-anticipation failed: {exc}", file=sys.stderr)
+            return 1
+        examples = sum(len(session["examples"]) for session in prepared["sessions"])
+        print(
+            f"prepare-anticipation complete: {len(prepared['sessions'])} sessions, "
+            f"{examples} eligible examples; wrote {args.output / 'prepared.json'}"
+        )
+        return 0
+
+    if args.command == "audit-v3":
+        if args.output is None:
+            print("error: --output is required for 'audit-v3'", file=sys.stderr)
+            return 2
+        try:
+            from .audit_v3 import AuditError, audit_v3
+        except ImportError as exc:
+            print(f"audit-v3 failed: {exc}", file=sys.stderr)
+            return 1
+        try:
+            audit = audit_v3(args.input, args.output)
+        except (AuditError, OSError) as exc:
+            print(f"audit-v3 failed: {exc}", file=sys.stderr)
+            return 1
+        counts = ", ".join(
+            f"{split}={details['eligible_rows']}/{details['source_rows']}"
+            for split, details in sorted(audit.splits.items())
+        )
+        print(f"audit-v3 complete: {audit.view_id}; {counts}")
+        return 0
 
     if args.command == "build-v3":
         # Deferred import: the base install stays pyarrow-free for validate/clean.

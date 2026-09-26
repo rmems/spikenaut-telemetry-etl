@@ -74,9 +74,7 @@ def test_ecc_dbe_escalates_and_migrates():
 
 
 def test_ecc_dbe_beats_thermal_throttling():
-    decision = propose(
-        [state(ecc_dbe_vol=2, throttle_reasons=THR_HW_THERMAL_SLOWDOWN)]
-    )
+    decision = propose([state(ecc_dbe_vol=2, throttle_reasons=THR_HW_THERMAL_SLOWDOWN)])
     assert decision is not None
     assert decision.action is Action.ESCALATE_TO_HUMAN
 
