@@ -6,8 +6,9 @@ Guidance for coding agents (Amp, Codex, Cursor, Claude Code, and others) working
 
 `spikenaut-telemetry-etl` is the cleaning and validation pipeline for Spikenaut SNN telemetry
 (see `README.md`). It sits between the Rust collectors (`rmems/Theseus-Quarry`, raw JSONL schema v1)
-and the published Hugging Face dataset (`rmems/Spikenaut-SNN-Telemetry`): ingest → validate →
-clean → publish. The repository holds **code only**: no data, no LFS.
+and the published Hugging Face dataset (`rmems/Spikenaut-SNN-Telemetry`): ingest → clean →
+validate → write (`src/spikenaut_etl/pipeline.py`). Output is written only if every gate passes on
+the cleaned data. The repository holds code and small test fixtures only: no datasets, no LFS.
 
 ## Layout
 
@@ -35,8 +36,20 @@ pytest -q
 
 # The pipeline must accept the real fixtures...
 spikenaut-etl validate --input tests/fixtures --reports /tmp/reports
-# ...and must reject each corrupt fixture (all_empty_telemetry, all_zero_telemetry,
-# fabricated_timestamps). CI fails if any corrupt fixture is accepted.
+
+# ...and must reject each corrupt fixture. Each one is copied into its own directory under the
+# file name its source expects, then validated with --only; a zero exit status is a regression.
+for fixture in all_empty_telemetry all_zero_telemetry fabricated_timestamps; do
+  case "$fixture" in
+    all_empty_telemetry) key=neuromorphic_data; name=neuromorphic_data.jsonl ;;
+    *)                   key=node_sync_harvest; name=node_sync_harvest.jsonl ;;
+  esac
+  dir="/tmp/corrupt-$fixture"; mkdir -p "$dir"
+  cp "tests/fixtures/corrupt/$fixture.jsonl" "$dir/$name"
+  if spikenaut-etl validate --input "$dir" --reports "/tmp/reports-$fixture" --only "$key"; then
+    echo "REGRESSION: $fixture was accepted"
+  fi
+done
 ```
 
 CLI usage (`validate`, `clean`, `report`, `--only`, `--profile`) is documented in the README.
@@ -47,4 +60,7 @@ CLI usage (`validate`, `clean`, `report`, `--only`, `--profile`) is documented i
   or fill missing values (see "Why this exists" and the `--profile` table in the README).
 - Issue tracking for this repo is **GitHub issues** (README "Issue tracking"), unlike the Vault's
   beads setup.
-- Don't commit data files. This repo is code only.
+- Don't commit datasets or full telemetry captures. The small fixtures under `tests/fixtures/`
+  (valid and `corrupt/`) are committed on purpose; add one when a validator or schema change needs a
+  regression input. `tools/make_fixtures.py` regenerates the seeded samples from the recovered
+  originals.
