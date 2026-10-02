@@ -38,7 +38,9 @@ pytest -q
 spikenaut-etl validate --input tests/fixtures --reports /tmp/reports
 
 # ...and must reject each corrupt fixture. Each one is copied into its own directory under the
-# file name its source expects, then validated with --only; a zero exit status is a regression.
+# file name its source expects, then validated with --only. The loop exits non-zero if any corrupt
+# fixture is accepted, as in CI.
+failures=0
 for fixture in all_empty_telemetry all_zero_telemetry fabricated_timestamps; do
   case "$fixture" in
     all_empty_telemetry) key=neuromorphic_data; name=neuromorphic_data.jsonl ;;
@@ -48,8 +50,10 @@ for fixture in all_empty_telemetry all_zero_telemetry fabricated_timestamps; do
   cp "tests/fixtures/corrupt/$fixture.jsonl" "$dir/$name"
   if spikenaut-etl validate --input "$dir" --reports "/tmp/reports-$fixture" --only "$key"; then
     echo "REGRESSION: $fixture was accepted"
+    failures=$((failures + 1))
   fi
 done
+[ "$failures" -eq 0 ]
 ```
 
 CLI usage (`validate`, `clean`, `report`, `--only`, `--profile`) is documented in the README.
