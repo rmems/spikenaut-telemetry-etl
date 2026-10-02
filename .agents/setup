@@ -9,6 +9,7 @@
 #   - apt: curl, ca-certificates
 #   - uv + Python 3.14
 #   - venv with -e ".[dev]"
+#   - tool directories exposed to later shells (/etc/profile.d + /usr/local/bin links)
 #
 # It ends with a dependency fetch/prebuild, not a test run.
 set -euo pipefail
@@ -48,5 +49,29 @@ if [ ! -x .venv/bin/python ]; then
   uv venv --python 3.14 .venv
 fi
 uv pip install --python .venv/bin/python -e ".[dev]"
+
+# --- Expose the tools to later shells ---
+# The PATH exports above last only for this script; Amp starts the agent's shell
+# separately. Login shells get these directories from /etc/profile.d, and every other
+# shell finds the entry points through symlinks in /usr/local/bin (on the default PATH).
+# In login shells the venv's bin comes first, so python3 is the venv's Python.
+# The links skip python and pip so the system python3 stays the default elsewhere.
+repo_root="$(pwd)"
+tool_dirs=("$repo_root/.venv/bin")
+# shellcheck disable=SC2016 # $PATH must expand when the profile is sourced, not now.
+printf 'export PATH="%s:$PATH"\n' "$(IFS=:; echo "${tool_dirs[*]}")" |
+  $SUDO tee /etc/profile.d/amp-orb-spikenaut-telemetry-etl.sh >/dev/null
+for dir in "${tool_dirs[@]}"; do
+  [ -d "$dir" ] || continue
+  for tool in "$dir"/*; do
+    name="${tool##*/}"
+    case "$name" in
+      python* | pip* | activate* | deactivate | Activate.ps1) continue ;;
+    esac
+    if [ -f "$tool" ] && [ -x "$tool" ]; then
+      $SUDO ln -sfn "$tool" "/usr/local/bin/$name"
+    fi
+  done
+done
 
 echo "Amp orb setup for spikenaut-telemetry-etl finished."
