@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit config for rmems/spikenaut-telemetry-etl.
+language: en-US
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  fail_commit_status: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_instructions:
+  - path: '{src,tools}/**/*.py'
+    instructions: 'Python >=3.14 (CI 3.14; ruff target-version py314). CI gate: `ruff check src tests tools`, `mypy`, `pytest -q`. Keep code compatible with the declared Python floor. Keep code mypy-clean with complete type hints. Corrupt/fabricated telemetry must be rejected loudly (see `tests/fixtures/corrupt/`), not silently cleaned.'
+  - path: tests/**
+    instructions: Fixtures under `tests/fixtures/` encode real failure modes; new ETL rules need a fixture-backed test.
+  - path: .github/workflows/**
+    instructions: GitHub Actions workflows. Keep `permissions:` least-privilege and job commands in sync with the local gates documented in the repo. Every `uses:` is pinned to a full commit SHA today; new or bumped actions must be too.
+  tools:
+    ruff:
+      enabled: true
+    actionlint:
+      enabled: true
+    yamllint:
+      enabled: true
+    markdownlint:
+      enabled: true
+    pylint:
+      enabled: false
+    flake8:
+      enabled: false
