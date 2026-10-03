@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-# Draft CodeRabbit config for rmems/spikenaut-telemetry-etl (generated locally, not pushed).
+# CodeRabbit config for rmems/spikenaut-telemetry-etl.
 language: en-US
 reviews:
   profile: chill
