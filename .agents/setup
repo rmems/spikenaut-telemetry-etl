@@ -16,7 +16,7 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SUDO=""
+SUDO="env"
 if [ "$(id -u)" -ne 0 ]; then
   SUDO="sudo"
 fi
@@ -30,8 +30,8 @@ apt_install() {
     fi
   done
   if [ "${#missing[@]}" -gt 0 ]; then
-    $SUDO apt-get -o Acquire::Retries=5 update -qq
-    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends "${missing[@]}"
+    "$SUDO" apt-get -o Acquire::Retries=5 update -qq
+    "$SUDO" env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends "${missing[@]}"
   fi
 }
 
@@ -41,11 +41,21 @@ apt_install curl ca-certificates
 # --- Python (uv) ---
 export PATH="$HOME/.local/bin:$PATH"
 if ! command -v uv >/dev/null 2>&1; then
-  curl -LsSf https://astral.sh/uv/install.sh | sh
+  uv_version="0.12.22"
+  uv_installer="$(mktemp)"
+  trap 'rm -f "$uv_installer"' EXIT
+  curl -LsSf "https://github.com/astral-sh/uv/releases/download/$uv_version/uv-installer.sh" -o "$uv_installer"
+  printf '%s  %s\n' "58488ae8dbd0773134c92c85e901430e33f99d975bd7f929d26aa9ab0c2f9390" "$uv_installer" |
+    sha256sum --check --status
+  sh "$uv_installer"
+  rm -f "$uv_installer"
+  trap - EXIT
 fi
 # requires-python >=3.14; validate.yml uses 3.14.
 uv python install 3.14
-if [ ! -x .venv/bin/python ]; then
+if [ ! -x .venv/bin/python ] ||
+  ! .venv/bin/python -c 'import sys; raise SystemExit(sys.version_info[:2] != (3, 14))'; then
+  rm -rf .venv
   uv venv --python 3.14 .venv
 fi
 uv pip install --python .venv/bin/python -e ".[dev]"
@@ -60,7 +70,7 @@ repo_root="$(pwd)"
 tool_dirs=("$repo_root/.venv/bin" "$HOME/.local/bin")
 # shellcheck disable=SC2016 # $PATH must expand when the profile is sourced, not now.
 printf 'export PATH=%q:$PATH\n' "$(IFS=:; echo "${tool_dirs[*]}")" |
-  $SUDO tee /etc/profile.d/amp-orb-spikenaut-telemetry-etl.sh >/dev/null
+  "$SUDO" tee /etc/profile.d/amp-orb-spikenaut-telemetry-etl.sh >/dev/null
 for dir in "${tool_dirs[@]}"; do
   [ -d "$dir" ] || continue
   for tool in "$dir"/*; do
@@ -70,7 +80,7 @@ for dir in "${tool_dirs[@]}"; do
       python* | pip* | activate* | deactivate | Activate.ps1 | env | env.fish) continue ;;
     esac
     if [ -f "$tool" ] && [ -x "$tool" ]; then
-      $SUDO ln -sfn "$tool" "/usr/local/bin/$name"
+      "$SUDO" ln -sfn "$tool" "/usr/local/bin/$name"
     fi
   done
 done
