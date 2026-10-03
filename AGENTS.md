@@ -7,7 +7,7 @@ Guidance for coding agents (Amp, Codex, Cursor, Claude Code, and others) working
 `spikenaut-telemetry-etl` is the cleaning and validation pipeline for Spikenaut SNN telemetry
 (see `README.md`). It sits between the Rust collectors (`rmems/Theseus-Quarry`, raw JSONL schema v1)
 and the published Hugging Face dataset (`rmems/Spikenaut-SNN-Telemetry`): ingest → clean →
-validate → write (`src/spikenaut_etl/pipeline.py`). Output is written only if every gate passes on
+validate → publish (`src/spikenaut_etl/pipeline.py`). Output is written only if every gate passes on
 the cleaned data. The repository holds code and small test fixtures only: no datasets, no LFS.
 
 ## Layout
@@ -53,7 +53,7 @@ for fixture in all_empty_telemetry all_zero_telemetry fabricated_timestamps; do
     failures=$((failures + 1))
   fi
 done
-[ "$failures" -eq 0 ]
+exit $failures
 ```
 
 CLI usage (`validate`, `clean`, `report`, `--only`, `--profile`) is documented in the README.
