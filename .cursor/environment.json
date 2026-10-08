@@ -1,0 +1,4 @@
+{
+  "name": "spikenaut-telemetry-etl",
+  "install": "bash .cursor/install.sh"
+}
