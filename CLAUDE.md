@@ -25,7 +25,7 @@ Run ruff and mypy before committing; CI fails on either.
 ## Architecture map
 
 - `src/spikenaut_etl/pipeline.py`: ingest, clean, validate, write. Output is written only after `validate.assert_publishable` returns.
-- `src/spikenaut_etl/cli.py`: `spikenaut-etl` entry point (`validate`, `clean`, `report`, `build-v3`).
+- `src/spikenaut_etl/cli.py`: `spikenaut-etl` entry point (`validate`, `clean`, `report`, `build-v3`, `audit-v3`, `prepare-anticipation`).
 - `ingest.py`, `v1.py`, `clean.py`, `validate.py`, `timestamps.py`, `report.py`: the pipeline stages.
 - `schemas.py`, `contracts.py`: declared record schemas and named producer/consumer contracts.
 - `v2_parquet.py`, `v3_build.py`, `audit_v3.py`, `teacher_policy.py`, `anticipation.py`, `system_telemetry.py`, `artifacts.py`: dataset builders, audits, and gaming-telemetry ingest.
